@@ -140,7 +140,7 @@ class Scheduler:
         # пользователь получит одно дублирующее напоминание.
         self._sent_reminders: set[str] = set()
 
-        self._scheduler = AsyncIOScheduler(timezone=str(_TZ_MSK))
+        self._scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
         self._register_jobs()
 
     # ── Регистрация джоб ──────────────────────────────────────────────────────
@@ -151,7 +151,7 @@ class Scheduler:
         # Утро — 06:30 по МСК
         self._scheduler.add_job(
             self._safe_morning,
-            trigger=CronTrigger(hour=6, minute=30, timezone=str(_TZ_MSK)),
+            trigger=CronTrigger(hour=6, minute=30, timezone="Europe/Moscow"),
             id="morning_job",
             name="Утренний план",
             replace_existing=True,
@@ -161,7 +161,7 @@ class Scheduler:
         # Вечер — 21:00 по МСК
         self._scheduler.add_job(
             self._safe_evening,
-            trigger=CronTrigger(hour=21, minute=0, timezone=str(_TZ_MSK)),
+            trigger=CronTrigger(hour=21, minute=0, timezone="Europe/Moscow"),
             id="evening_job",
             name="Вечерний итог",
             replace_existing=True,
