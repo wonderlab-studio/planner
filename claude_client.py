@@ -6,7 +6,7 @@ claude_client.py — интеграция с Anthropic Claude API.
     generate_evening_summary — итог дня + мотивация
     parse_intent           — парсинг команды пользователя в JSON
 
-Модель: claude-sonnet-4-20250514
+Модель: claude-sonnet-4-5-20251001
 Стек: anthropic SDK, loguru, python-dotenv
 
 Экономия токенов:
@@ -32,7 +32,7 @@ load_dotenv()
 
 # ── Конфиг ────────────────────────────────────────────────────────────────────
 
-MODEL = "claude-sonnet-4-20250514"
+MODEL = "claude-sonnet-4-5-20251001"
 MAX_TOKENS = 1000
 MAX_TOKENS_INTENT = 256   # JSON-ответ короткий — экономим
 MAX_TOKENS_SEARCH = 64    # {"id": 123} — минимум токенов
