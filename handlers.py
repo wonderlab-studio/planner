@@ -53,10 +53,11 @@ HELP_TEXT = """\
 • `/done <описание>` — архивировать карточку
 • `перенести <описание> <куда>` — переместить карточку
 • `/move <описание> <куда>` — переместить карточку
-• `заметка <описание> <текст>` — добавить комментарий
-• `/note <описание> <текст>` — добавить комментарий
+• `заметка <название> // <текст>` — добавить комментарий
+• `/note <название> // <текст>` — добавить комментарий
 
-_Описание задачи может быть приблизительным — я найду нужную карточку._\
+_Описание задачи может быть приблизительным — я найду нужную карточку._
+_Пример заметки:_ `заметка Редактура главы 11 // Остановился на стр. 42`\
 """
 
 # ── HandlersConfig ────────────────────────────────────────────────────────────
@@ -76,17 +77,48 @@ class HandlersConfig:
 
 # ── Вспомогательные функции ───────────────────────────────────────────────────
 
+_MAX_TG_LEN = 4096  # лимит одного сообщения Telegram
+
+
+def _split_text(text: str, max_len: int = _MAX_TG_LEN) -> list[str]:
+    """Разбивает длинный текст на части не длиннее max_len.
+
+    Режет по последнему переносу строки в пределах лимита,
+    чтобы не рвать слова и Markdown-блоки посередине.
+    """
+    if len(text) <= max_len:
+        return [text]
+
+    parts: list[str] = []
+    while text:
+        if len(text) <= max_len:
+            parts.append(text)
+            break
+        cut = text.rfind("\n", 0, max_len)
+        if cut == -1:
+            cut = max_len
+        parts.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+
+    return parts
+
+
 async def _reply(update: Update, text: str, parse_mode: str = ParseMode.MARKDOWN) -> None:
-    """Отправляет ответ пользователю. При ошибке Markdown повторяет без форматирования."""
+    """Отправляет ответ пользователю.
+
+    Длинные тексты (> 4096 символов) автоматически разбиваются на части.
+    При ошибке Markdown повторяет без форматирования.
+    """
     assert update.message is not None
-    try:
-        await update.message.reply_text(text, parse_mode=parse_mode)
-    except Exception:
-        # Markdown-ошибка или иное — пробуем без форматирования
+
+    for part in _split_text(text):
         try:
-            await update.message.reply_text(text)
-        except Exception as exc:
-            logger.error("_reply: не удалось отправить ответ — {}", exc)
+            await update.message.reply_text(part, parse_mode=parse_mode)
+        except Exception:
+            try:
+                await update.message.reply_text(part)
+            except Exception as exc:
+                logger.error("_reply: не удалось отправить часть сообщения — {}", exc)
 
 
 def _normalize(text: str) -> str:
@@ -378,26 +410,46 @@ async def _handle_move(update: Update, cfg: HandlersConfig, raw_text: str) -> No
 # ── Обработчик «заметка» ──────────────────────────────────────────────────────
 
 async def _handle_note(update: Update, cfg: HandlersConfig, raw_text: str) -> None:
-    """Ищет карточку и добавляет к ней комментарий."""
+    """Ищет карточку и добавляет к ней комментарий.
+
+    Формат: «Название карточки // Текст заметки»
+    Левая часть (до //) — поисковый запрос, правая — текст комментария.
+    Если разделитель отсутствует — просим пользователя уточнить формат.
+    """
     assert update.message is not None
     logger.info("handle_note: raw_text={!r}", raw_text)
 
     if not raw_text:
         await _reply(
             update,
-            "❓ Укажи задачу и текст заметки. Например: `заметка молоко купить 2 литра`",
+            "❓ Укажи задачу и текст заметки через `//`.\n"
+            "Пример: `заметка Редактура главы 11 // Остановился на стр. 42`",
         )
         return
 
-    try:
-        intent = await cfg.claude.parse_intent(raw_text)
-    except Exception as exc:
-        logger.exception("handle_note: parse_intent error — {}", exc)
-        await _reply(update, "⚠️ Не удалось разобрать команду.")
+    # ── Разбиваем по разделителю // ──────────────────────────────────────────
+    if "//" not in raw_text:
+        await _reply(
+            update,
+            "❓ Не нашёл разделитель `//`.\n"
+            "Формат: `заметка *Название карточки* // *Текст заметки*`\n"
+            "Пример: `заметка Редактура главы 11 // Остановился на стр. 42`",
+        )
         return
 
-    query    = intent.get("title") or raw_text
-    note_text = intent.get("note") or raw_text
+    parts = raw_text.split("//", maxsplit=1)
+    query     = parts[0].strip()
+    note_text = parts[1].strip()
+
+    if not query:
+        await _reply(update, "❓ Укажи название карточки перед `//`.")
+        return
+
+    if not note_text:
+        await _reply(update, "❓ Укажи текст заметки после `//`.")
+        return
+
+    logger.debug("handle_note: query={!r} note={!r}", query, note_text)
 
     await update.message.reply_text("🔍 Ищу карточку…")
 

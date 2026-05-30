@@ -95,6 +95,7 @@ class Card:
     properties: dict = field(default_factory=dict)
     archived: bool = False
     state: int = 1
+    column_changed_at: str | None = None  # ISO datetime, когда карточка попала в текущую колонку
 
     @property
     def event_time(self) -> datetime | None:
@@ -137,6 +138,16 @@ class Card:
         except Exception:
             return None
 
+    @property
+    def column_changed_at_parsed(self) -> datetime | None:
+        """Парсит column_changed_at → datetime (UTC)."""
+        if not self.column_changed_at:
+            return None
+        try:
+            return datetime.fromisoformat(self.column_changed_at.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
 
 # ── Фабричные функции ─────────────────────────────────────────────────────────
 
@@ -161,6 +172,7 @@ def _parse_card(raw: dict) -> Card:
         properties=raw.get("properties") or {},
         archived=bool(raw.get("archived", False)),
         state=raw.get("state", 1),
+        column_changed_at=raw.get("column_changed_at"),
     )
 
 
@@ -268,6 +280,42 @@ class KaitenClient:
 
             if len(data) < limit:
                 break  # последняя страница
+            offset += limit
+
+        return all_cards
+
+    async def get_column_cards(self, column_id: int) -> list[Card]:
+        """GET /columns/{column_id}/cards — карточки колонки с полем column_changed_at.
+
+        Используется для фильтрации по дате попадания в колонку (например, Архив).
+        Эндпоинт возвращает поле column_changed_at, которого нет в /spaces/.../cards.
+        Пагинация аналогична get_cards (limit=100, offset).
+        """
+        all_cards: list[Card] = []
+        limit = 100
+        offset = 0
+
+        while True:
+            data = await self._request(
+                "GET",
+                f"/columns/{column_id}/cards",
+                params={"limit": limit, "offset": offset},
+            )
+            if not isinstance(data, list):
+                logger.warning(
+                    "get_column_cards({}): неожиданный ответ на offset={}", column_id, offset
+                )
+                break
+
+            batch = [_parse_card(c) for c in data]
+            all_cards.extend(batch)
+            logger.debug(
+                "get_column_cards({}): offset={} получено={} накоплено={}",
+                column_id, offset, len(batch), len(all_cards),
+            )
+
+            if len(data) < limit:
+                break
             offset += limit
 
         return all_cards
