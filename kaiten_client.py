@@ -96,6 +96,7 @@ class Card:
     archived: bool = False
     state: int = 1
     column_changed_at: str | None = None  # ISO datetime, когда карточка попала в текущую колонку
+    updated_at: str | None = None 
 
     @property
     def event_time(self) -> datetime | None:
@@ -147,6 +148,16 @@ class Card:
             return datetime.fromisoformat(self.column_changed_at.replace("Z", "+00:00"))
         except Exception:
             return None
+        
+    @property
+    def updated_at_parsed(self) -> datetime | None:
+        """Парсит updated_at → datetime (UTC)."""
+        if not self.updated_at:
+            return None
+        try:
+            return datetime.fromisoformat(self.updated_at.replace("Z", "+00:00"))
+        except Exception:
+            return None
 
 
 # ── Фабричные функции ─────────────────────────────────────────────────────────
@@ -173,6 +184,7 @@ def _parse_card(raw: dict) -> Card:
         archived=bool(raw.get("archived", False)),
         state=raw.get("state", 1),
         column_changed_at=raw.get("column_changed_at"),
+        updated_at=raw.get("updated_at"),
     )
 
 

@@ -76,28 +76,31 @@ class EveningLogic:
             if not c.blocked and not c.archived
         ]
 
-        # ── 2. Выполненные: Архив, column_changed_at == сегодня ──────────────
-        # Используем /columns/{id}/cards — единственный эндпоинт, который
-        # возвращает column_changed_at (дата попадания в колонку).
+        # ── 2. Выполненные: Архив, updated_at == сегодня ─────────────────────
+        # Используем get_cards() — стандартный рабочий эндпоинт.
+        # Фильтруем по updated_at: карточки обновлённые сегодня
+        # скорее всего и были заархивированы сегодня.
         done: list[Card] = []
         try:
-            archive_cards = await self._client.get_column_cards(ARCHIVE_COLUMN_ID)
+            archive_cards = await self._client.get_cards(ARCHIVE_COLUMN_ID)
             for card in archive_cards:
                 if card.blocked:
                     continue
-                changed = card.column_changed_at_parsed
-                if changed is None:
+                # Пробуем updated_at
+                ts = card.updated_at_parsed
+                if ts is None:
+                    # Fallback: column_changed_at если есть
+                    ts = card.column_changed_at_parsed
+                if ts is None:
                     continue
-                # Переводим UTC → МСК для сравнения с локальной датой
-                changed_local = changed.astimezone(_TZ_MSK)
-                if changed_local.date() == today:
+                ts_local = ts.astimezone(_TZ_MSK)
+                if ts_local.date() == today:
                     done.append(card)
             logger.info(
                 "evening: архив загружен, выполнено сегодня={} (всего в архиве={})",
                 len(done), len(archive_cards),
             )
         except Exception as exc:
-            # Архив недоступен — продолжаем без выполненных, не падаем
             logger.warning("evening: не удалось загрузить Архив — {}", exc)
 
         logger.info(
