@@ -203,6 +203,10 @@ class MorningLogic:
             elif tag_daily in tags:
                 # 1.3: ежедневно → секция по event_time
                 group_daily.append(card)
+            elif tag_workday in tags and not is_weekday:
+                # 1.4а: по будням, но сегодня выходной → следующая неделя
+                # (group_weekly → next_week_col, секция по event_time)
+                group_weekly.append(card)
             elif tag_workday in tags and is_weekday:
                 # 1.4: по будням (только будни) → секция по event_time
                 group_workday.append(card)
@@ -326,6 +330,34 @@ class MorningLogic:
                 pool.append(card)
 
         logger.info("morning [monday]: пул для перераспределения={}", len(pool))
+
+        # ── Шаг 0: Карточки с event_time на конкретный день текущей недели ────
+        # Обрабатываются до тег-классификации — дата события приоритетнее тегов.
+        # Например: карточка «Встреча» с event_time = среда 14:00 → колонка «Среда», секция «День».
+        event_day_cards: list[Card] = []
+        remaining_pool:  list[Card] = []
+        for card in pool:
+            et = card.event_time
+            if et is not None:
+                et_date = et.date()
+                days_ahead = (et_date - today).days
+                if 0 <= days_ahead <= 6:  # дата попадает на текущую неделю (пн–вс)
+                    event_day_cards.append(card)
+                    continue
+            remaining_pool.append(card)
+
+        logger.info(
+            "morning [monday]: event_time на эту неделю={} остальных={}",
+            len(event_day_cards), len(remaining_pool),
+        )
+
+        for card in event_day_cards:
+            et_weekday = card.event_time.date().weekday()  # type: ignore[union-attr]
+            target_col = COLUMN_IDS[WEEKDAY_COLUMNS[et_weekday]]
+            sec = BoardLogic.section_by_event_time(card)
+            await self._move(card, target_col, sec, preloaded)
+
+        pool = remaining_pool  # дальнейшая классификация только для оставшихся
 
         # ── Шаг 2a: Батч-перенос пула во «Следующая неделя» ──────────────────
         # sort_order назначаем начиная с 10000 — выше любых реальных значений,
