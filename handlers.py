@@ -29,7 +29,7 @@ from telegram.ext import (
 
 from board_logic import BoardLogic, COLUMN_IDS, COLUMN_NAME_BY_ID, WEEKDAY_COLUMNS
 from claude_client import ClaudeClient
-from kaiten_client import Card, KaitenClient
+from kaiten_client import Card, KaitenClient, TAG_IDS
 from notifier import Notifier
 
 # ── Тип для routine-коллбэков ─────────────────────────────────────────────────
@@ -570,6 +570,48 @@ async def _resend_card_buttons(
         logger.warning("_resend_card_buttons: ошибка — {}", exc)
 
 
+# ── Вспомогательная логика для кнопки «Все на сегодня» ───────────────────────
+
+def _next_col_for_regular(card: Card, today: date) -> int:
+    """Возвращает column_id следующего подходящего дня для регулярной задачи.
+
+    Правила:
+        еженедельно  → «Следующая неделя» (Monday run распределит по weekday-полю)
+        ежедневно    → завтра
+        по будням    → ближайший пн–пт начиная с завтра
+        по выходным  → ближайший сб–вс начиная с завтра
+
+    Для нерегулярных карточек возвращает завтра (нейтральный дефолт,
+    вызывающий код должен проверять is_regular_task перед вызовом).
+    """
+    tags = set(card.tag_ids)
+
+    # Еженедельные → следующая неделя: Monday run поставит в нужный день по weekday-полю
+    if TAG_IDS["еженедельно"] in tags:
+        return COLUMN_IDS["Следующая неделя"]
+
+    # Для остальных ищем ближайший подходящий день (максимум 7 шагов вперёд)
+    for days_ahead in range(1, 8):
+        candidate = today + timedelta(days=days_ahead)
+        wd = candidate.weekday()  # 0=Пн … 6=Вс
+
+        if TAG_IDS["ежедневно"] in tags:
+            break                                        # любой день — берём завтра
+
+        if TAG_IDS["по будням"] in tags and wd <= 4:
+            break                                        # нашли ближайший будний
+
+        if TAG_IDS["по выходным"] in tags and wd >= 5:
+            break                                        # нашли ближайний выходной
+    else:
+        # Теоретически недостижимо для корректных тегов, но страхуемся
+        logger.warning("_next_col_for_regular: не нашли слот за 7 дней, card_id={}", card.id)
+        return COLUMN_IDS["Следующая неделя"]
+
+    target_wd = (today + timedelta(days=days_ahead)).weekday()
+    return COLUMN_IDS[WEEKDAY_COLUMNS[target_wd]]
+
+
 # ── Фабрика хендлеров ─────────────────────────────────────────────────────────
 
 def build_handlers(cfg: HandlersConfig) -> Application:
@@ -794,16 +836,21 @@ def build_handlers(cfg: HandlersConfig) -> Application:
             await update.message.reply_text("⚠️ Не удалось обновить размер задачи.")
             return ConversationHandler.END
 
-        # Ищем следующий подходящий слот начиная с завтра
+        # Ищем следующий подходящий слот с учётом типа задачи
         try:
             card = await cfg.kaiten.get_card(card_id)
             if card is None:
                 raise ValueError(f"card {card_id} not found after update")
 
-            tomorrow        = date.today() + timedelta(days=1)
-            tomorrow_col_id = COLUMN_IDS[WEEKDAY_COLUMNS[tomorrow.weekday()]]
+            # Для регулярных задач — стартуем с колонки по метке,
+            # для обычных — с завтра.
+            if cfg.logic.is_regular_task(card):
+                start_col_id = _next_col_for_regular(card, date.today())
+            else:
+                tomorrow     = date.today() + timedelta(days=1)
+                start_col_id = COLUMN_IDS[WEEKDAY_COLUMNS[tomorrow.weekday()]]
 
-            slot = await cfg.logic.find_slot_for_card(card, tomorrow_col_id)
+            slot = await cfg.logic.find_slot_for_card(card, start_col_id)
             if slot is None:
                 slot = (COLUMN_IDS["Следующая неделя"], "Утро")
 
