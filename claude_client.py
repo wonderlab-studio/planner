@@ -5,8 +5,10 @@ claude_client.py — интеграция с Anthropic Claude API.
     generate_morning_plan  — красивый план дня для Telegram
     generate_evening_summary — итог дня + мотивация
     parse_intent           — парсинг команды пользователя в JSON
+    search_card_by_title   — нечёткий поиск карточки по заголовку
+    generate_card_advice   — совет Claude по конкретной задаче
 
-Модель: claude-sonnet-4-20250514
+Модель: claude-sonnet-4-6
 Стек: anthropic SDK, loguru, python-dotenv
 
 Экономия токенов:
@@ -26,7 +28,7 @@ import anthropic
 from dotenv import load_dotenv
 from loguru import logger
 
-from prompts import MORNING_SYSTEM, EVENING_SYSTEM, PARSE_INTENT_SYSTEM, SEARCH_SYSTEM
+from prompts import MORNING_SYSTEM, EVENING_SYSTEM, PARSE_INTENT_SYSTEM, SEARCH_SYSTEM, ADVICE_SYSTEM
 
 load_dotenv()
 
@@ -36,6 +38,7 @@ MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 1500
 MAX_TOKENS_INTENT = 256   # JSON-ответ короткий — экономим
 MAX_TOKENS_SEARCH = 64    # {"id": 123} — минимум токенов
+MAX_TOKENS_ADVICE = 600   # совет по карточке
 
 _ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
@@ -401,3 +404,78 @@ class ClaudeClient:
         except anthropic.APIError as e:
             logger.error("search_card_by_title: API error — {}", e)
             return None
+
+    # ── Совет по карточке ─────────────────────────────────────────────────────
+
+    async def generate_card_advice(
+        self,
+        question: str,
+        card_title: str,
+        description: str | None,
+        comments: list[str],
+    ) -> str:
+        """Генерирует совет Claude по конкретной задаче из планировщика.
+
+        Параметры:
+            question   — вопрос пользователя по задаче
+            card_title — название карточки
+            description — описание карточки (может быть None)
+            comments   — список текстов комментариев к карточке
+                         (включая предыдущие вопросы/ответы если уже были)
+
+        Возвращает:
+            Текст совета в Markdown для отправки в Telegram.
+
+        Пример промпта (user):
+            "Вопрос: С чего начать?
+
+            Задача: Написать отчёт по итогам квартала
+            Описание: Нужно охватить продажи, маркетинг и производство
+            Комментарии:
+            💬 Согласовать структуру с Иваном до пятницы
+            💬 Данные по продажам у Марины"
+        """
+        # Формируем контекст карточки
+        context_parts = [f"Задача: {card_title}"]
+
+        if description:
+            context_parts.append(f"Описание: {description}")
+
+        if comments:
+            context_parts.append("Комментарии:")
+            for comment in comments:
+                if comment:
+                    context_parts.append(f"💬 {comment}")
+
+        card_context = "\n".join(context_parts)
+        user_message = f"Вопрос: {question}\n\n{card_context}"
+
+        logger.debug(
+            "generate_card_advice: card={!r} comments={} question={!r}",
+            card_title, len(comments), question,
+        )
+
+        try:
+            response = await self._client.messages.create(
+                model=MODEL,
+                max_tokens=MAX_TOKENS_ADVICE,
+                system=[
+                    {
+                        "type": "text",
+                        "text": ADVICE_SYSTEM,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                messages=[{"role": "user", "content": user_message}],
+            )
+            result = response.content[0].text
+            logger.info(
+                "generate_card_advice: input={} cached_read={} output={}",
+                response.usage.input_tokens,
+                getattr(response.usage, "cache_read_input_tokens", 0),
+                response.usage.output_tokens,
+            )
+            return result
+        except anthropic.APIError as e:
+            logger.error("generate_card_advice: API error — {}", e)
+            return "⚠️ Не удалось получить совет. Попробуй позже."

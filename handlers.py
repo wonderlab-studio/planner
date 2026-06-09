@@ -38,10 +38,12 @@ RoutineCallable = Callable[[], Awaitable[str]]
 
 # ── Состояния ConversationHandler ─────────────────────────────────────────────
 
-CARD_ACTION        = 0  # пользователь выбрал карточку, ждём действие
-AWAITING_COMMENT   = 1  # ждём текст комментария (для done или comment)
-AWAITING_HOURS     = 2  # ждём число часов для «Все на сегодня»
+CARD_ACTION          = 0  # пользователь выбрал карточку, ждём действие
+AWAITING_COMMENT     = 1  # ждём текст комментария (для done или comment)
+AWAITING_HOURS       = 2  # ждём число часов для «Все на сегодня»
 AWAITING_MOVE_TARGET = 3  # ждём куда перенести
+AWAITING_QUESTION    = 4  # ждём вопрос для кнопки «Совет»
+AWAITING_REMINDER_TIME = 5  # ждём дату/время для кнопки «Напоминалка»
 
 # ── Фильтр «известные команды» — чтобы они не попадали в состояния диалога ────
 
@@ -545,6 +547,8 @@ def _action_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("➡️ Все на сегодня",  callback_data="action:today")],
         [InlineKeyboardButton("💬 Комментарий",     callback_data="action:comment")],
         [InlineKeyboardButton("📅 Перенести",       callback_data="action:move")],
+        [InlineKeyboardButton("🤖 Совет",           callback_data="action:advice")],
+        [InlineKeyboardButton("🔔 Напоминалка",     callback_data="action:reminder")],
         [InlineKeyboardButton("← Назад",            callback_data="action:back")],
     ])
 
@@ -884,7 +888,7 @@ def build_handlers(cfg: HandlersConfig) -> Application:
         title   = context.user_data.get("selected_card_title", f"#{card_id}")
 
         try:
-            intent = await cfg.claude.parse_intent(text)
+            intent = await cfg.claude.parse_intent(f"перенести {text}")
         except Exception as exc:
             logger.exception("received_move_target_cb: parse_intent error — {}", exc)
             await update.message.reply_text(
@@ -916,6 +920,170 @@ def build_handlers(cfg: HandlersConfig) -> Application:
         except Exception as exc:
             logger.exception("received_move_target_cb: move error — {}", exc)
             await update.message.reply_text("⚠️ Ошибка при перемещении карточки.")
+
+        if update.effective_chat:
+            await _resend_card_buttons(cfg, context, update.effective_chat.id)
+
+        return ConversationHandler.END
+
+    # ── Кнопка «Совет» ───────────────────────────────────────────────────────
+
+    async def action_advice_cb(
+        update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        """🤖 Совет → запрашиваем вопрос пользователя."""
+        query = update.callback_query
+        assert query is not None
+        await query.answer()
+        await query.edit_message_text(
+            "🤖 Какой вопрос по этой задаче?\n"
+            "_Например: «с чего начать», «какие риски», «что учесть»_",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=None,
+        )
+        return AWAITING_QUESTION
+
+    async def received_question_cb(
+        update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        """Получен вопрос: запрашиваем совет у Claude, добавляем комментарий к карточке."""
+        assert update.message is not None
+        question = update.message.text.strip()
+        card_id  = context.user_data.get("selected_card_id")
+        title    = context.user_data.get("selected_card_title", f"#{card_id}")
+
+        await update.message.reply_text("🤖 Думаю над советом…")
+
+        # Получаем полный контекст карточки
+        description: str | None = None
+        comments: list[str] = []
+        try:
+            card = await cfg.kaiten.get_card(card_id)
+            if card:
+                description = card.description
+            comments = await cfg.kaiten.get_comments(card_id)
+        except Exception as exc:
+            logger.warning("received_question_cb: не удалось загрузить контекст карточки — {}", exc)
+
+        # Запрашиваем совет у Claude
+        try:
+            answer = await cfg.claude.generate_card_advice(
+                question=question,
+                title=title,
+                description=description,
+                comments=comments,
+            )
+        except Exception as exc:
+            logger.exception("received_question_cb: generate_card_advice error — {}", exc)
+            await update.message.reply_text("⚠️ Не удалось получить совет. Попробуй позже.")
+            if update.effective_chat:
+                await _resend_card_buttons(cfg, context, update.effective_chat.id)
+            return ConversationHandler.END
+
+        # Отправляем ответ в чат
+        await _reply(update, answer)
+
+        # Сохраняем вопрос и ответ как комментарий к карточке
+        note = f"❓ Вопрос: {question}\n💡 Ответ: {answer}"
+        try:
+            await cfg.kaiten.add_comment(card_id, note)
+            logger.info("received_question_cb: совет сохранён в карточку id={}", card_id)
+        except Exception as exc:
+            logger.warning("received_question_cb: не удалось сохранить совет в карточку — {}", exc)
+
+        if update.effective_chat:
+            await _resend_card_buttons(cfg, context, update.effective_chat.id)
+
+        return ConversationHandler.END
+
+    # ── Кнопка «Напоминалка» ─────────────────────────────────────────────────
+
+    async def action_reminder_cb(
+        update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        """🔔 Напоминалка → запрашиваем дату и время."""
+        query = update.callback_query
+        assert query is not None
+        await query.answer()
+        await query.edit_message_text(
+            "🔔 Когда напомнить?\n"
+            "_Например: «завтра в 14:00», «пятница 09:30», «20 июня 10:00»_",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=None,
+        )
+        return AWAITING_REMINDER_TIME
+
+    async def received_reminder_time_cb(
+        update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        """Получены дата/время: устанавливаем event_time и добавляем тег «напомнить»."""
+        assert update.message is not None
+        text    = update.message.text.strip()
+        card_id = context.user_data.get("selected_card_id")
+        title   = context.user_data.get("selected_card_title", f"#{card_id}")
+
+        # Парсим дату через Claude (префикс «создать задачу» чтобы Claude понял контекст)
+        try:
+            intent = await cfg.claude.parse_intent(f"создать задачу {text}")
+        except Exception as exc:
+            logger.exception("received_reminder_time_cb: parse_intent error — {}", exc)
+            await update.message.reply_text("⚠️ Не удалось разобрать дату. Попробуй ещё раз:")
+            return AWAITING_REMINDER_TIME
+
+        event_date: str | None = intent.get("deadline")  # "YYYY-MM-DD"
+
+        if not event_date:
+            await update.message.reply_text(
+                "❓ Не удалось определить дату.\n"
+                "Попробуй написать точнее, например: «завтра в 14:00» или «пятница 09:30»"
+            )
+            return AWAITING_REMINDER_TIME
+
+        # Извлекаем время из сырого текста пользователя (HH:MM или H:MM)
+        time_match = re.search(r"\b(\d{1,2}):(\d{2})\b", text)
+        if time_match:
+            hh = int(time_match.group(1))
+            mm = int(time_match.group(2))
+            time_str = f"{hh:02d}:{mm:02d}:00"
+        else:
+            # Нет явного времени — берём дефолт по секции
+            section_defaults = {"Утро": "09:00:00", "День": "14:00:00", "Вечер": "19:00:00"}
+            section  = intent.get("section") or "Утро"
+            time_str = section_defaults.get(section, "09:00:00")
+
+        event_time_obj = {"date": event_date, "time": time_str, "tzOffset": 180}
+        logger.info(
+            "received_reminder_time_cb: card_id={} event_time={}", card_id, event_time_obj
+        )
+
+        # Обновляем event_time карточки
+        try:
+            await cfg.kaiten.update_card(
+                card_id,
+                properties={"id_590358": event_time_obj},
+            )
+        except Exception as exc:
+            logger.exception("received_reminder_time_cb: update event_time error — {}", exc)
+            await update.message.reply_text("⚠️ Не удалось установить время события.")
+            if update.effective_chat:
+                await _resend_card_buttons(cfg, context, update.effective_chat.id)
+            return ConversationHandler.END
+
+        # Добавляем тег «напомнить» если его ещё нет
+        remind_tag = TAG_IDS["напомнить"]
+        try:
+            card = await cfg.kaiten.get_card(card_id)
+            current_tags = list(card.tag_ids) if card else []
+            if remind_tag not in current_tags:
+                await cfg.kaiten.update_card(card_id, tag_ids=current_tags + [remind_tag])
+                logger.info("received_reminder_time_cb: тег «напомнить» добавлен к id={}", card_id)
+        except Exception as exc:
+            logger.warning("received_reminder_time_cb: не удалось добавить тег — {}", exc)
+
+        await update.message.reply_text(
+            f"🔔 Напоминание установлено для «{title}»:\n"
+            f"📅 {event_date} в {time_str[:5]}",
+        )
 
         if update.effective_chat:
             await _resend_card_buttons(cfg, context, update.effective_chat.id)
@@ -983,11 +1151,13 @@ def build_handlers(cfg: HandlersConfig) -> Application:
         ],
         states={
             CARD_ACTION: [
-                CallbackQueryHandler(action_done_cb,    pattern=r"^action:done$"),
-                CallbackQueryHandler(action_today_cb,   pattern=r"^action:today$"),
-                CallbackQueryHandler(action_comment_cb, pattern=r"^action:comment$"),
-                CallbackQueryHandler(action_move_cb,    pattern=r"^action:move$"),
-                CallbackQueryHandler(action_back_cb,    pattern=r"^action:back$"),
+                CallbackQueryHandler(action_done_cb,     pattern=r"^action:done$"),
+                CallbackQueryHandler(action_today_cb,    pattern=r"^action:today$"),
+                CallbackQueryHandler(action_comment_cb,  pattern=r"^action:comment$"),
+                CallbackQueryHandler(action_move_cb,     pattern=r"^action:move$"),
+                CallbackQueryHandler(action_advice_cb,   pattern=r"^action:advice$"),
+                CallbackQueryHandler(action_reminder_cb, pattern=r"^action:reminder$"),
+                CallbackQueryHandler(action_back_cb,     pattern=r"^action:back$"),
             ],
             AWAITING_COMMENT: [
                 MessageHandler(_text_not_cmd, received_comment_cb),
@@ -997,6 +1167,12 @@ def build_handlers(cfg: HandlersConfig) -> Application:
             ],
             AWAITING_MOVE_TARGET: [
                 MessageHandler(_text_not_cmd, received_move_target_cb),
+            ],
+            AWAITING_QUESTION: [
+                MessageHandler(_text_not_cmd, received_question_cb),
+            ],
+            AWAITING_REMINDER_TIME: [
+                MessageHandler(_text_not_cmd, received_reminder_time_cb),
             ],
         },
         fallbacks=[

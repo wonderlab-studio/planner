@@ -61,10 +61,14 @@ def _format_date_ru(d: date) -> str:
     return f"{d.day} {_MONTH_NAMES[d.month - 1]} {d.year}, {_WEEKDAY_NAMES[d.weekday()]}"
 
 
-def _card_to_dict(card: Card, section: str | None = None) -> dict:
+def _card_to_dict(
+    card: Card,
+    section: str | None = None,
+    comments: list[str] | None = None,
+) -> dict:
     """Конвертирует Card в dict для ClaudeClient.generate_morning_plan.
 
-    Поля: title, description, importance, size, due_date, event_time, section.
+    Поля: title, description, importance, size, due_date, event_time, section, comments.
     """
     et = card.event_time
     return {
@@ -75,24 +79,34 @@ def _card_to_dict(card: Card, section: str | None = None) -> dict:
         "due_date":    card.due_date,
         "event_time":  et.strftime("%H:%M") if et else None,
         "section":     section,
+        "comments":    comments or [],
     }
 
 
-def _extract_section_cards(cards: list[Card]) -> list[dict]:
+def _extract_section_cards(
+    cards: list[Card],
+    comments_map: dict[int, list[str]] | None = None,
+) -> list[dict]:
     """Разбирает список карточек колонки (с разделителями) в список dict с полем section.
 
     Проходит по sort_order, отслеживает текущую секцию через разделители.
     Разделители и архивированные в результат не включаются.
+    Если передан comments_map, комментарии добавляются к каждой карточке.
     """
     sorted_cards = sorted(cards, key=lambda c: c.sort_order)
     result: list[dict] = []
     current_section: str | None = None
+    _comments_map = comments_map or {}
 
     for card in sorted_cards:
         if card.blocked:
             current_section = card.block_reason
         elif not card.archived:
-            result.append(_card_to_dict(card, section=current_section))
+            result.append(_card_to_dict(
+                card,
+                section=current_section,
+                comments=_comments_map.get(card.id, []),
+            ))
 
     return result
 
@@ -239,8 +253,22 @@ class Scheduler:
             await self._notifier.send("⚠️ Ошибка при переносе карточек. Проверь логи.")
             return
 
-        # ── Форматируем карточки в list[dict] с секциями ──────────────────────
-        cards_dicts = _extract_section_cards(cards)
+        # ── Загружаем комментарии параллельно для всех не-разделителей ──────────
+        task_cards = [c for c in cards if not c.blocked and not c.archived]
+        comments_list = await asyncio.gather(
+            *[self._kaiten.get_comments(c.id) for c in task_cards],
+            return_exceptions=True,
+        )
+        comments_map: dict[int, list[str]] = {
+            c.id: (cmts if isinstance(cmts, list) else [])
+            for c, cmts in zip(task_cards, comments_list)
+        }
+        logger.debug(
+            "morning_job: загружены комментарии для {} карточек", len(task_cards)
+        )
+
+        # ── Форматируем карточки в list[dict] с секциями и комментариями ─────
+        cards_dicts = _extract_section_cards(cards, comments_map=comments_map)
         logger.debug("morning_job: подготовлено карточек для Claude={}", len(cards_dicts))
 
         # ── Генерируем план через Claude ──────────────────────────────────────
