@@ -387,6 +387,15 @@ class KaitenClient:
         logger.info("add_comment: комментарий добавлен к карточке id={}", card_id)
         return True
 
+    async def add_tag(self, card_id: int, tag_id: int) -> bool:
+        """POST /cards/{card_id}/tags/{tag_id} — добавляет тег к карточке."""
+        data = await self._request("POST", f"/cards/{card_id}/tags/{tag_id}")
+        if data is None:
+            logger.error("add_tag: не удалось добавить тег {} к карточке id={}", tag_id, card_id)
+            return False
+        logger.info("add_tag: тег {} добавлен к карточке id={}", tag_id, card_id)
+        return True
+
     async def get_comments(self, card_id: int) -> list[str]:
         """GET /cards/{card_id}/comments — список текстов комментариев."""
         data = await self._request("GET", f"/cards/{card_id}/comments")

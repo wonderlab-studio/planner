@@ -410,7 +410,7 @@ class ClaudeClient:
     async def generate_card_advice(
         self,
         question: str,
-        card_title: str,
+        title: str,
         description: str | None,
         comments: list[str],
     ) -> str:
@@ -418,7 +418,7 @@ class ClaudeClient:
 
         Параметры:
             question   — вопрос пользователя по задаче
-            card_title — название карточки
+            title — название карточки
             description — описание карточки (может быть None)
             comments   — список текстов комментариев к карточке
                          (включая предыдущие вопросы/ответы если уже были)
@@ -436,7 +436,7 @@ class ClaudeClient:
             💬 Данные по продажам у Марины"
         """
         # Формируем контекст карточки
-        context_parts = [f"Задача: {card_title}"]
+        context_parts = [f"Задача: {title}"]
 
         if description:
             context_parts.append(f"Описание: {description}")
@@ -452,7 +452,7 @@ class ClaudeClient:
 
         logger.debug(
             "generate_card_advice: card={!r} comments={} question={!r}",
-            card_title, len(comments), question,
+            title, len(comments), question,
         )
 
         try:
