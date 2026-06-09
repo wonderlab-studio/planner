@@ -38,7 +38,7 @@ MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 1500
 MAX_TOKENS_INTENT = 256   # JSON-ответ короткий — экономим
 MAX_TOKENS_SEARCH = 64    # {"id": 123} — минимум токенов
-MAX_TOKENS_ADVICE = 600   # совет по карточке
+MAX_TOKENS_ADVICE = 1200   # совет по карточке
 
 _ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
