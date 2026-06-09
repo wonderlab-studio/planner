@@ -1075,7 +1075,7 @@ def build_handlers(cfg: HandlersConfig) -> Application:
             card = await cfg.kaiten.get_card(card_id)
             current_tags = list(card.tag_ids) if card else []
             if remind_tag not in current_tags:
-                await cfg.kaiten.update_card(card_id, tag_ids=current_tags + [remind_tag])
+                await cfg.kaiten.add_tag(card_id, remind_tag)
                 logger.info("received_reminder_time_cb: тег «напомнить» добавлен к id={}", card_id)
         except Exception as exc:
             logger.warning("received_reminder_time_cb: не удалось добавить тег — {}", exc)
