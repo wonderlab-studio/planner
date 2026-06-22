@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import date
+from datetime import date, datetime, timezone, timedelta
 from typing import Any
 
 import anthropic
@@ -38,7 +38,7 @@ MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 1500
 MAX_TOKENS_INTENT = 256   # JSON-ответ короткий — экономим
 MAX_TOKENS_SEARCH = 64    # {"id": 123} — минимум токенов
-MAX_TOKENS_ADVICE = 1200   # совет по карточке
+MAX_TOKENS_ADVICE = 600   # совет по карточке
 
 _ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
@@ -269,7 +269,7 @@ class ClaudeClient:
              "section": "Утро", "deadline": "2026-05-22", "importance": "важное",
              "note": null}
         """
-        today_str = date.today().isoformat()
+        today_str = datetime.now(timezone(timedelta(hours=3))).date().isoformat()
         system_prompt = PARSE_INTENT_SYSTEM.format(today=today_str)
 
         logger.debug("parse_intent: текст={!r}", user_text)
@@ -410,7 +410,7 @@ class ClaudeClient:
     async def generate_card_advice(
         self,
         question: str,
-        title: str,
+        card_title: str,
         description: str | None,
         comments: list[str],
     ) -> str:
@@ -418,7 +418,7 @@ class ClaudeClient:
 
         Параметры:
             question   — вопрос пользователя по задаче
-            title — название карточки
+            card_title — название карточки
             description — описание карточки (может быть None)
             comments   — список текстов комментариев к карточке
                          (включая предыдущие вопросы/ответы если уже были)
@@ -436,7 +436,7 @@ class ClaudeClient:
             💬 Данные по продажам у Марины"
         """
         # Формируем контекст карточки
-        context_parts = [f"Задача: {title}"]
+        context_parts = [f"Задача: {card_title}"]
 
         if description:
             context_parts.append(f"Описание: {description}")
@@ -452,7 +452,7 @@ class ClaudeClient:
 
         logger.debug(
             "generate_card_advice: card={!r} comments={} question={!r}",
-            title, len(comments), question,
+            card_title, len(comments), question,
         )
 
         try:

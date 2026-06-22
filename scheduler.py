@@ -2,9 +2,10 @@
 scheduler.py — APScheduler джобы системы планирования.
 
 Джобы:
-    run_morning_job  — 06:30 ежедневно, план дня
-    run_evening_job  — 21:00 ежедневно, итог дня
-    run_reminder_job — каждую минуту, напоминания о событиях
+    run_morning_job       — 06:30 ежедневно, план дня
+    run_evening_job       — 21:00 ежедневно, [UPD 4] временно отключено
+    run_reminder_job      — каждую минуту, напоминания о событиях
+    run_archive_cleanup_job — каждый пн в 06:00, удаление старых карточек из Архива
 
 Стек: APScheduler 3.x (AsyncIOScheduler), loguru, asyncio.
 Флаги дублирования хранятся в SQLite через модуль db.
@@ -22,7 +23,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from loguru import logger
 
 import db
-from kaiten_client import Card, KaitenClient, TAG_IDS
+from kaiten_client import Card, KaitenClient, TAG_IDS, ARCHIVE_COLUMN_ID
 from board_logic import BoardLogic, WEEKDAY_COLUMNS, COLUMN_IDS
 from claude_client import ClaudeClient
 from notifier import Notifier
@@ -65,10 +66,13 @@ def _card_to_dict(
     card: Card,
     section: str | None = None,
     comments: list[str] | None = None,
+    segments: list | None = None,
 ) -> dict:
     """Конвертирует Card в dict для ClaudeClient.generate_morning_plan.
 
-    Поля: title, description, importance, size, due_date, event_time, section, comments.
+    Поля: title, description, importance, size, due_date, event_time,
+          section, comments, segments.
+    segments — список пар ("HH:MM", "HH:MM"); одна пара если задача не прерывается.
     """
     et = card.event_time
     return {
@@ -80,18 +84,21 @@ def _card_to_dict(
         "event_time":  et.strftime("%H:%M") if et else None,
         "section":     section,
         "comments":    comments or [],
+        "segments":    segments or [],
     }
 
 
 def _extract_section_cards(
     cards: list[Card],
     comments_map: dict[int, list[str]] | None = None,
+    segments_map: dict | None = None,
 ) -> list[dict]:
     """Разбирает список карточек колонки (с разделителями) в список dict с полем section.
 
     Проходит по sort_order, отслеживает текущую секцию через разделители.
     Разделители и архивированные в результат не включаются.
-    Если передан comments_map, комментарии добавляются к каждой карточке.
+    Если переданы comments_map / segments_map — добавляет комментарии и сегменты.
+    Результат сортируется по event_time (карточки без времени — в конце).
     """
     sorted_cards = sorted(cards, key=lambda c: c.sort_order)
     result: list[dict] = []
@@ -106,8 +113,10 @@ def _extract_section_cards(
                 card,
                 section=current_section,
                 comments=_comments_map.get(card.id, []),
+                segments=segments_map.get(card.id) if segments_map else None,
             ))
 
+    result.sort(key=lambda d: d.get("event_time") or "99:99")
     return result
 
 
@@ -192,7 +201,20 @@ class Scheduler:
             misfire_grace_time=60,
         )
 
-        logger.info("scheduler: джобы зарегистрированы (morning=06:30, evening=21:00, reminder=1m)")
+        # Очистка Архива — каждый понедельник в 06:00 (до утренней логики)
+        self._scheduler.add_job(
+            self._safe_archive_cleanup,
+            trigger=CronTrigger(day_of_week="mon", hour=6, minute=0, timezone="Europe/Moscow"),
+            id="archive_cleanup_job",
+            name="Очистка Архива",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+
+        logger.info(
+            "scheduler: джобы зарегистрированы "
+            "(morning=06:30, evening=21:00[off], reminder=1m, archive_cleanup=пн 06:00)"
+        )
 
     # ── Публичные методы ──────────────────────────────────────────────────────
 
@@ -226,6 +248,12 @@ class Scheduler:
         except Exception as exc:
             logger.exception("scheduler: необработанная ошибка в reminder_job — {}", exc)
 
+    async def _safe_archive_cleanup(self) -> None:
+        try:
+            await self.run_archive_cleanup_job()
+        except Exception as exc:
+            logger.exception("scheduler: необработанная ошибка в archive_cleanup_job — {}", exc)
+
     # ── Утренняя джоба ────────────────────────────────────────────────────────
 
     async def run_morning_job(self) -> None:
@@ -247,6 +275,7 @@ class Scheduler:
         # ── Перенос карточек ──────────────────────────────────────────────────
         try:
             cards: list[Card] = await self._morning.run(today)
+            segments_map = self._morning.last_segments
             logger.info("morning_job: перенос завершён, карточек сегодня={}", len(cards))
         except Exception as exc:
             logger.error("morning_job: ошибка morning.run — {}", exc)
@@ -267,8 +296,12 @@ class Scheduler:
             "morning_job: загружены комментарии для {} карточек", len(task_cards)
         )
 
-        # ── Форматируем карточки в list[dict] с секциями и комментариями ─────
-        cards_dicts = _extract_section_cards(cards, comments_map=comments_map)
+        # ── Форматируем карточки в list[dict] с секциями, комментариями, сегментами
+        cards_dicts = _extract_section_cards(
+            cards,
+            comments_map=comments_map,
+            segments_map=segments_map,
+        )
         logger.debug("morning_job: подготовлено карточек для Claude={}", len(cards_dicts))
 
         # ── Генерируем план через Claude ──────────────────────────────────────
@@ -289,41 +322,53 @@ class Scheduler:
         await loop.run_in_executor(None, db.set_morning_done, today)
         logger.info("morning_job: завершено, флаг установлен")
 
-    # ── Вечерняя джоба ───────────────────────────────────────────────────────
+    # ── Вечерняя джоба [UPD 4: временно отключена] ──────────────────────────
 
     async def run_evening_job(self) -> None:
-        """Вечерняя логика: итог дня от Claude.
+        """[UPD 4] Временно отключена — будет доработана в v5.
 
-        Проверяет флаг в SQLite — если уже выполнено, пропускает.
-        Публичный метод для вызова из handlers.py при команде «вечер».
+        Джоба в 21:00 остаётся зарегистрированной но ничего не делает.
+        Команда «вечер» в боте также возвращает заглушку.
         """
-        today = date.today()
-        logger.info("evening_job: старт ({})", today.isoformat())
+        logger.info("evening: временно отключено")
 
-        # ── Проверка флага ────────────────────────────────────────────────────
-        loop = asyncio.get_event_loop()
-        already_done = await loop.run_in_executor(None, db.is_evening_done, today)
-        if already_done:
-            logger.info("evening_job: уже выполнено сегодня, пропускаем")
-            return
+    # ── Джоба очистки Архива ─────────────────────────────────────────────────
 
-        # ── Генерируем итог ───────────────────────────────────────────────────
+    async def run_archive_cleanup_job(self) -> None:
+        """Каждый понедельник в 06:00: удаляет из Архива карточки старше 30 дней.
+
+        Фильтрация по полю updated_at — дата последнего изменения карточки.
+        Карточки без updated_at не трогаются.
+        """
         try:
-            summary_text = await self._evening.run(today)
-        except Exception as exc:
-            logger.error("evening_job: ошибка evening.run — {}", exc)
-            await self._notifier.send("⚠️ Ошибка при подведении итогов. Проверь логи.")
-            return
+            cutoff = datetime.now(_TZ_MSK) - timedelta(days=30)
+            logger.info("archive_cleanup: порог удаления={}", cutoff.date().isoformat())
 
-        # ── Отправляем в Telegram ─────────────────────────────────────────────
-        try:
-            await self._notifier.send_evening_summary(summary_text)
-        except Exception as exc:
-            logger.error("evening_job: ошибка send_evening_summary — {}", exc)
+            cards = await self._kaiten.get_cards(ARCHIVE_COLUMN_ID)
+            deleted = 0
 
-        # ── Ставим флаг ───────────────────────────────────────────────────────
-        await loop.run_in_executor(None, db.set_evening_done, today)
-        logger.info("evening_job: завершено, флаг установлен")
+            for card in cards:
+                if card.blocked:
+                    continue
+                ts = card.updated_at_parsed
+                if ts and ts < cutoff:
+                    ok = await self._kaiten.delete_card(card.id)
+                    if ok:
+                        deleted += 1
+                        logger.info(
+                            "archive_cleanup: удалена «{}» (id={}) updated={}",
+                            card.title, card.id,
+                            ts.date().isoformat() if ts else "?",
+                        )
+                    else:
+                        logger.warning(
+                            "archive_cleanup: не удалось удалить id={}", card.id
+                        )
+
+            logger.info("archive_cleanup: удалено {} карточек старше 30 дней", deleted)
+
+        except Exception as exc:
+            logger.error("archive_cleanup: ошибка — {}", exc)
 
     # ── Джоба напоминаний ─────────────────────────────────────────────────────
 

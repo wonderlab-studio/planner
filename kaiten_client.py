@@ -95,6 +95,7 @@ class Card:
     properties: dict = field(default_factory=dict)
     archived: bool = False
     state: int = 1
+    updated_at: str | None = None
 
     @property
     def event_time(self) -> datetime | None:
@@ -137,6 +138,15 @@ class Card:
         except Exception:
             return None
 
+    @property
+    def updated_at_parsed(self) -> datetime | None:
+        if not self.updated_at:
+            return None
+        try:
+            return datetime.fromisoformat(self.updated_at.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
 
 # ── Фабричные функции ─────────────────────────────────────────────────────────
 
@@ -161,6 +171,7 @@ def _parse_card(raw: dict) -> Card:
         properties=raw.get("properties") or {},
         archived=bool(raw.get("archived", False)),
         state=raw.get("state", 1),
+        updated_at=raw.get("updated_at"),
     )
 
 
@@ -385,23 +396,6 @@ class KaitenClient:
             logger.error("add_comment: не удалось добавить комментарий к карточке id={}", card_id)
             return False
         logger.info("add_comment: комментарий добавлен к карточке id={}", card_id)
-        return True
-
-    async def add_tag(self, card_id: int, tag_id: int) -> bool:
-        """POST /cards/{card_id}/tags — добавляет тег к карточке по имени."""
-        tag_name = next((k for k, v in TAG_IDS.items() if v == tag_id), None)
-        if not tag_name:
-            logger.error("add_tag: неизвестный tag_id={}", tag_id)
-            return False
-        data = await self._request(
-            "POST",
-            f"/cards/{card_id}/tags",
-            json={"name": tag_name},
-        )
-        if data is None:
-            logger.error("add_tag: не удалось добавить тег «{}» к карточке id={}", tag_name, card_id)
-            return False
-        logger.info("add_tag: тег «{}» добавлен к карточке id={}", tag_name, card_id)
         return True
 
     async def get_comments(self, card_id: int) -> list[str]:

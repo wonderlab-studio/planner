@@ -1,102 +1,185 @@
 """
-morning_logic.py — утренняя логика переноса карточек.
+morning_logic.py — утренняя логика.
 
-Класс MorningLogic реализует:
-  - _run_regular : обычный день (вт–вс)
-  - _run_monday  : понедельник (сброс недели + перераспределение)
+[UPD 4] Полная перезапись для v4: алгоритм фаз 1–4.
 
-Публичный метод:
-    async def run(today: date) -> list[Card]
-        Возвращает карточки сегодняшней колонки после всех перемещений.
-        Используется вызывающим кодом для передачи в ClaudeClient.generate_morning_plan.
+Фаза 1 : карточки с event_time.date() == today → фиксированные слоты
+Фаза 2 : сортировка оставшихся по 9 группам приоритета
+Фаза 3 : назначение event_time через update_card + перемещение в секцию
+Фаза 4 : переполнение → следующий день / «Следующая неделя»
+
+Понедельничная сборка карточек — без изменений (v3).
 """
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from loguru import logger
 
 from kaiten_client import Card, KaitenClient, TAG_IDS
-from board_logic import (
-    BoardLogic,
-    COLUMN_IDS,
-    WEEKDAY_COLUMNS,
-)
+from board_logic import BoardLogic, COLUMN_IDS, WEEKDAY_COLUMNS
+
+_TZ_MSK = timezone(timedelta(hours=3))
+
+# Тег «вечерняя» (UPD 4, id=1097987)
+_TAG_EVENING = 1097987
+
+# Блоки времени (минуты от начала суток)
+_BLOCKS: dict[str, tuple[int, int]] = {
+    "Утро":  (9 * 60,  14 * 60),   # 09:00–14:00, 300 мин
+    "День":  (15 * 60, 19 * 60),   # 15:00–19:00, 240 мин
+    "Вечер": (19 * 60, 22 * 60),   # 19:00–22:00, 180 мин
+}
+
+# Длительность по умолчанию если size не задан (часы)
+_DEFAULT_HOURS = 0.25
 
 
 # ── Вспомогательные функции ───────────────────────────────────────────────────
 
 def _sorted_by_order(cards: list[Card]) -> list[Card]:
-    """Сортирует список карточек по sort_order."""
     return sorted(cards, key=lambda c: c.sort_order)
 
 
 def _get_card_section(sorted_cards: list[Card], target: Card) -> str | None:
-    """Определяет секцию карточки внутри отсортированного списка.
-
-    Проходит по карточкам в порядке sort_order, отслеживает текущий разделитель.
-    Возвращает block_reason активного разделителя в момент встречи с target.
-    """
-    current_section: str | None = None
+    """Определяет секцию карточки по её позиции в отсортированном списке."""
+    current: str | None = None
     for card in sorted_cards:
         if card.blocked:
-            current_section = card.block_reason
+            current = card.block_reason
         elif card.id == target.id:
-            return current_section
+            return current
     return None
 
 
-def _cards_in_section(sorted_cards: list[Card], section: str) -> list[Card]:
-    """Возвращает не-разделители из указанной секции отсортированного списка."""
-    result: list[Card] = []
-    in_target = False
-    for card in sorted_cards:
-        if card.blocked:
-            in_target = (card.block_reason == section)
-        elif in_target:
-            result.append(card)
-    return result
+def _fmt_min(minutes: int) -> str:
+    """Форматирует минуты от начала суток в строку HH:MM."""
+    h, m = divmod(minutes, 60)
+    return f"{h:02d}:{m:02d}"
+
+
+# ── Планировщик одного блока ──────────────────────────────────────────────────
+
+class _BlockScheduler:
+    """Управляет временными слотами внутри одного блока (Утро/День/Вечер).
+
+    Поддерживает сегментированное размещение: задача может «обтекать»
+    фиксированные события, занимая несколько свободных интервалов подряд.
+    """
+
+    def __init__(self, section: str) -> None:
+        self.section = section
+        self._start, self._end = _BLOCKS[section]
+        self._occupied: list[tuple[int, int]] = []
+        self._cursor: int = self._start
+
+    def reserve(self, start_min: int, end_min: int) -> None:
+        """Резервирует интервал (для карточек фазы 1 с фиксированным временем)."""
+        end_min = min(end_min, self._end)
+        if start_min < end_min:
+            self._occupied.append((start_min, end_min))
+            self._occupied.sort()
+
+    def free_intervals_from_cursor(self) -> list[tuple[int, int]]:
+        """Список свободных интервалов от текущего курсора до конца блока.
+
+        Учитывает все зарезервированные и уже занятые интервалы.
+        """
+        pos = max(self._cursor, self._start)
+        intervals: list[tuple[int, int]] = []
+        for occ_s, occ_e in sorted(self._occupied):
+            occ_s = max(occ_s, self._start)
+            occ_e = min(occ_e, self._end)
+            if occ_e <= pos:
+                continue
+            if occ_s > pos:
+                intervals.append((pos, occ_s))
+            pos = max(pos, occ_e)
+        if pos < self._end:
+            intervals.append((pos, self._end))
+        return intervals
+
+    def remaining_minutes(self) -> int:
+        """Суммарное свободное время от курсора до конца блока."""
+        return sum(e - s for s, e in self.free_intervals_from_cursor())
+
+    def try_place_segmented(
+        self,
+        duration_min: int,
+    ) -> list[tuple[int, int]] | None:
+        """Размещает задачу по нескольким свободным интервалам (если нужно).
+
+        Алгоритм «обтекания»: задача занимает столько свободного времени сколько нужно,
+        перепрыгивая через фиксированные события. Если суммарного свободного
+        времени недостаточно — возвращает None (задача уходит в overflow).
+
+        Возвращает список сегментов [(start_min, end_min), ...] или None.
+        """
+        if duration_min <= 0:
+            return None
+
+        free = self.free_intervals_from_cursor()
+        total_free = sum(e - s for s, e in free)
+
+        if total_free < duration_min:
+            return None  # не влезает даже по частям
+
+        segments: list[tuple[int, int]] = []
+        remaining = duration_min
+
+        for seg_s, seg_e in free:
+            if remaining <= 0:
+                break
+            chunk = min(remaining, seg_e - seg_s)
+            seg_end = seg_s + chunk
+            segments.append((seg_s, seg_end))
+            self._occupied.append((seg_s, seg_end))
+            remaining -= chunk
+
+        self._occupied.sort()
+        # Продвигаем курсор за конец последнего сегмента
+        if segments:
+            self._cursor = segments[-1][1]
+
+        return segments
 
 
 # ── MorningLogic ──────────────────────────────────────────────────────────────
 
 class MorningLogic:
-    """Утренняя логика переноса карточек с вчера на сегодня."""
+    """Утренняя логика переноса и расстановки карточек по времени (v4)."""
 
     def __init__(self, client: KaitenClient, logic: BoardLogic) -> None:
         self._client = client
-        self._logic = logic
+        self._logic  = logic
+        # Сегменты последнего запуска: {card_id: [("HH:MM", "HH:MM"), ...]}
+        # Доступен после run() — используется scheduler.py для card_dict["segments"]
+        self.last_segments: dict[int, list[tuple[str, str]]] = {}
 
     # ── Точка входа ───────────────────────────────────────────────────────────
 
     async def run(self, today: date) -> list[Card]:
-        """Запускает утреннюю логику для заданной даты.
+        """Запускает утреннюю логику.
 
-        Возвращает список карточек сегодняшней колонки после всех перемещений.
-        Не бросает исключения — ошибки отдельных карточек логируются и пропускаются.
+        Возвращает карточки сегодняшней колонки после всех перемещений.
+        После вызова self.last_segments содержит сегменты для каждой карточки.
+        Не бросает исключения: ошибки отдельных карточек логируются и пропускаются.
         """
+        self.last_segments = {}  # сбрасываем перед каждым запуском
         if today.weekday() == 0:
             return await self._run_monday(today)
         return await self._run_regular(today)
 
-    # ── Загрузка всех колонок ─────────────────────────────────────────────────
+    # ── Загрузка колонок ─────────────────────────────────────────────────────
 
     async def _load_week_cards(self) -> dict[int, list[Card]]:
-        """Загружает карточки пн–вс + «Следующая неделя» за один проход.
-
-        Возвращает словарь {column_id: [Card, ...]}.
-        При ошибке загрузки отдельной колонки пишет WARNING и кладёт пустой список.
-        """
+        """Загружает пн–вс + «Следующая неделя» за один проход."""
         col_ids = [
-            COLUMN_IDS["Понедельник"],
-            COLUMN_IDS["Вторник"],
-            COLUMN_IDS["Среда"],
-            COLUMN_IDS["Четверг"],
-            COLUMN_IDS["Пятница"],
-            COLUMN_IDS["Суббота"],
-            COLUMN_IDS["Воскресенье"],
-            COLUMN_IDS["Следующая неделя"],
+            COLUMN_IDS["Понедельник"], COLUMN_IDS["Вторник"],
+            COLUMN_IDS["Среда"],       COLUMN_IDS["Четверг"],
+            COLUMN_IDS["Пятница"],     COLUMN_IDS["Суббота"],
+            COLUMN_IDS["Воскресенье"], COLUMN_IDS["Следующая неделя"],
         ]
         preloaded: dict[int, list[Card]] = {}
         for col_id in col_ids:
@@ -109,7 +192,7 @@ class MorningLogic:
                 preloaded[col_id] = []
         return preloaded
 
-    # ── Перемещение одной карточки ────────────────────────────────────────────
+    # ── Перемещение карточки ─────────────────────────────────────────────────
 
     async def _move(
         self,
@@ -118,10 +201,7 @@ class MorningLogic:
         section: str,
         preloaded: dict[int, list[Card]],
     ) -> bool:
-        """Перемещает карточку в col_id/section, обновляет preloaded in-place.
-
-        Не бросает исключений — при ошибке возвращает False.
-        """
+        """Перемещает карточку в col_id/section, синхронизирует preloaded."""
         try:
             sort_order = await self._logic.get_section_sort_order(col_id, section)
             result = await self._client.move_card(card.id, col_id, sort_order)
@@ -131,37 +211,268 @@ class MorningLogic:
                     card.title, card.id, col_id, section,
                 )
                 return False
-
             logger.info(
                 "move OK: «{}» (id={}) → col={} sec={} so={:.4f}",
                 card.title, card.id, col_id, section, sort_order,
             )
-
-            # Синхронизируем preloaded: убираем из старой колонки
             old_col = card.column_id
             if old_col in preloaded:
                 preloaded[old_col] = [c for c in preloaded[old_col] if c.id != card.id]
-
-            # Мутируем поля карточки и добавляем в новую колонку
             card.column_id = col_id
             card.sort_order = sort_order
             preloaded.setdefault(col_id, []).append(card)
             return True
-
         except Exception as exc:
             logger.error(
-                "move ERROR: «{}» (id={}) → col={} sec={} — {}",
+                "move ERROR: «{}» (id={}) col={} sec={} — {}",
                 card.title, card.id, col_id, section, exc,
             )
             return False
 
+    # ── Назначение event_time ────────────────────────────────────────────────
+
+    async def _set_event_time(self, card: Card, dt: datetime) -> bool:
+        try:
+            prop = {
+                "date":     dt.strftime("%Y-%m-%d"),
+                "time":     dt.strftime("%H:%M:%S"),
+                "tzOffset": 180,
+            }
+            await self._client.update_card(card.id, properties={"id_590358": prop})
+            card.properties["id_590358"] = prop
+            logger.info("set_event_time: «{}» (id={}) → {} {}",
+                        card.title, card.id, prop["date"], prop["time"])
+            return True
+        except Exception as exc:
+            logger.error("set_event_time ERROR: «{}» (id={}) — {}",
+                         card.title, card.id, exc)
+            return False
+
+    # ── Фазы 1–4: расписание для одного дня ─────────────────────────────────
+
+    async def _schedule_today(
+        self,
+        candidates: list[Card],
+        today: date,
+        preloaded: dict[int, list[Card]],
+    ) -> list[Card]:
+        """Размещает кандидатов в сегодняшней колонке по алгоритму фаз 1–4.
+
+        Заполняет self.last_segments: {card_id: [("HH:MM", "HH:MM"), ...]}.
+        Возвращает свежие карточки сегодняшней колонки из API.
+        """
+        today_col_id  = COLUMN_IDS[WEEKDAY_COLUMNS[today.weekday()]]
+        tomorrow      = today + timedelta(days=1)
+        day_after     = today + timedelta(days=2)
+
+        schedulers = {
+            "Утро":  _BlockScheduler("Утро"),
+            "День":  _BlockScheduler("День"),
+            "Вечер": _BlockScheduler("Вечер"),
+        }
+
+        # ── Фаза 1: фиксированные event_time == today ─────────────────────────
+        phase1:    list[Card] = []
+        remaining: list[Card] = []
+
+        for card in candidates:
+            et = card.event_time
+            if et is not None:
+                et_local = et.astimezone(_TZ_MSK) if et.tzinfo else et.replace(tzinfo=_TZ_MSK)
+                if et_local.date() == today:
+                    phase1.append(card)
+                    continue
+            remaining.append(card)
+
+        for card in sorted(phase1, key=lambda c: c.event_time):
+            et_local  = card.event_time.astimezone(_TZ_MSK)
+            hour      = et_local.hour
+            section   = "Утро" if hour < 12 else ("Вечер" if hour >= 19 else "День")
+            await self._move(card, today_col_id, section, preloaded)
+
+            # Резервируем слот и записываем единственный сегмент
+            start_min = hour * 60 + et_local.minute
+            size_h    = card.size if (card.size and card.size != 999) else _DEFAULT_HOURS
+            end_min   = start_min + round(size_h * 60)
+            schedulers[section].reserve(start_min, end_min)
+            self.last_segments[card.id] = [(_fmt_min(start_min), _fmt_min(end_min))]
+
+        logger.info(
+            "_schedule_today: phase1={} remaining={}",
+            len(phase1), len(remaining),
+        )
+
+        # ── Фаза 2: 9 групп приоритета ────────────────────────────────────────
+        #
+        # → Утро (не «вечерняя»):
+        #   1. Критическое + deadline сегодня, size ASC
+        #   2. Важное     + deadline сегодня, size ASC
+        # → День (не «вечерняя»):
+        #   3. Критическое + deadline завтра/послезавтра
+        #   4. Важное      + deadline завтра/послезавтра
+        #   5. Среднее     + deadline завтра/послезавтра
+        #   6. Все остальные без тега «вечерняя»
+        # → Вечер (тег «вечерняя»):
+        #   7. Критическое + deadline сегодня, size ASC
+        #   8. Важное      + deadline сегодня, size ASC
+        #   9. Все остальные с тегом «вечерняя»
+
+        groups: list[list[Card]] = [[] for _ in range(9)]
+        group_section = [
+            "Утро",  "Утро",             # 0, 1
+            "День",  "День",  "День",  "День",  # 2, 3, 4, 5
+            "Вечер", "Вечер", "Вечер", # 6, 7, 8
+        ]
+
+        for card in remaining:
+            tags   = set(card.tag_ids)
+            is_eve = _TAG_EVENING in tags
+            imp    = card.importance   # None / "среднее" / "важное" / "критическое"
+
+            dd_parsed = card.due_date_parsed
+            dl_date   = dd_parsed.date() if dd_parsed else None
+            today_dl  = (dl_date == today)               if dl_date else False
+            soon_dl   = (dl_date in (tomorrow, day_after)) if dl_date else False
+
+            if not is_eve:
+                if   imp == "критическое" and today_dl:  groups[0].append(card)
+                elif imp == "важное"       and today_dl:  groups[1].append(card)
+                elif imp == "критическое" and soon_dl:   groups[2].append(card)
+                elif imp == "важное"       and soon_dl:   groups[3].append(card)
+                elif imp == "среднее"      and soon_dl:   groups[4].append(card)
+                else:                                      groups[5].append(card)
+            else:
+                if   imp == "критическое" and today_dl:  groups[6].append(card)
+                elif imp == "важное"       and today_dl:  groups[7].append(card)
+                else:                                      groups[8].append(card)
+
+        # Группы 1, 2, 7, 8 — сортировка по size ASC (сначала быстрые)
+        for i in (0, 1, 6, 7):
+            groups[i].sort(key=lambda c: c.size if (c.size and c.size != 999) else 0)
+
+        logger.debug(
+            "_schedule_today: groups = {}",
+            [len(g) for g in groups],
+        )
+
+        # ── Фаза 3: сегментированное назначение времени и перемещение ────────
+        overflow: list[Card] = []
+
+        for g_idx, group_cards in enumerate(groups):
+            section = group_section[g_idx]
+            sched   = schedulers[section]
+
+            for card in group_cards:
+                # Вычисляем нужную длительность
+                if card.size == 999:
+                    # Заполнить всё оставшееся свободное время блока
+                    dur_min = sched.remaining_minutes()
+                elif card.size is None:
+                    dur_min = round(_DEFAULT_HOURS * 60)
+                else:
+                    dur_min = max(1, round(card.size * 60))
+
+                if dur_min == 0:
+                    logger.info(
+                        "overflow (block full): «{}» (id={}) g={}",
+                        card.title, card.id, g_idx + 1,
+                    )
+                    overflow.append(card)
+                    continue
+
+                # Сегментированное размещение: задача огибает фиксированные события
+                segments = sched.try_place_segmented(dur_min)
+                if segments is None:
+                    logger.info(
+                        "overflow (no free time): «{}» (id={}) g={}",
+                        card.title, card.id, g_idx + 1,
+                    )
+                    overflow.append(card)
+                    continue
+
+                # Записываем сегменты в виде строк "HH:MM"
+                str_segs = [(_fmt_min(s), _fmt_min(e)) for s, e in segments]
+                self.last_segments[card.id] = str_segs
+                logger.info(
+                    "placed: «{}» (id={}) g={} segs={}",
+                    card.title, card.id, g_idx + 1,
+                    " ".join(f"{s}–{e}" for s, e in str_segs),
+                )
+
+                # event_time = начало первого сегмента
+                h, m  = divmod(segments[0][0], 60)
+                ev_dt = datetime(today.year, today.month, today.day, h, m, tzinfo=_TZ_MSK)
+                await self._set_event_time(card, ev_dt)
+                await self._move(card, today_col_id, section, preloaded)
+
+        # ── Фаза 4: переполнение ──────────────────────────────────────────────
+        if overflow:
+            logger.info("_schedule_today: overflow={}", len(overflow))
+            await self._handle_overflow(overflow, today, preloaded)
+
+        # Возвращаем свежие карточки из API (с установленными event_time)
+        try:
+            return await self._client.get_cards(today_col_id)
+        except Exception as exc:
+            logger.error("_schedule_today: не удалось загрузить итог — {}", exc)
+            return []
+
+    # ── Обработка переполнения ────────────────────────────────────────────────
+
+    async def _handle_overflow(
+        self,
+        cards: list[Card],
+        from_date: date,
+        preloaded: dict[int, list[Card]],
+    ) -> None:
+        """Перемещает карточки в следующий день (без назначения event_time).
+
+        После воскресенья (weekday=6) → «Следующая неделя».
+        Следующее утро само запланирует их по алгоритму фаз 1–4.
+        """
+        next_week_col = COLUMN_IDS["Следующая неделя"]
+        next_day = from_date + timedelta(days=1)
+
+        if next_day.weekday() == 0:
+            # Следующий день был бы понедельником следующей недели
+            target_col = next_week_col
+        else:
+            target_col = COLUMN_IDS[WEEKDAY_COLUMNS[next_day.weekday()]]
+
+        for card in cards:
+            try:
+                so     = await self._logic.get_section_sort_order(target_col, "Утро")
+                result = await self._client.move_card(card.id, target_col, so)
+                if result:
+                    old_col = card.column_id
+                    if old_col in preloaded:
+                        preloaded[old_col] = [c for c in preloaded[old_col] if c.id != card.id]
+                    card.column_id = target_col
+                    card.sort_order = so
+                    preloaded.setdefault(target_col, []).append(card)
+                    logger.info(
+                        "overflow → col={}: «{}» (id={})",
+                        target_col, card.title, card.id,
+                    )
+                else:
+                    logger.error("overflow FAIL: id={} «{}»", card.id, card.title)
+            except Exception as exc:
+                logger.error("overflow ERROR: id={} — {}", card.id, exc)
+
     # ── Обычный день (вт–вс) ─────────────────────────────────────────────────
 
     async def _run_regular(self, today: date) -> list[Card]:
-        """Утренняя логика обычного дня: переносим вчера → сегодня."""
+        """Утренняя логика обычного дня (вт–вс).
+
+        1. Загружает карточки вчерашней колонки.
+        2. Маршрутизирует: еженедельно → следующая неделя,
+           На контроле → сегодняшний «На контроле»,
+           по будням на выходной / по выходным в будни → следующая неделя,
+           остальные → кандидаты для фаз 1–4.
+        3. Запускает _schedule_today.
+        """
         logger.info("morning [regular]: {}", today.isoformat())
 
-        # ── 0. Загрузка всех колонок ──────────────────────────────────────────
         preloaded = await self._load_week_cards()
 
         yesterday     = today - timedelta(days=1)
@@ -170,131 +481,68 @@ class MorningLogic:
         next_week_col = COLUMN_IDS["Следующая неделя"]
 
         is_weekday = today.weekday() <= 4   # пн=0 … пт=4
-        is_sunday  = today.weekday() == 6
 
         tag_weekly  = TAG_IDS["еженедельно"]
-        tag_daily   = TAG_IDS["ежедневно"]
         tag_workday = TAG_IDS["по будням"]
         tag_weekend = TAG_IDS["по выходным"]
 
-        # ── 1. Берём задачи из вчерашней колонки ─────────────────────────────
         yest_sorted = _sorted_by_order(preloaded.get(yest_col_id, []))
         tasks = [c for c in yest_sorted if not c.blocked and not c.archived]
         logger.info("morning [regular]: вчера col={} задач={}", yest_col_id, len(tasks))
 
-        # ── 2. Классифицируем по строгому порядку требований ─────────────────
-        group_weekly:  list[Card] = []
-        group_control: list[Card] = []
-        group_daily:   list[Card] = []
-        group_workday: list[Card] = []
-        group_weekend: list[Card] = []
-        group_other:   list[Card] = []
+        candidates: list[Card] = []
 
         for card in tasks:
-            tags = set(card.tag_ids)
+            tags    = set(card.tag_ids)
             section = _get_card_section(yest_sorted, card)
 
             if tag_weekly in tags:
-                # 1.1: еженедельно → следующая неделя
-                group_weekly.append(card)
+                # Еженедельно → следующая неделя (без time-scheduling)
+                sec = BoardLogic.section_by_event_time(card)
+                await self._move(card, next_week_col, sec, preloaded)
+
             elif section == "На контроле":
-                # 1.2: секция «На контроле» → та же секция сегодня
-                group_control.append(card)
-            elif tag_daily in tags:
-                # 1.3: ежедневно → секция по event_time
-                group_daily.append(card)
+                # На контроле → та же секция сегодня (без time-scheduling)
+                await self._move(card, today_col_id, "На контроле", preloaded)
+
             elif tag_workday in tags and not is_weekday:
-                # 1.4а: по будням, но сегодня выходной → следующая неделя
-                # (group_weekly → next_week_col, секция по event_time)
-                group_weekly.append(card)
-            elif tag_workday in tags and is_weekday:
-                # 1.4: по будням (только будни) → секция по event_time
-                group_workday.append(card)
-            elif tag_weekend in tags and is_sunday:
-                # 1.5: по выходным (только вс) → секция по event_time
-                group_weekend.append(card)
-            else:
-                # 1.6: остальные — по алгоритму приоритетов
-                group_other.append(card)
-
-        logger.debug(
-            "morning [regular]: weekly={} control={} daily={} workday={} weekend={} other={}",
-            len(group_weekly), len(group_control), len(group_daily),
-            len(group_workday), len(group_weekend), len(group_other),
-        )
-
-        # ── 3. Перемещения в строгом порядке ─────────────────────────────────
-
-        # 1.1 Еженедельно → Следующая неделя
-        for card in group_weekly:
-            sec = BoardLogic.section_by_event_time(card)
-            await self._move(card, next_week_col, sec, preloaded)
-
-        # 1.2 На контроле → На контроле сегодня
-        for card in group_control:
-            await self._move(card, today_col_id, "На контроле", preloaded)
-
-        # 1.3 Ежедневно → секция по event_time
-        for card in group_daily:
-            sec = BoardLogic.section_by_event_time(card)
-            await self._move(card, today_col_id, sec, preloaded)
-
-        # 1.4 По будням → секция по event_time
-        for card in group_workday:
-            sec = BoardLogic.section_by_event_time(card)
-            await self._move(card, today_col_id, sec, preloaded)
-
-        # 1.5 По выходным → секция по event_time
-        for card in group_weekend:
-            sec = BoardLogic.section_by_event_time(card)
-            await self._move(card, today_col_id, sec, preloaded)
-
-        # 1.6 Остальные: сортируем по приоритету, ищем слот через find_slot_for_card
-        sorted_other = self._logic.sort_cards_by_priority(group_other)
-        for card in sorted_other:
-            slot = await self._logic.find_slot_for_card(
-                card, today_col_id, preloaded
-            )
-            if slot is None:
-                # find_slot_for_card уже вернула (Следующая неделя, Утро) — не должно быть None,
-                # но на случай неожиданного сбоя — страхуемся
-                logger.warning(
-                    "morning [regular]: нет слота для «{}» (id={}) → Следующая неделя/Утро",
-                    card.title, card.id,
-                )
+                # По будням, но сегодня выходной → следующая неделя
                 await self._move(card, next_week_col, "Утро", preloaded)
-            else:
-                await self._move(card, slot[0], slot[1], preloaded)
 
-        # ── 4. Возвращаем актуальные карточки сегодня ─────────────────────────
-        logger.info("morning [regular]: завершено, загружаем итог col={}", today_col_id)
-        try:
-            return await self._client.get_cards(today_col_id)
-        except Exception as exc:
-            logger.error("morning [regular]: не удалось загрузить итог — {}", exc)
-            return []
+            elif tag_weekend in tags and is_weekday:
+                # По выходным, но сегодня будний день → следующая неделя
+                await self._move(card, next_week_col, "Утро", preloaded)
+
+            else:
+                # Всё остальное (ежедневно, по будням, по выходным, прочие) →
+                # кандидаты для расписания
+                candidates.append(card)
+
+        logger.info("morning [regular]: кандидатов={}", len(candidates))
+        return await self._schedule_today(candidates, today, preloaded)
 
     # ── Понедельник ───────────────────────────────────────────────────────────
 
     async def _run_monday(self, today: date) -> list[Card]:
-        """Утренняя логика понедельника: перераспределение всей недели."""
+        """Утренняя логика понедельника.
+
+        Сборка карточек со всей недели — без изменений (v3).
+        Размещение в понедельник — через фазы 1–4 (UPD 4).
+        """
         logger.info("morning [monday]: {}", today.isoformat())
 
-        monday_col    = COLUMN_IDS["Понедельник"]
-        sunday_col    = COLUMN_IDS["Воскресенье"]
-        saturday_col  = COLUMN_IDS["Суббота"]
-        next_week_col = COLUMN_IDS["Следующая неделя"]
+        monday_col     = COLUMN_IDS["Понедельник"]
+        sunday_col     = COLUMN_IDS["Воскресенье"]
+        saturday_col   = COLUMN_IDS["Суббота"]
+        next_week_col  = COLUMN_IDS["Следующая неделя"]
         far_future_col = COLUMN_IDS["Далекие времена"]
 
         tag_weekly  = TAG_IDS["еженедельно"]
-        tag_daily   = TAG_IDS["ежедневно"]
-        tag_workday = TAG_IDS["по будням"]
         tag_weekend = TAG_IDS["по выходным"]
 
-        # ── 0. Загрузка колонок недели ────────────────────────────────────────
         preloaded = await self._load_week_cards()
 
-        # ── Шаг 1: На контроле воскресенья → На контроле понедельника ─────────
+        # ── Шаг 1: «На контроле» воскресенья → понедельник ──────────────────
         sunday_sorted = _sorted_by_order(preloaded.get(sunday_col, []))
         control_sunday = [
             c for c in sunday_sorted
@@ -305,17 +553,12 @@ class MorningLogic:
         for card in control_sunday:
             await self._move(card, monday_col, "На контроле", preloaded)
 
-        # ── Шаг 2: Собираем пул — все задачи пн–вс + следующей недели
-        #           кроме «На контроле» понедельника (только что перенесённых туда) ──
+        # ── Шаг 2: Сборка пула (пн–вс + следующая неделя) ───────────────────
         week_col_ids = [
-            COLUMN_IDS["Понедельник"],
-            COLUMN_IDS["Вторник"],
-            COLUMN_IDS["Среда"],
-            COLUMN_IDS["Четверг"],
-            COLUMN_IDS["Пятница"],
-            COLUMN_IDS["Суббота"],
-            COLUMN_IDS["Воскресенье"],
-            next_week_col,
+            COLUMN_IDS["Понедельник"], COLUMN_IDS["Вторник"],
+            COLUMN_IDS["Среда"],       COLUMN_IDS["Четверг"],
+            COLUMN_IDS["Пятница"],     COLUMN_IDS["Суббота"],
+            COLUMN_IDS["Воскресенье"], next_week_col,
         ]
 
         pool: list[Card] = []
@@ -324,144 +567,103 @@ class MorningLogic:
             for card in col_sorted:
                 if card.blocked or card.archived:
                     continue
-                # Исключаем «На контроле» понедельника
                 if col_id == monday_col and _get_card_section(col_sorted, card) == "На контроле":
                     continue
                 pool.append(card)
 
-        logger.info("morning [monday]: пул для перераспределения={}", len(pool))
+        logger.info("morning [monday]: пул={}", len(pool))
 
-        # ── Шаг 0: Карточки с event_time на конкретный день текущей недели ────
-        # Обрабатываются до тег-классификации — дата события приоритетнее тегов.
-        # Например: карточка «Встреча» с event_time = среда 14:00 → колонка «Среда», секция «День».
+        # ── Шаг 0 (фикс): event_time на эту неделю → сразу в нужный день ────
         event_day_cards: list[Card] = []
         remaining_pool:  list[Card] = []
+
         for card in pool:
             et = card.event_time
             if et is not None:
-                et_date = et.date()
-                days_ahead = (et_date - today).days
-                if 0 <= days_ahead <= 6:  # дата попадает на текущую неделю (пн–вс)
+                et_local   = et.astimezone(_TZ_MSK) if et.tzinfo else et.replace(tzinfo=_TZ_MSK)
+                days_ahead = (et_local.date() - today).days
+                if 0 <= days_ahead <= 6:
                     event_day_cards.append(card)
                     continue
             remaining_pool.append(card)
 
         logger.info(
-            "morning [monday]: event_time на эту неделю={} остальных={}",
+            "morning [monday]: event_time на неделю={} остальных={}",
             len(event_day_cards), len(remaining_pool),
         )
-
         for card in event_day_cards:
-            et_weekday = card.event_time.date().weekday()  # type: ignore[union-attr]
-            target_col = COLUMN_IDS[WEEKDAY_COLUMNS[et_weekday]]
-            sec = BoardLogic.section_by_event_time(card)
+            et_local   = card.event_time.astimezone(_TZ_MSK)
+            target_col = COLUMN_IDS[WEEKDAY_COLUMNS[et_local.date().weekday()]]
+            sec        = BoardLogic.section_by_event_time(card)
             await self._move(card, target_col, sec, preloaded)
 
-        pool = remaining_pool  # дальнейшая классификация только для оставшихся
+        pool = remaining_pool
 
-        # ── Шаг 2a: Батч-перенос пула во «Следующая неделя» ──────────────────
-        # sort_order назначаем начиная с 10000 — выше любых реальных значений,
-        # чтобы не перебивать уже существующие карточки следующей недели.
+        # ── Батч-перенос пула во «Следующая неделя» ──────────────────────────
         BATCH_BASE = 10_000.0
         for i, card in enumerate(pool):
             try:
                 batch_so = BATCH_BASE + i
-                result = await self._client.move_card(card.id, next_week_col, batch_so)
+                result   = await self._client.move_card(card.id, next_week_col, batch_so)
                 if result is None:
-                    logger.error(
-                        "morning [monday]: batch FAIL id={} «{}»", card.id, card.title
-                    )
+                    logger.error("monday batch FAIL: id={} «{}»", card.id, card.title)
                     continue
-                # Синхронизируем preloaded
                 old_col = card.column_id
                 if old_col in preloaded:
                     preloaded[old_col] = [c for c in preloaded[old_col] if c.id != card.id]
                 card.column_id = next_week_col
                 card.sort_order = batch_so
                 preloaded.setdefault(next_week_col, []).append(card)
-                logger.debug("morning [monday]: batch OK id={} «{}»", card.id, card.title)
+                logger.debug("monday batch OK: id={} «{}»", card.id, card.title)
             except Exception as exc:
-                logger.error(
-                    "morning [monday]: batch ERROR id={} «{}» — {}", card.id, card.title, exc
-                )
+                logger.error("monday batch ERROR: id={} — {}", card.id, exc)
 
-        logger.info("morning [monday]: батч завершён, начинаем распределение")
+        logger.info("morning [monday]: батч завершён, распределяем")
 
-        # Маппинг «ПН»/«ВТ»/… → column_id
-        weekday_str_to_col: dict[str, int] = {
-            wd_str: COLUMN_IDS[col_name]
-            for wd_str, col_name in zip(
+        # Маппинг «ПН»…«ВС» → column_id
+        wd_to_col: dict[str, int] = {
+            k: COLUMN_IDS[v]
+            for k, v in zip(
                 ["ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС"],
                 WEEKDAY_COLUMNS,
             )
         }
 
-        # ── Классифицируем пул ────────────────────────────────────────────────
-        # Порядок: еженедельно → ежедневно+по будням → по выходным → остальные
-        group_weekly:  list[Card] = []
-        group_regular: list[Card] = []   # ежедневно + по будням → понедельник
-        group_weekend: list[Card] = []   # по выходным → суббота
-        group_other:   list[Card] = []
+        # ── Классификация пула ────────────────────────────────────────────────
+        monday_candidates: list[Card] = []
 
         for card in pool:
             tags = set(card.tag_ids)
+
             if tag_weekly in tags:
-                group_weekly.append(card)
-            elif tag_daily in tags or tag_workday in tags:
-                group_regular.append(card)
+                # Еженедельно → колонка по weekday-полю
+                wd     = card.weekday
+                col_id = wd_to_col.get(wd, monday_col) if wd else monday_col
+                sec    = BoardLogic.section_by_event_time(card)
+                await self._move(card, col_id, sec, preloaded)
+
             elif tag_weekend in tags:
-                group_weekend.append(card)
+                # По выходным → суббота
+                sec = BoardLogic.section_by_event_time(card)
+                await self._move(card, saturday_col, sec, preloaded)
+
             else:
-                group_other.append(card)
+                # Ежедневно, по будням и все прочие → кандидаты для расписания пн
+                monday_candidates.append(card)
 
-        logger.debug(
-            "morning [monday]: weekly={} regular={} weekend={} other={}",
-            len(group_weekly), len(group_regular), len(group_weekend), len(group_other),
-        )
+        logger.info("morning [monday]: кандидатов для расписания={}", len(monday_candidates))
 
-        # ── 2.1: Еженедельно → колонка по weekday-полю карточки ──────────────
-        for card in group_weekly:
-            wd = card.weekday          # 'ПН' / 'ВТ' / …
-            col_id = weekday_str_to_col.get(wd, monday_col) if wd else monday_col
-            sec = BoardLogic.section_by_event_time(card)
-            await self._move(card, col_id, sec, preloaded)
+        # ── Фазы 1–4 для понедельника ─────────────────────────────────────────
+        result = await self._schedule_today(monday_candidates, today, preloaded)
 
-        # ── 2.2: Ежедневно + по будням → понедельник ─────────────────────────
-        for card in group_regular:
-            sec = BoardLogic.section_by_event_time(card)
-            await self._move(card, monday_col, sec, preloaded)
-
-        # ── 2.3: По выходным → суббота ────────────────────────────────────────
-        for card in group_weekend:
-            sec = BoardLogic.section_by_event_time(card)
-            await self._move(card, saturday_col, sec, preloaded)
-
-        # ── 2.4: Остальные → по приоритету начиная с понедельника ────────────
-        sorted_other = self._logic.sort_cards_by_priority(group_other)
-        for card in sorted_other:
-            slot = await self._logic.find_slot_for_card(
-                card, monday_col, preloaded
-            )
-            if slot is None:
-                # find_slot_for_card возвращает (next_week, Утро) если нигде нет места,
-                # None означает полный сбой — страхуемся
-                logger.warning(
-                    "morning [monday]: нет слота для «{}» (id={}) — оставляем в Следующей неделе",
-                    card.title, card.id,
-                )
-                # Карточка уже в следующей неделе после батч-переноса — ничего не делаем
-            else:
-                await self._move(card, slot[0], slot[1], preloaded)
-
-        # ── Шаг 5: Далёкие времена → Следующая неделя ────────────────────────
-        # Карточки с event_time, попадающим на следующую неделю (пн–вс)
+        # ── Далёкие времена → Следующая неделя ────────────────────────────────
         next_monday = today + timedelta(days=7)
-        next_sunday  = today + timedelta(days=13)
+        next_sunday = today + timedelta(days=13)
 
         try:
             far_cards = await self._client.get_cards(far_future_col)
         except Exception as exc:
-            logger.error("morning [monday]: не удалось загрузить Далёкие времена — {}", exc)
+            logger.error("morning [monday]: Далёкие времена недоступны — {}", exc)
             far_cards = []
 
         promoted = 0
@@ -471,34 +673,23 @@ class MorningLogic:
             et = card.event_time
             if et is None:
                 continue
-            et_date = et.date()
+            et_local = et.astimezone(_TZ_MSK) if et.tzinfo else et.replace(tzinfo=_TZ_MSK)
+            et_date  = et_local.date()
             if next_monday <= et_date <= next_sunday:
                 sec = BoardLogic.section_by_event_time(card)
                 try:
-                    so = await self._logic.get_section_sort_order(next_week_col, sec)
-                    result = await self._client.move_card(card.id, next_week_col, so)
-                    if result:
+                    so  = await self._logic.get_section_sort_order(next_week_col, sec)
+                    res = await self._client.move_card(card.id, next_week_col, so)
+                    if res:
                         promoted += 1
                         logger.info(
-                            "morning [monday]: Далёкие → Следующая неделя: «{}» (id={}) date={}",
+                            "monday: Далёкие → Следующая неделя «{}» (id={}) date={}",
                             card.title, card.id, et_date,
                         )
                     else:
-                        logger.error(
-                            "morning [monday]: не удалось перенести из Далёких id={}", card.id
-                        )
+                        logger.error("monday: Далёкие FAIL id={}", card.id)
                 except Exception as exc:
-                    logger.error(
-                        "morning [monday]: ошибка переноса из Далёких id={} — {}", card.id, exc
-                    )
+                    logger.error("monday: Далёкие ERROR id={} — {}", card.id, exc)
 
-        logger.info(
-            "morning [monday]: завершено, promoted_from_far={}", promoted
-        )
-
-        # ── Возвращаем актуальные карточки понедельника ───────────────────────
-        try:
-            return await self._client.get_cards(monday_col)
-        except Exception as exc:
-            logger.error("morning [monday]: не удалось загрузить итог — {}", exc)
-            return []
+        logger.info("morning [monday]: завершено, promoted_from_far={}", promoted)
+        return result
