@@ -25,12 +25,10 @@ _TZ_MSK = timezone(timedelta(hours=3))
 # Тег «вечерняя» (UPD 4, id=1097987)
 _TAG_EVENING = 1097987
 
-# Блоки времени (минуты от начала суток)
-_BLOCKS: dict[str, tuple[int, int]] = {
-    "Утро":  (9 * 60,  14 * 60),   # 09:00–14:00, 300 мин
-    "День":  (15 * 60, 19 * 60),   # 15:00–19:00, 240 мин
-    "Вечер": (19 * 60, 22 * 60),   # 19:00–22:00, 180 мин
-}
+# Временные блоки (мин от начала суток)
+# «Утро» и «День» — ярлыки приоритета, оба берут время из единого рабочего пула.
+_WORK_START,    _WORK_END    = 9 * 60, 19 * 60   # 09:00–19:00 единый рабочий блок
+_EVENING_START, _EVENING_END = 19 * 60, 22 * 60  # 19:00–22:00
 
 # Длительность по умолчанию если size не задан (часы)
 _DEFAULT_HOURS = 0.25
@@ -62,15 +60,16 @@ def _fmt_min(minutes: int) -> str:
 # ── Планировщик одного блока ──────────────────────────────────────────────────
 
 class _BlockScheduler:
-    """Управляет временными слотами внутри одного блока (Утро/День/Вечер).
+    """Управляет временными слотами внутри одного блока.
 
+    Принимает границы блока в минутах от начала суток.
     Поддерживает сегментированное размещение: задача может «обтекать»
     фиксированные события, занимая несколько свободных интервалов подряд.
     """
 
-    def __init__(self, section: str) -> None:
-        self.section = section
-        self._start, self._end = _BLOCKS[section]
+    def __init__(self, start_min: int, end_min: int) -> None:
+        self._start = start_min
+        self._end   = end_min
         self._occupied: list[tuple[int, int]] = []
         self._cursor: int = self._start
 
@@ -232,20 +231,24 @@ class MorningLogic:
     # ── Назначение event_time ────────────────────────────────────────────────
 
     async def _set_event_time(self, card: Card, dt: datetime) -> bool:
+        """Назначает event_time карточке через update_card (property id_590358)."""
         try:
-            prop = {
-                "date":     dt.strftime("%Y-%m-%d"),
-                "time":     dt.strftime("%H:%M:%S"),
-                "tzOffset": 180,
-            }
-            await self._client.update_card(card.id, properties={"id_590358": prop})
-            card.properties["id_590358"] = prop
-            logger.info("set_event_time: «{}» (id={}) → {} {}",
-                        card.title, card.id, prop["date"], prop["time"])
+            iso_str = dt.strftime("%Y-%m-%dT%H:%M:%S+03:00")
+            await self._client.update_card(
+                card.id, properties={"id_590358": iso_str}
+            )
+            # Обновляем локальную копию properties для корректной работы card.event_time
+            card.properties["id_590358"] = {"value": iso_str}
+            logger.info(
+                "set_event_time: «{}» (id={}) → {}",
+                card.title, card.id, iso_str,
+            )
             return True
         except Exception as exc:
-            logger.error("set_event_time ERROR: «{}» (id={}) — {}",
-                         card.title, card.id, exc)
+            logger.error(
+                "set_event_time ERROR: «{}» (id={}) — {}",
+                card.title, card.id, exc,
+            )
             return False
 
     # ── Фазы 1–4: расписание для одного дня ─────────────────────────────────
@@ -265,11 +268,9 @@ class MorningLogic:
         tomorrow      = today + timedelta(days=1)
         day_after     = today + timedelta(days=2)
 
-        schedulers = {
-            "Утро":  _BlockScheduler("Утро"),
-            "День":  _BlockScheduler("День"),
-            "Вечер": _BlockScheduler("Вечер"),
-        }
+        # Единый рабочий блок 09:00–19:00 (Утро и День — ярлыки приоритета, не окна)
+        work_sched    = _BlockScheduler(_WORK_START,    _WORK_END)
+        evening_sched = _BlockScheduler(_EVENING_START, _EVENING_END)
 
         # ── Фаза 1: фиксированные event_time == today ─────────────────────────
         phase1:    list[Card] = []
@@ -287,14 +288,20 @@ class MorningLogic:
         for card in sorted(phase1, key=lambda c: c.event_time):
             et_local  = card.event_time.astimezone(_TZ_MSK)
             hour      = et_local.hour
-            section   = "Утро" if hour < 12 else ("Вечер" if hour >= 19 else "День")
-            await self._move(card, today_col_id, section, preloaded)
-
-            # Резервируем слот и записываем единственный сегмент
             start_min = hour * 60 + et_local.minute
             size_h    = card.size if (card.size and card.size != 999) else _DEFAULT_HOURS
             end_min   = start_min + round(size_h * 60)
-            schedulers[section].reserve(start_min, end_min)
+
+            if hour < 19:
+                # Рабочее время: резервируем в work_sched
+                # Секция на доске: до 12:00 → «Утро», с 12:00 → «День»
+                section = "Утро" if hour < 12 else "День"
+                work_sched.reserve(start_min, end_min)
+            else:
+                section = "Вечер"
+                evening_sched.reserve(start_min, end_min)
+
+            await self._move(card, today_col_id, section, preloaded)
             self.last_segments[card.id] = [(_fmt_min(start_min), _fmt_min(end_min))]
 
         logger.info(
@@ -318,10 +325,17 @@ class MorningLogic:
         #   9. Все остальные с тегом «вечерняя»
 
         groups: list[list[Card]] = [[] for _ in range(9)]
-        group_section = [
-            "Утро",  "Утро",             # 0, 1
-            "День",  "День",  "День",  "День",  # 2, 3, 4, 5
-            "Вечер", "Вечер", "Вечер", # 6, 7, 8
+        # (sched, секция на доске)
+        group_sched_section: list[tuple[_BlockScheduler, str]] = [
+            (work_sched,    "Утро"),   # 0: критическое + dl сегодня
+            (work_sched,    "Утро"),   # 1: важное      + dl сегодня
+            (work_sched,    "День"),   # 2: критическое + dl скоро
+            (work_sched,    "День"),   # 3: важное      + dl скоро
+            (work_sched,    "День"),   # 4: среднее     + dl скоро
+            (work_sched,    "День"),   # 5: все остальные (не «вечерняя»)
+            (evening_sched, "Вечер"),  # 6: вечерняя + критическое + dl сегодня
+            (evening_sched, "Вечер"),  # 7: вечерняя + важное      + dl сегодня
+            (evening_sched, "Вечер"),  # 8: вечерняя — остальные
         ]
 
         for card in remaining:
@@ -359,8 +373,7 @@ class MorningLogic:
         overflow: list[Card] = []
 
         for g_idx, group_cards in enumerate(groups):
-            section = group_section[g_idx]
-            sched   = schedulers[section]
+            sched, section = group_sched_section[g_idx]
 
             for card in group_cards:
                 # Вычисляем нужную длительность
