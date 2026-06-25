@@ -33,6 +33,9 @@ _EVENING_START, _EVENING_END = 19 * 60, 22 * 60  # 19:00–22:00
 # Длительность по умолчанию если size не задан (часы)
 _DEFAULT_HOURS = 0.25
 
+# Длительность size=999 если есть другие задачи в пуле (мин)
+_SIZE_999_DEFAULT_MIN = 60
+
 
 # ── Вспомогательные функции ───────────────────────────────────────────────────
 
@@ -114,6 +117,10 @@ class _BlockScheduler:
         времени недостаточно — возвращает None (задача уходит в overflow).
 
         Возвращает список сегментов [(start_min, end_min), ...] или None.
+
+        Курсор продвигается до конца ПЕРВОГО сегмента (не последнего).
+        Это позволяет следующей задаче занять слоты сразу после первого сегмента
+        текущей задачи — не «перепрыгивать» через прерывистую задачу.
         """
         if duration_min <= 0:
             return None
@@ -137,9 +144,12 @@ class _BlockScheduler:
             remaining -= chunk
 
         self._occupied.sort()
-        # Продвигаем курсор за конец последнего сегмента
+        # Продвигаем курсор до конца ПЕРВОГО сегмента.
+        # Следующая задача начнёт с этой точки и сможет занять свободное время
+        # между сегментами текущей задачи (например, 09:30–12:00 если текущая
+        # прыгнула через фиксированное событие с 12:00).
         if segments:
-            self._cursor = segments[-1][1]
+            self._cursor = segments[0][1]
 
         return segments
 
@@ -312,19 +322,26 @@ class MorningLogic:
         # ── Фаза 2: 9 групп приоритета ────────────────────────────────────────
         #
         # → Утро (не «вечерняя»):
-        #   1. Критическое + deadline сегодня, size ASC
-        #   2. Важное     + deadline сегодня, size ASC
+        #   0. Критическое + deadline сегодня, size ASC
+        #   1. Важное     + deadline сегодня, size ASC
         # → День (не «вечерняя»):
-        #   3. Критическое + deadline завтра/послезавтра
-        #   4. Важное      + deadline завтра/послезавтра
-        #   5. Среднее     + deadline завтра/послезавтра
-        #   6. Все остальные без тега «вечерняя»
+        #   2. Критическое + deadline завтра/послезавтра
+        #   3. Важное      + deadline завтра/послезавтра
+        #   4. Среднее     + deadline сегодня или завтра/послезавтра
+        #   5. Все остальные без тега «вечерняя», size не 999
+        #   (6 — см. ниже: size 999 вынесен в конец обработки)
         # → Вечер (тег «вечерняя»):
-        #   7. Критическое + deadline сегодня, size ASC
-        #   8. Важное      + deadline сегодня, size ASC
-        #   9. Все остальные с тегом «вечерняя»
+        #   6. Критическое + deadline сегодня, size ASC
+        #   7. Важное      + deadline сегодня, size ASC
+        #   8. Все остальные с тегом «вечерняя»
+        #
+        # Карточки size=999 без тега «вечерняя» собираются отдельно и
+        # обрабатываются ПОСЛЕДНИМИ в рабочем блоке (после групп 0–5),
+        # чтобы корректно вычислить сколько времени у них осталось.
 
         groups: list[list[Card]] = [[] for _ in range(9)]
+        work_999: list[Card] = []   # size=999, не вечерняя — обрабатываются после групп 0–5
+
         # (sched, секция на доске)
         group_sched_section: list[tuple[_BlockScheduler, str]] = [
             (work_sched,    "Утро"),   # 0: критическое + dl сегодня
@@ -332,7 +349,7 @@ class MorningLogic:
             (work_sched,    "День"),   # 2: критическое + dl скоро
             (work_sched,    "День"),   # 3: важное      + dl скоро
             (work_sched,    "День"),   # 4: среднее     + dl скоро
-            (work_sched,    "День"),   # 5: все остальные (не «вечерняя»)
+            (work_sched,    "День"),   # 5: все остальные (не «вечерняя», size не 999)
             (evening_sched, "Вечер"),  # 6: вечерняя + критическое + dl сегодня
             (evening_sched, "Вечер"),  # 7: вечерняя + важное      + dl сегодня
             (evening_sched, "Вечер"),  # 8: вечерняя — остальные
@@ -349,7 +366,11 @@ class MorningLogic:
             soon_dl   = (dl_date in (tomorrow, day_after)) if dl_date else False
 
             if not is_eve:
-                if   imp == "критическое" and today_dl:  groups[0].append(card)
+                if card.size == 999:
+                    # size=999 без тега «вечерняя» — откладываем на самый конец
+                    # рабочего блока, чтобы занять только оставшееся время
+                    work_999.append(card)
+                elif imp == "критическое" and today_dl:  groups[0].append(card)
                 elif imp == "важное"       and today_dl:  groups[1].append(card)
                 elif imp == "критическое" and soon_dl:   groups[2].append(card)
                 elif imp == "важное"       and soon_dl:   groups[3].append(card)
@@ -360,26 +381,63 @@ class MorningLogic:
                 elif imp == "важное"       and today_dl:  groups[7].append(card)
                 else:                                      groups[8].append(card)
 
-        # Группы 1, 2, 7, 8 — сортировка по size ASC (сначала быстрые)
+        # Группы 0, 1, 6, 7 — сортировка по size ASC (сначала быстрые)
         for i in (0, 1, 6, 7):
             groups[i].sort(key=lambda c: c.size if (c.size and c.size != 999) else 0)
 
         logger.debug(
-            "_schedule_today: groups = {}",
-            [len(g) for g in groups],
+            "_schedule_today: groups = {} work_999={}",
+            [len(g) for g in groups], len(work_999),
         )
 
         # ── Фаза 3: сегментированное назначение времени и перемещение ────────
         overflow: list[Card] = []
 
+        # Обрабатываем группы 0–8, затем work_999 отдельно в конце
+        processing_order: list[tuple[list[Card], _BlockScheduler, str]] = []
         for g_idx, group_cards in enumerate(groups):
             sched, section = group_sched_section[g_idx]
+            processing_order.append((group_cards, sched, section))
+        # work_999 — последними в рабочем блоке
+        processing_order.append((work_999, work_sched, "День"))
 
-            for card in group_cards:
+        # Для вычисления has_more при size=999: считаем сколько задач
+        # ещё будет обработано в том же блоке (work_sched или evening_sched)
+        # после текущей позиции в processing_order.
+        def _count_remaining_in_sched(
+            from_step: int,
+            from_card_idx: int,
+            target_sched: _BlockScheduler,
+        ) -> int:
+            """Количество карточек, которые будут обработаны в target_sched
+            после текущей позиции (from_step, from_card_idx)."""
+            count = 0
+            for step_idx, (step_cards, step_sched, _) in enumerate(processing_order):
+                if step_sched is not target_sched:
+                    continue
+                start_ci = from_card_idx + 1 if step_idx == from_step else 0
+                count += len(step_cards) - start_ci
+            return count
+
+        for step_idx, (group_cards, sched, section) in enumerate(processing_order):
+            for card_idx, card in enumerate(group_cards):
                 # Вычисляем нужную длительность
                 if card.size == 999:
-                    # Заполнить всё оставшееся свободное время блока
-                    dur_min = sched.remaining_minutes()
+                    # size=999: 1 час если в блоке ещё есть задачи,
+                    # иначе занять всё оставшееся свободное время.
+                    more_after = _count_remaining_in_sched(step_idx, card_idx, sched)
+                    if more_after > 0:
+                        dur_min = _SIZE_999_DEFAULT_MIN
+                        logger.debug(
+                            "size=999 «{}» (id={}): has_more={}, dur={}min",
+                            card.title, card.id, more_after, dur_min,
+                        )
+                    else:
+                        dur_min = sched.remaining_minutes()
+                        logger.debug(
+                            "size=999 «{}» (id={}): last in block, dur={}min",
+                            card.title, card.id, dur_min,
+                        )
                 elif card.size is None:
                     dur_min = round(_DEFAULT_HOURS * 60)
                 else:
@@ -387,8 +445,8 @@ class MorningLogic:
 
                 if dur_min == 0:
                     logger.info(
-                        "overflow (block full): «{}» (id={}) g={}",
-                        card.title, card.id, g_idx + 1,
+                        "overflow (block full): «{}» (id={}) step={}",
+                        card.title, card.id, step_idx,
                     )
                     overflow.append(card)
                     continue
@@ -397,8 +455,8 @@ class MorningLogic:
                 segments = sched.try_place_segmented(dur_min)
                 if segments is None:
                     logger.info(
-                        "overflow (no free time): «{}» (id={}) g={}",
-                        card.title, card.id, g_idx + 1,
+                        "overflow (no free time): «{}» (id={}) step={}",
+                        card.title, card.id, step_idx,
                     )
                     overflow.append(card)
                     continue
@@ -407,8 +465,8 @@ class MorningLogic:
                 str_segs = [(_fmt_min(s), _fmt_min(e)) for s, e in segments]
                 self.last_segments[card.id] = str_segs
                 logger.info(
-                    "placed: «{}» (id={}) g={} segs={}",
-                    card.title, card.id, g_idx + 1,
+                    "placed: «{}» (id={}) step={} segs={}",
+                    card.title, card.id, step_idx,
                     " ".join(f"{s}–{e}" for s, e in str_segs),
                 )
 
