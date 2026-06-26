@@ -25,6 +25,14 @@ _TZ_MSK = timezone(timedelta(hours=3))
 # Тег «вечерняя» (UPD 4, id=1097987)
 _TAG_EVENING = 1097987
 
+# Теги регулярных задач: если у карточки задано время События — она попадает в Phase 1
+_RECURRING_FIXED_TAGS = frozenset([
+    TAG_IDS["ежедневно"],
+    TAG_IDS["еженедельно"],
+    TAG_IDS["по будням"],
+    TAG_IDS["по выходным"],
+])
+
 # Временные блоки (мин от начала суток)
 # «Утро» и «День» — ярлыки приоритета, оба берут время из единого рабочего пула.
 _WORK_START,    _WORK_END    = 9 * 60, 19 * 60   # 09:00–19:00 единый рабочий блок
@@ -243,15 +251,18 @@ class MorningLogic:
     async def _set_event_time(self, card: Card, dt: datetime) -> bool:
         """Назначает event_time карточке через update_card (property id_590358)."""
         try:
-            iso_str = dt.strftime("%Y-%m-%dT%H:%M:%S+03:00")
+            prop_value = {
+                "date": dt.strftime("%Y-%m-%d"),
+                "time": dt.strftime("%H:%M:%S"),
+                "tzOffset": 180,
+            }
             await self._client.update_card(
-                card.id, properties={"id_590358": iso_str}
+                card.id, properties={"id_590358": prop_value}
             )
-            # Обновляем локальную копию properties для корректной работы card.event_time
-            card.properties["id_590358"] = {"value": iso_str}
+            card.properties["id_590358"] = prop_value
             logger.info(
-                "set_event_time: «{}» (id={}) → {}",
-                card.title, card.id, iso_str,
+                "set_event_time: «{}» (id={}) → {}T{}",
+                card.title, card.id, prop_value["date"], prop_value["time"],
             )
             return True
         except Exception as exc:
@@ -282,28 +293,47 @@ class MorningLogic:
         work_sched    = _BlockScheduler(_WORK_START,    _WORK_END)
         evening_sched = _BlockScheduler(_EVENING_START, _EVENING_END)
 
-        # ── Фаза 1: фиксированные event_time == today ─────────────────────────
+        # ── Фаза 1: фиксированные события ─────────────────────────────────────
+        # Попадают: event_time.date() == today
+        # ИЛИ карточка с регулярным тегом (ежедневно/еженедельно/по будням/по выходным)
+        # у которой явно задано время события (не 00:00).
         phase1:    list[Card] = []
         remaining: list[Card] = []
 
         for card in candidates:
             et = card.event_time
-            if et is not None:
-                et_local = et.astimezone(_TZ_MSK) if et.tzinfo else et.replace(tzinfo=_TZ_MSK)
-                if et_local.date() == today:
-                    phase1.append(card)
-                    continue
-            remaining.append(card)
+            if et is None:
+                remaining.append(card)
+                continue
+            et_local = et.astimezone(_TZ_MSK) if et.tzinfo else et.replace(tzinfo=_TZ_MSK)
+            is_today     = et_local.date() == today
+            is_recurring = bool(set(card.tag_ids) & _RECURRING_FIXED_TAGS)
+            has_time     = (et_local.hour, et_local.minute) != (0, 0)
+            if is_today or (is_recurring and has_time):
+                phase1.append(card)
+            else:
+                remaining.append(card)
 
         for card in sorted(phase1, key=lambda c: c.event_time):
-            et_local  = card.event_time.astimezone(_TZ_MSK)
+            et = card.event_time
+            et_local = et.astimezone(_TZ_MSK) if et.tzinfo else et.replace(tzinfo=_TZ_MSK)
+
+            # Регулярная задача с другой датой: обновляем только дату на сегодня
+            if et_local.date() != today:
+                ev_dt = datetime(
+                    today.year, today.month, today.day,
+                    et_local.hour, et_local.minute, et_local.second,
+                    tzinfo=_TZ_MSK,
+                )
+                await self._set_event_time(card, ev_dt)
+                et_local = ev_dt
+
             hour      = et_local.hour
             start_min = hour * 60 + et_local.minute
             size_h    = card.size if (card.size and card.size != 999) else _DEFAULT_HOURS
             end_min   = start_min + round(size_h * 60)
 
             if hour < 19:
-                # Рабочее время: резервируем в work_sched
                 # Секция на доске: до 12:00 → «Утро», с 12:00 → «День»
                 section = "Утро" if hour < 12 else "День"
                 work_sched.reserve(start_min, end_min)
