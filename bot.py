@@ -1,20 +1,20 @@
 """
 bot.py — точка входа системы личного планирования.
 
-Собирает все зависимости, запускает APScheduler и Telegram polling
-в одном asyncio event loop.
+Поддержка нескольких пользователей: загружает конфиг из users.json
+(или fallback на env-переменные), создаёт изолированный набор зависимостей
+для каждого пользователя и запускает единый Scheduler + Telegram polling.
 
 Порядок запуска:
-    1. Создаём все клиенты и логику
-    2. Создаём Scheduler (регистрирует джобы, но ещё не стартует)
-    3. Определяем morning_routine / evening_routine для handlers —
-       они делегируют в Scheduler, который сам отправляет через Notifier
-    4. Запускаем Scheduler
-    5. Запускаем Telegram Application (polling)
+    1. load_users() — список пользователей
+    2. Для каждого пользователя: KaitenClient → setup_board → BoardLogic / MorningLogic / Notifier
+    3. Создаём Scheduler (один, итерирует по всем пользователям)
+    4. Для каждого пользователя: UserHandlerCtx с коллбэками morning/evening
+    5. Запускаем Scheduler и Telegram Application (polling)
     6. Держим event loop живым до сигнала остановки
 
 Остановка:
-    Ctrl+C → KeyboardInterrupt → блок finally закрывает всё в обратном порядке.
+    Ctrl+C / SIGTERM → блок finally закрывает всё в обратном порядке.
 """
 
 from __future__ import annotations
@@ -27,13 +27,14 @@ from loguru import logger
 
 import db  # noqa: F401 — инициализирует SQLite при импорте
 from board_logic import BoardLogic
+from board_setup import setup_board
 from claude_client import ClaudeClient
-from evening_logic import EveningLogic
-from handlers import HandlersConfig, build_handlers
+from handlers import HandlersConfig, UserHandlerCtx, build_handlers
 from kaiten_client import KaitenClient
 from morning_logic import MorningLogic
 from notifier import Notifier
-from scheduler import Scheduler
+from scheduler import Scheduler, UserSchedulerCtx
+from user_config import load_users
 
 
 # ── Логирование ───────────────────────────────────────────────────────────────
@@ -67,52 +68,69 @@ async def main() -> None:
     _setup_logging()
     logger.info("bot: ── ЗАПУСК СИСТЕМЫ ──────────────────────────────────────")
 
-    # ── 1. Зависимости ────────────────────────────────────────────────────────
-    kaiten   = KaitenClient()
-    logic    = BoardLogic(kaiten)
-    claude   = ClaudeClient()
-    notifier = Notifier()
-    morning  = MorningLogic(kaiten, logic)
-    evening  = EveningLogic(kaiten, logic, claude)
+    users = load_users()
+    claude = ClaudeClient()
 
-    # ── 2. Планировщик ────────────────────────────────────────────────────────
-    scheduler = Scheduler(
-        morning=morning,
-        evening=evening,
-        claude=claude,
-        notifier=notifier,
-        kaiten=kaiten,
-        logic=logic,
-    )
+    user_sched_ctxs: list[UserSchedulerCtx] = []
+    users_handler: dict[int, UserHandlerCtx] = {}
+    kaiten_clients: list[KaitenClient] = []  # для закрытия в finally
 
-    # ── 3. Коллбэки для handlers ──────────────────────────────────────────────
-    # Scheduler.run_morning_job() / run_evening_job() возвращают None —
-    # они сами отправляют результат через Notifier.
-    # Handlers ожидают str: пустая строка — сигнал «дубль не нужен».
-    # Handlers проверяют `if plan_text:` перед reply — пустую строку не шлют.
+    for user in users:
+        # 1. Создать KaitenClient (lane_id=0 → определится в setup_board)
+        client = KaitenClient(board_id=user.kaiten_board_id, lane_id=user.kaiten_lane_id)
+        kaiten_clients.append(client)
 
-    async def morning_routine() -> str:
-        """Делегирует в Scheduler; план уже отправлен через Notifier."""
-        await scheduler.run_morning_job()
-        return ""
+        # 2. Настроить доску (создать колонки/разделители, определить lane_id)
+        try:
+            column_ids = await setup_board(client, user)
+        except Exception as exc:
+            logger.error("setup_board failed for user={}: {}", user.user_id, exc)
+            raise
 
-    async def evening_routine() -> str:
-        """Делегирует в Scheduler; итог уже отправлен через Notifier."""
-        await scheduler.run_evening_job()
-        return ""
+        # 3. Создать зависимости
+        logic = BoardLogic(client, column_ids)
+        morning = MorningLogic(client, logic)
+        notifier = Notifier(chat_id=user.telegram_chat_id)
 
-    # ── 4. Telegram Application ───────────────────────────────────────────────
-    cfg = HandlersConfig(
-        kaiten=kaiten,
-        logic=logic,
-        claude=claude,
-        notifier=notifier,
-        morning_routine=morning_routine,
-        evening_routine=evening_routine,
-    )
+        # 4. Собрать контексты
+        sched_ctx = UserSchedulerCtx(
+            user_cfg=user,
+            morning=morning,
+            notifier=notifier,
+            kaiten=client,
+            logic=logic,
+        )
+        user_sched_ctxs.append(sched_ctx)
+
+    # 5. Создать Scheduler (до UserHandlerCtx — нужен для коллбэков)
+    scheduler = Scheduler(users=user_sched_ctxs, claude=claude)
+
+    # 6. Создать handler-контексты с коллбэками утра/вечера
+    for sched_ctx in user_sched_ctxs:
+        user = sched_ctx.user_cfg
+
+        # Scheduler.run_morning_for_user() сам отправляет план через Notifier.
+        # Handlers проверяют `if plan_text:` — None/None не дублирует отправку.
+        async def morning_routine(_sc=sched_ctx) -> None:
+            await scheduler.run_morning_for_user(_sc)
+
+        async def evening_routine(_sc=sched_ctx) -> None:
+            pass  # evening отключён в v4
+
+        users_handler[user.telegram_chat_id] = UserHandlerCtx(
+            user_id=user.user_id,
+            kaiten=sched_ctx.kaiten,
+            logic=sched_ctx.logic,
+            notifier=sched_ctx.notifier,
+            morning_routine=morning_routine,
+            evening_routine=evening_routine,
+        )
+
+    # 7. Telegram Application
+    cfg = HandlersConfig(users=users_handler, claude=claude)
     app = build_handlers(cfg)
 
-    # ── 5. Запуск ─────────────────────────────────────────────────────────────
+    # 8. Запуск
     stop_event = asyncio.Event()
 
     # Обработчик SIGTERM (для Railway / Docker graceful shutdown)
@@ -133,7 +151,10 @@ async def main() -> None:
         await app.initialize()
         await app.start()
         await app.updater.start_polling(drop_pending_updates=True)
-        logger.info("bot: Telegram polling запущен — ожидаем сообщений")
+        logger.info(
+            "bot: Telegram polling запущен — ожидаем сообщений ({} пользователей)",
+            len(users),
+        )
 
         # Держим event loop живым до Ctrl+C или SIGTERM
         await stop_event.wait()
@@ -160,12 +181,14 @@ async def main() -> None:
         except Exception as exc:
             logger.error("bot: ошибка при остановке Scheduler — {}", exc)
 
-        # Закрываем HTTP-клиент Kaiten
-        try:
-            await kaiten.close()
-            logger.info("bot: KaitenClient закрыт")
-        except Exception as exc:
-            logger.error("bot: ошибка при закрытии KaitenClient — {}", exc)
+        # Закрываем HTTP-клиенты Kaiten (по одному на пользователя)
+        for client in kaiten_clients:
+            try:
+                await client.close()
+            except Exception as exc:
+                logger.error("bot: ошибка при закрытии KaitenClient — {}", exc)
+        if kaiten_clients:
+            logger.info("bot: KaitenClient(s) закрыты ({})", len(kaiten_clients))
 
         # Закрываем Claude API клиент
         try:

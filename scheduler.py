@@ -2,18 +2,20 @@
 scheduler.py — APScheduler джобы системы планирования.
 
 Джобы:
-    run_morning_job       — 06:30 ежедневно, план дня
-    run_evening_job       — 21:00 ежедневно, [UPD 4] временно отключено
-    run_reminder_job      — каждую минуту, напоминания о событиях
-    run_archive_cleanup_job — каждый пн в 06:00, удаление старых карточек из Архива
+    run_morning_job          — 06:30 ежедневно, план дня (итерирует по всем пользователям)
+    run_evening_job          — 21:00 ежедневно, [UPD 4] временно отключено
+    run_reminder_job         — каждую минуту, напоминания о событиях
+    run_archive_cleanup_job  — каждый пн в 06:00, удаление старых карточек из Архива
 
 Стек: APScheduler 3.x (AsyncIOScheduler), loguru, asyncio.
 Флаги дублирования хранятся в SQLite через модуль db.
+Мульти-пользователь: каждый пользователь описан UserSchedulerCtx.
 """
 
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from datetime import date, datetime, timezone, timedelta
 from typing import Any
 
@@ -24,11 +26,24 @@ from loguru import logger
 
 import db
 from kaiten_client import Card, KaitenClient, TAG_IDS, ARCHIVE_COLUMN_ID
-from board_logic import BoardLogic, WEEKDAY_COLUMNS, COLUMN_IDS
+from board_logic import BoardLogic
 from claude_client import ClaudeClient
 from notifier import Notifier
 from morning_logic import MorningLogic
-from evening_logic import EveningLogic
+from user_config import UserConfig
+
+
+# ── UserSchedulerCtx ──────────────────────────────────────────────────────────
+
+@dataclass
+class UserSchedulerCtx:
+    """Контекст одного пользователя для джоб планировщика."""
+    user_cfg: UserConfig
+    morning:  MorningLogic
+    notifier: Notifier
+    kaiten:   KaitenClient
+    logic:    BoardLogic
+
 
 # ── Константы ─────────────────────────────────────────────────────────────────
 
@@ -130,9 +145,8 @@ def _now_msk() -> datetime:
 def _reminder_key(card_id: int, minutes_before: int) -> str:
     """Уникальный ключ для отправленного напоминания.
 
-    Формат: "{card_id}:{minutes_before}:{YYYY-MM-DD HH:MM}"
-    Включает дату события чтобы не дублировать только в рамках одного дня,
-    но корректно повторять на следующий день для регулярных задач.
+    Формат: "{card_id}:{minutes_before}"
+    Сбрасывается при рестарте сервиса.
     """
     return f"{card_id}:{minutes_before}"
 
@@ -140,28 +154,25 @@ def _reminder_key(card_id: int, minutes_before: int) -> str:
 # ── Scheduler ─────────────────────────────────────────────────────────────────
 
 class Scheduler:
-    """Оболочка над AsyncIOScheduler с джобами утра, вечера и напоминаний."""
+    """Оболочка над AsyncIOScheduler с джобами утра, вечера, напоминаний и архива.
+
+    Поддерживает мульти-пользовательский режим: каждая джоба итерирует
+    по всем пользователям из списка users.
+    """
 
     def __init__(
         self,
-        morning: MorningLogic,
-        evening: EveningLogic,
+        users: list[UserSchedulerCtx],
         claude: ClaudeClient,
-        notifier: Notifier,
-        kaiten: KaitenClient,
-        logic: BoardLogic,
     ) -> None:
-        self._morning  = morning
-        self._evening  = evening
-        self._claude   = claude
-        self._notifier = notifier
-        self._kaiten   = kaiten
-        self._logic    = logic
+        self._users  = users
+        self._claude = claude
 
-        # Ключи уже отправленных напоминаний — сбрасываются при рестарте сервиса.
-        # Для одной сессии достаточно in-memory set; при рестарте в худшем случае
-        # пользователь получит одно дублирующее напоминание.
-        self._sent_reminders: set[str] = set()
+        # Ключи уже отправленных напоминаний, отдельный set на каждого пользователя.
+        # Сбрасываются при рестарте сервиса.
+        self._sent_reminders: dict[str, set[str]] = {
+            u.user_cfg.user_id: set() for u in users
+        }
 
         self._scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
         self._register_jobs()
@@ -257,35 +268,58 @@ class Scheduler:
     # ── Утренняя джоба ────────────────────────────────────────────────────────
 
     async def run_morning_job(self) -> None:
-        """Утренняя логика: перенос карточек + план дня от Claude.
+        """Запускает утреннюю логику для каждого пользователя.
+
+        Ошибка одного пользователя не прерывает остальных.
+        """
+        for user_ctx in self._users:
+            try:
+                await self._run_morning_for_user(user_ctx)
+            except Exception as exc:
+                logger.error(
+                    "morning_job user={}: {}",
+                    user_ctx.user_cfg.user_id, exc,
+                )
+
+    async def run_morning_for_user(self, user_ctx: UserSchedulerCtx) -> None:
+        """Публичный метод для ручного запуска утренней логики (из handlers)."""
+        await self._run_morning_for_user(user_ctx)
+
+    async def _run_morning_for_user(self, user_ctx: UserSchedulerCtx) -> None:
+        """Утренняя логика для одного пользователя: перенос карточек + план от Claude.
 
         Проверяет флаг в SQLite — если уже выполнено сегодня, пропускает.
-        Публичный метод чтобы handlers.py мог вызвать его напрямую при команде «утро».
         """
-        today = date.today()
-        logger.info("morning_job: старт ({})", today.isoformat())
+        today   = date.today()
+        user_id = user_ctx.user_cfg.user_id
+        logger.info("morning_job user={}: старт ({})", user_id, today.isoformat())
 
         # ── Проверка флага ────────────────────────────────────────────────────
         loop = asyncio.get_event_loop()
-        already_done = await loop.run_in_executor(None, db.is_morning_done, today)
+        already_done = await loop.run_in_executor(
+            None, db.is_morning_done, today, user_id
+        )
         if already_done:
-            logger.info("morning_job: уже выполнено сегодня, пропускаем")
+            logger.info("morning_job user={}: уже выполнено сегодня, пропускаем", user_id)
             return
 
         # ── Перенос карточек ──────────────────────────────────────────────────
         try:
-            cards: list[Card] = await self._morning.run(today)
-            segments_map = self._morning.last_segments
-            logger.info("morning_job: перенос завершён, карточек сегодня={}", len(cards))
+            cards: list[Card] = await user_ctx.morning.run(today)
+            segments_map = user_ctx.morning.last_segments
+            logger.info(
+                "morning_job user={}: перенос завершён, карточек сегодня={}",
+                user_id, len(cards),
+            )
         except Exception as exc:
-            logger.error("morning_job: ошибка morning.run — {}", exc)
-            await self._notifier.send("⚠️ Ошибка при переносе карточек. Проверь логи.")
+            logger.error("morning_job user={}: ошибка morning.run — {}", user_id, exc)
+            await user_ctx.notifier.send("Ошибка при переносе карточек. Проверь логи.")
             return
 
-        # ── Загружаем комментарии параллельно для всех не-разделителей ──────────
+        # ── Загружаем комментарии параллельно для всех не-разделителей ────────
         task_cards = [c for c in cards if not c.blocked and not c.archived]
         comments_list = await asyncio.gather(
-            *[self._kaiten.get_comments(c.id) for c in task_cards],
+            *[user_ctx.kaiten.get_comments(c.id) for c in task_cards],
             return_exceptions=True,
         )
         comments_map: dict[int, list[str]] = {
@@ -293,7 +327,8 @@ class Scheduler:
             for c, cmts in zip(task_cards, comments_list)
         }
         logger.debug(
-            "morning_job: загружены комментарии для {} карточек", len(task_cards)
+            "morning_job user={}: загружены комментарии для {} карточек",
+            user_id, len(task_cards),
         )
 
         # ── Форматируем карточки в list[dict] с секциями, комментариями, сегментами
@@ -302,25 +337,37 @@ class Scheduler:
             comments_map=comments_map,
             segments_map=segments_map,
         )
-        logger.debug("morning_job: подготовлено карточек для Claude={}", len(cards_dicts))
+        logger.debug(
+            "morning_job user={}: подготовлено карточек для Claude={}",
+            user_id, len(cards_dicts),
+        )
 
         # ── Генерируем план через Claude ──────────────────────────────────────
         date_str = _format_date_ru(today)
         try:
             plan_text = await self._claude.generate_morning_plan(cards_dicts, date_str)
         except Exception as exc:
-            logger.error("morning_job: ошибка generate_morning_plan — {}", exc)
-            plan_text = f"📅 *{date_str}*\n\n⚠️ Не удалось сгенерировать план. Посмотри доску вручную."
+            logger.error(
+                "morning_job user={}: ошибка generate_morning_plan — {}",
+                user_id, exc,
+            )
+            plan_text = (
+                f"*{date_str}*\n\n"
+                "Не удалось сгенерировать план. Посмотри доску вручную."
+            )
 
         # ── Отправляем в Telegram ─────────────────────────────────────────────
         try:
-            await self._notifier.send_morning_plan(plan_text)
+            await user_ctx.notifier.send_morning_plan(plan_text)
         except Exception as exc:
-            logger.error("morning_job: ошибка send_morning_plan — {}", exc)
+            logger.error(
+                "morning_job user={}: ошибка send_morning_plan — {}",
+                user_id, exc,
+            )
 
         # ── Ставим флаг ───────────────────────────────────────────────────────
-        await loop.run_in_executor(None, db.set_morning_done, today)
-        logger.info("morning_job: завершено, флаг установлен")
+        await loop.run_in_executor(None, db.set_morning_done, today, user_id)
+        logger.info("morning_job user={}: завершено, флаг установлен", user_id)
 
     # ── Вечерняя джоба [UPD 4: временно отключена] ──────────────────────────
 
@@ -335,16 +382,34 @@ class Scheduler:
     # ── Джоба очистки Архива ─────────────────────────────────────────────────
 
     async def run_archive_cleanup_job(self) -> None:
-        """Каждый понедельник в 06:00: удаляет из Архива карточки старше 30 дней.
+        """Каждый понедельник в 06:00: очистка Архива для каждого пользователя.
+
+        Ошибка одного пользователя не прерывает остальных.
+        """
+        for user_ctx in self._users:
+            try:
+                await self._run_archive_for_user(user_ctx)
+            except Exception as exc:
+                logger.error(
+                    "archive_job user={}: {}",
+                    user_ctx.user_cfg.user_id, exc,
+                )
+
+    async def _run_archive_for_user(self, user_ctx: UserSchedulerCtx) -> None:
+        """Удаляет из Архива карточки старше 30 дней для одного пользователя.
 
         Фильтрация по полю updated_at — дата последнего изменения карточки.
         Карточки без updated_at не трогаются.
         """
+        user_id = user_ctx.user_cfg.user_id
         try:
             cutoff = datetime.now(_TZ_MSK) - timedelta(days=30)
-            logger.info("archive_cleanup: порог удаления={}", cutoff.date().isoformat())
+            logger.info(
+                "archive_cleanup user={}: порог удаления={}",
+                user_id, cutoff.date().isoformat(),
+            )
 
-            cards = await self._kaiten.get_cards(ARCHIVE_COLUMN_ID)
+            cards = await user_ctx.kaiten.get_cards(ARCHIVE_COLUMN_ID)
             deleted = 0
 
             for card in cards:
@@ -352,45 +417,66 @@ class Scheduler:
                     continue
                 ts = card.updated_at_parsed
                 if ts and ts < cutoff:
-                    ok = await self._kaiten.delete_card(card.id)
+                    ok = await user_ctx.kaiten.delete_card(card.id)
                     if ok:
                         deleted += 1
                         logger.info(
-                            "archive_cleanup: удалена «{}» (id={}) updated={}",
-                            card.title, card.id,
+                            "archive_cleanup user={}: удалена «{}» (id={}) updated={}",
+                            user_id, card.title, card.id,
                             ts.date().isoformat() if ts else "?",
                         )
                     else:
                         logger.warning(
-                            "archive_cleanup: не удалось удалить id={}", card.id
+                            "archive_cleanup user={}: не удалось удалить id={}",
+                            user_id, card.id,
                         )
 
-            logger.info("archive_cleanup: удалено {} карточек старше 30 дней", deleted)
+            logger.info(
+                "archive_cleanup user={}: удалено {} карточек старше 30 дней",
+                user_id, deleted,
+            )
 
         except Exception as exc:
-            logger.error("archive_cleanup: ошибка — {}", exc)
+            logger.error("archive_cleanup user={}: ошибка — {}", user_id, exc)
 
     # ── Джоба напоминаний ─────────────────────────────────────────────────────
 
     async def run_reminder_job(self) -> None:
-        """Проверяет карточки с тегом «напомнить» и event_time.
+        """Проверяет напоминания для каждого пользователя.
+
+        Ошибка одного пользователя не прерывает остальных.
+        """
+        for user_ctx in self._users:
+            try:
+                await self._run_reminders_for_user(user_ctx)
+            except Exception as exc:
+                logger.error(
+                    "reminder_job user={}: {}",
+                    user_ctx.user_cfg.user_id, exc,
+                )
+
+    async def _run_reminders_for_user(self, user_ctx: UserSchedulerCtx) -> None:
+        """Проверяет карточки с тегом «напомнить» и event_time для одного пользователя.
 
         Правила (из requirements):
           - среднее:              напоминание за 15 мин
           - важное / критическое: напоминания за 30 мин и за 15 мин (с пометкой ВАЖНО)
 
-        Дедупликация через in-memory set _sent_reminders.
-        Ключ включает card_id и minutes_before — сбрасывается только при рестарте.
+        Дедупликация через in-memory dict _sent_reminders[user_id].
         """
-        now = _now_msk()
-        today = now.date()
+        user_id      = user_ctx.user_cfg.user_id
+        sent         = self._sent_reminders[user_id]
+        now          = _now_msk()
 
         # ── Загружаем карточки сегодняшней колонки ────────────────────────────
-        today_col_id = self._logic.get_today_column_id()
+        today_col_id = user_ctx.logic.get_today_column_id()
         try:
-            cards = await self._kaiten.get_cards(today_col_id)
+            cards = await user_ctx.kaiten.get_cards(today_col_id)
         except Exception as exc:
-            logger.error("reminder_job: не удалось загрузить карточки col={} — {}", today_col_id, exc)
+            logger.error(
+                "reminder_job user={}: не удалось загрузить карточки col={} — {}",
+                user_id, today_col_id, exc,
+            )
             return
 
         # ── Фильтруем: только с тегом «напомнить» и event_time ───────────────
@@ -405,13 +491,16 @@ class Scheduler:
         if not remind_cards:
             return
 
-        logger.debug("reminder_job: карточек с напоминанием={}", len(remind_cards))
+        logger.debug(
+            "reminder_job user={}: карточек с напоминанием={}",
+            user_id, len(remind_cards),
+        )
 
         for card in remind_cards:
             et = card.event_time
             # event_time хранится в UTC+3 — now тоже в UTC+3, сравниваем напрямую
             # Убираем tzinfo для простого вычисления разницы в минутах
-            et_naive = et.replace(tzinfo=None) if et.tzinfo else et
+            et_naive  = et.replace(tzinfo=None) if et.tzinfo else et
             now_naive = now.replace(tzinfo=None)
 
             # Событие уже прошло или слишком далеко (> 60 мин) — не проверяем
@@ -419,58 +508,54 @@ class Scheduler:
             if delta_minutes < 0 or delta_minutes > 60:
                 continue
 
-            importance = card.importance
+            importance  = card.importance
             is_important = importance in _IMPORTANT_IMPORTANCE
 
             # Определяем какие напоминания нужны для этой карточки
             # Окно проверки: [target - 0.5, target + 0.5) минут
             # то есть ±30 секунд от точного момента (джоба раз в минуту)
-            targets: list[int] = []
-            if is_important:
-                targets = [30, 15]
-            else:
-                targets = [15]
+            targets: list[int] = [30, 15] if is_important else [15]
 
             for target_minutes in targets:
-                # Попадает ли текущий момент в окно "за target минут до события"
                 in_window = abs(delta_minutes - target_minutes) < 0.5
 
                 if not in_window:
                     continue
 
                 key = _reminder_key(card.id, target_minutes)
-                if key in self._sent_reminders:
+                if key in sent:
                     logger.debug(
-                        "reminder_job: дубликат пропущен card_id={} min={}",
-                        card.id, target_minutes,
+                        "reminder_job user={}: дубликат пропущен card_id={} min={}",
+                        user_id, card.id, target_minutes,
                     )
                     continue
 
                 # ── Отправляем напоминание ────────────────────────────────────
                 try:
-                    await self._notifier.send_reminder(
+                    await user_ctx.notifier.send_reminder(
                         card_title=card.title,
                         minutes_left=target_minutes,
                         important=is_important,
                     )
-                    self._sent_reminders.add(key)
+                    sent.add(key)
                     logger.info(
-                        "reminder_job: отправлено «{}» (id={}) за {} мин (important={})",
-                        card.title, card.id, target_minutes, is_important,
+                        "reminder_job user={}: отправлено «{}» (id={}) за {} мин (important={})",
+                        user_id, card.title, card.id, target_minutes, is_important,
                     )
                 except Exception as exc:
                     logger.error(
-                        "reminder_job: ошибка отправки напоминания card_id={} — {}",
-                        card.id, exc,
+                        "reminder_job user={}: ошибка отправки card_id={} — {}",
+                        user_id, card.id, exc,
                     )
 
-        # ── Чистим устаревшие ключи раз в сутки ──────────────────────────────
+        # ── Чистим устаревшие ключи при накоплении ────────────────────────────
         # При большом количестве регулярных задач set будет расти.
         # Простая эвристика: если набралось > 500 ключей, сбрасываем весь set.
         # В худшем случае пользователь получит одно лишнее напоминание при следующем
         # запуске — приемлемая цена за простоту без персистентного хранилища.
-        if len(self._sent_reminders) > 500:
+        if len(sent) > 500:
             logger.warning(
-                "reminder_job: _sent_reminders > 500 ключей, сбрасываем set"
+                "reminder_job user={}: _sent_reminders > 500 ключей, сбрасываем set",
+                user_id,
             )
-            self._sent_reminders.clear()
+            sent.clear()

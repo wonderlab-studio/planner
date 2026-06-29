@@ -1,12 +1,14 @@
 """
 kaiten_client.py — асинхронный HTTP-клиент к Kaiten API.
 
-Конфиг из .env:
+Конфиг из .env (модульные globals, общие для всего приложения):
     KAITEN_TOKEN      — Bearer-токен
     KAITEN_BASE_URL   — https://wonderlabst.kaiten.ru/api/latest
     KAITEN_SPACE_ID   — ID пространства (197396)
-    KAITEN_BOARD_ID   — ID доски (476640)
-    KAITEN_LANE_ID    — ID дорожки (623640)
+
+Board-специфичные параметры передаются в __init__:
+    board_id  — ID доски (напр. 476640)
+    lane_id   — ID дорожки (напр. 623640)
 """
 
 from __future__ import annotations
@@ -22,15 +24,11 @@ from loguru import logger
 
 load_dotenv()
 
-# ── Конфиг ────────────────────────────────────────────────────────────────────
+# ── Конфиг (модульные globals — общие для всех пользователей одной org) ────────
 
 KAITEN_TOKEN    = os.getenv("KAITEN_TOKEN", "")
 KAITEN_BASE_URL = os.getenv("KAITEN_BASE_URL", "")
 KAITEN_SPACE_ID = int(os.getenv("KAITEN_SPACE_ID", "197396"))
-KAITEN_BOARD_ID = int(os.getenv("KAITEN_BOARD_ID", "476640"))
-KAITEN_LANE_ID  = int(os.getenv("KAITEN_LANE_ID",  "623640"))
-
-ARCHIVE_COLUMN_ID = 6122269
 
 TZ_MSK = timezone(timedelta(hours=3))
 
@@ -186,9 +184,15 @@ def _parse_column(raw: dict) -> Column:
 # ── KaitenClient ──────────────────────────────────────────────────────────────
 
 class KaitenClient:
-    """Асинхронный клиент к Kaiten REST API."""
+    """Асинхронный клиент к Kaiten REST API.
 
-    def __init__(self) -> None:
+    board_id и lane_id — board-специфичные параметры, передаются в __init__.
+    token и base_url берутся из модульных глобалей KAITEN_TOKEN, KAITEN_BASE_URL.
+    """
+
+    def __init__(self, board_id: int, lane_id: int) -> None:
+        self._board_id = board_id
+        self._lane_id = lane_id
         if not KAITEN_TOKEN:
             logger.warning("KAITEN_TOKEN не задан — запросы к API будут падать с 401")
         self._client = httpx.AsyncClient(
@@ -242,7 +246,7 @@ class KaitenClient:
 
     async def get_columns(self) -> list[Column]:
         """GET /boards/{board_id}/columns → список колонок доски."""
-        data = await self._request("GET", f"/boards/{KAITEN_BOARD_ID}/columns")
+        data = await self._request("GET", f"/boards/{self._board_id}/columns")
         if not isinstance(data, list):
             logger.warning("get_columns: неожиданный ответ: {}", data)
             return []
@@ -304,11 +308,11 @@ class KaitenClient:
     ) -> Card | None:
         """POST /cards — создаёт карточку.
 
-        board_id и lane_id подставляются автоматически из конфига.
+        board_id и lane_id подставляются автоматически из self._board_id / self._lane_id.
         """
         body: dict[str, Any] = {
-            "board_id": KAITEN_BOARD_ID,
-            "lane_id":  KAITEN_LANE_ID,
+            "board_id": self._board_id,
+            "lane_id":  self._lane_id,
             "column_id": column_id,
             "title": title,
         }
@@ -362,10 +366,17 @@ class KaitenClient:
         logger.info("update_card: обновлена карточка id={} поля={}", card_id, list(fields))
         return _parse_card(data)
 
-    async def archive_card(self, card_id: int, comment: str | None = None) -> bool:
+    async def archive_card(
+        self,
+        card_id: int,
+        archive_column_id: int,
+        comment: str | None = None,
+    ) -> bool:
         """Архивирует карточку: сначала добавляет комментарий (если передан),
-        затем перемещает в колонку Архив (id=6122269).
+        затем перемещает в колонку Архив.
 
+        archive_column_id — ID колонки-архива (предоставляется вызывающим кодом,
+        не хранится в KaitenClient).
         Возвращает True при успехе.
         """
         if comment:
@@ -374,12 +385,12 @@ class KaitenClient:
         data = await self._request(
             "PATCH",
             f"/cards/{card_id}",
-            json={"column_id": ARCHIVE_COLUMN_ID},
+            json={"column_id": archive_column_id},
         )
         if not data:
             logger.error("archive_card: не удалось архивировать карточку id={}", card_id)
             return False
-        logger.info("archive_card: карточка id={} перемещена в Архив", card_id)
+        logger.info("archive_card: карточка id={} перемещена в Архив (col={})", card_id, archive_column_id)
         return True
 
     async def add_comment(self, card_id: int, text: str) -> bool:
@@ -404,3 +415,46 @@ class KaitenClient:
         if not isinstance(data, list):
             return []
         return [c.get("text", "") for c in data if c.get("text")]
+
+    async def get_lanes(self) -> list[dict]:
+        """GET /boards/{board_id}/lanes — список lanes (swimlanes) доски."""
+        data = await self._request("GET", f"/boards/{self._board_id}/lanes")
+        return data if isinstance(data, list) else []
+
+    async def create_column(self, title: str, sort_order: float) -> dict | None:
+        """POST /boards/{board_id}/columns — создаёт колонку на доске."""
+        return await self._request(
+            "POST",
+            f"/boards/{self._board_id}/columns",
+            json={"title": title, "sort_order": sort_order},
+        )
+
+    async def delete_column(self, column_id: int) -> bool:
+        """DELETE /boards/{board_id}/columns/{column_id} — удаляет колонку.
+
+        Возвращает True при успехе.
+        """
+        result = await self._request(
+            "DELETE",
+            f"/boards/{self._board_id}/columns/{column_id}",
+        )
+        return result is not None
+
+    async def create_blocked_card(
+        self,
+        column_id: int,
+        title: str,
+        block_reason: str,
+        sort_order: float = 1.0,
+    ) -> dict | None:
+        """POST /cards — создаёт карточку-разделитель (blocked=True) в указанной колонке."""
+        body = {
+            "title": title,
+            "board_id": self._board_id,
+            "column_id": column_id,
+            "lane_id": self._lane_id,
+            "blocked": True,
+            "block_reason": block_reason,
+            "sort_order": sort_order,
+        }
+        return await self._request("POST", "/cards", json=body)

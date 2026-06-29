@@ -25,32 +25,10 @@ from kaiten_client import (
 
 # ── Константы ─────────────────────────────────────────────────────────────────
 
-COLUMN_IDS: dict[str, int] = {
-    "Понедельник":      1688101,
-    "Вторник":          1689798,
-    "Среда":            1689899,
-    "Четверг":          1689903,
-    "Пятница":          1689912,
-    "Суббота":          6122424,
-    "Воскресенье":      6122425,
-    "Следующая неделя": 6122270,
-    "Далекие времена":  6122271,
-    "Долгий ящик":      1688100,
-    "Архив":            6122269,
-}
-
 # Индекс 0=Пн … 6=Вс — совпадает с datetime.weekday()
 WEEKDAY_COLUMNS: list[str] = [
     "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье",
 ]
-
-# Обратный маппинг: column_id → название дня
-COLUMN_NAME_BY_ID: dict[int, str] = {v: k for k, v in COLUMN_IDS.items()}
-
-# Порядковый номер дня по column_id (только дни недели, 0=Пн)
-WEEKDAY_INDEX_BY_COLUMN: dict[int, int] = {
-    COLUMN_IDS[name]: idx for idx, name in enumerate(WEEKDAY_COLUMNS)
-}
 
 # Приоритет секций в порядке заполнения
 SECTIONS_ORDER: list[str] = ["Утро", "День", "Вечер"]
@@ -87,14 +65,25 @@ _EPSILON = 0.001
 class BoardLogic:
     """Бизнес-логика поверх KaitenClient."""
 
-    def __init__(self, client: KaitenClient) -> None:
+    def __init__(self, client: KaitenClient, column_ids: dict[str, int]) -> None:
         self._client = client
+        self._column_ids = column_ids
+        self._column_name_by_id: dict[int, str] = {v: k for k, v in column_ids.items()}
+        self._weekday_index_by_column: dict[int, int] = {
+            column_ids[name]: i
+            for i, name in enumerate(WEEKDAY_COLUMNS)
+            if name in column_ids
+        }
+
+    @property
+    def column_ids(self) -> dict[str, int]:
+        return self._column_ids
 
     # ── Навигация по колонкам ─────────────────────────────────────────────────
 
     def get_column_id(self, day: str) -> int:
-        """'Понедельник' → 1688101. Поддерживает все колонки из COLUMN_IDS."""
-        col_id = COLUMN_IDS.get(day)
+        """'Понедельник' → ID колонки. Поддерживает все колонки из column_ids."""
+        col_id = self._column_ids.get(day)
         if col_id is None:
             raise ValueError(f"Неизвестное название колонки: {day!r}")
         return col_id
@@ -102,13 +91,13 @@ class BoardLogic:
     def get_today_column_id(self) -> int:
         """Возвращает column_id колонки текущего дня недели (0=Пн … 6=Вс)."""
         day_name = WEEKDAY_COLUMNS[date.today().weekday()]
-        return COLUMN_IDS[day_name]
+        return self._column_ids[day_name]
 
     def get_yesterday_column_id(self) -> int:
         """Возвращает column_id колонки вчерашнего дня."""
         yesterday = date.today() - timedelta(days=1)
         day_name = WEEKDAY_COLUMNS[yesterday.weekday()]
-        return COLUMN_IDS[day_name]
+        return self._column_ids[day_name]
 
     def get_next_weekday_column_id(self, from_column_id: int) -> int | None:
         """Возвращает column_id следующего дня после указанного.
@@ -116,13 +105,13 @@ class BoardLogic:
         Если следующий день — за воскресеньем, возвращает None
         (вызывающий код должен использовать «Следующая неделя»).
         """
-        idx = WEEKDAY_INDEX_BY_COLUMN.get(from_column_id)
+        idx = self._weekday_index_by_column.get(from_column_id)
         if idx is None:
             return None
         next_idx = idx + 1
         if next_idx >= len(WEEKDAY_COLUMNS):
             return None  # после воскресенья → следующая неделя
-        return COLUMN_IDS[WEEKDAY_COLUMNS[next_idx]]
+        return self._column_ids[WEEKDAY_COLUMNS[next_idx]]
 
     # ── Позиционирование в секции ─────────────────────────────────────────────
 
@@ -314,21 +303,17 @@ class BoardLogic:
     # ── Регулярные задачи ─────────────────────────────────────────────────────
 
     async def archive_card(self, card_id: int, comment: str | None = None) -> bool:
-        """Архивирует карточку через KaitenClient с явным sort_order=1.0.
+        """Архивирует карточку через KaitenClient.
 
-        Обёртка над client.archive_card, гарантирующая что карточка
-        попадает в начало колонки Архив (sort_order=1.0).
+        Делегирует в client.archive_card с ID архивной колонки из column_ids.
         Если передан comment — добавляет его перед перемещением.
         """
-        if comment:
-            await self._client.add_comment(card_id, comment)
-        from kaiten_client import ARCHIVE_COLUMN_ID
-        result = await self._client.update_card(
+        result = await self._client.archive_card(
             card_id,
-            column_id=ARCHIVE_COLUMN_ID,
-            sort_order=1.0,
+            self._column_ids["Архив"],
+            comment,
         )
-        if result is None:
+        if not result:
             logger.error("archive_card: не удалось архивировать карточку id={}", card_id)
             return False
         logger.info("archive_card: карточка id={} перемещена в Архив", card_id)
@@ -422,10 +407,10 @@ class BoardLogic:
         while col_id is not None:
             col_chain.append(col_id)
             col_id = self.get_next_weekday_column_id(col_id)
-        col_chain.append(COLUMN_IDS["Следующая неделя"])
+        col_chain.append(self._column_ids["Следующая неделя"])
 
         for col_id in col_chain:
-            is_next_week = (col_id == COLUMN_IDS["Следующая неделя"])
+            is_next_week = (col_id == self._column_ids["Следующая неделя"])
             sections = SECTIONS_ORDER if not is_next_week else ["Утро"]
 
             # Получаем карточки колонки: из кеша или запросом

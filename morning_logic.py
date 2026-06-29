@@ -18,7 +18,7 @@ from datetime import date, datetime, timedelta, timezone
 from loguru import logger
 
 from kaiten_client import Card, KaitenClient, TAG_IDS
-from board_logic import BoardLogic, COLUMN_IDS, WEEKDAY_COLUMNS
+from board_logic import BoardLogic, WEEKDAY_COLUMNS
 
 _TZ_MSK = timezone(timedelta(hours=3))
 
@@ -193,10 +193,10 @@ class MorningLogic:
     async def _load_week_cards(self) -> dict[int, list[Card]]:
         """Загружает пн–вс + «Следующая неделя» за один проход."""
         col_ids = [
-            COLUMN_IDS["Понедельник"], COLUMN_IDS["Вторник"],
-            COLUMN_IDS["Среда"],       COLUMN_IDS["Четверг"],
-            COLUMN_IDS["Пятница"],     COLUMN_IDS["Суббота"],
-            COLUMN_IDS["Воскресенье"], COLUMN_IDS["Следующая неделя"],
+            self._logic.column_ids["Понедельник"], self._logic.column_ids["Вторник"],
+            self._logic.column_ids["Среда"],       self._logic.column_ids["Четверг"],
+            self._logic.column_ids["Пятница"],     self._logic.column_ids["Суббота"],
+            self._logic.column_ids["Воскресенье"], self._logic.column_ids["Следующая неделя"],
         ]
         preloaded: dict[int, list[Card]] = {}
         for col_id in col_ids:
@@ -285,7 +285,7 @@ class MorningLogic:
         Заполняет self.last_segments: {card_id: [("HH:MM", "HH:MM"), ...]}.
         Возвращает свежие карточки сегодняшней колонки из API.
         """
-        today_col_id  = COLUMN_IDS[WEEKDAY_COLUMNS[today.weekday()]]
+        today_col_id  = self._logic.column_ids[WEEKDAY_COLUMNS[today.weekday()]]
         tomorrow      = today + timedelta(days=1)
         day_after     = today + timedelta(days=2)
 
@@ -531,14 +531,14 @@ class MorningLogic:
         После воскресенья (weekday=6) → «Следующая неделя».
         Следующее утро само запланирует их по алгоритму фаз 1–4.
         """
-        next_week_col = COLUMN_IDS["Следующая неделя"]
+        next_week_col = self._logic.column_ids["Следующая неделя"]
         next_day = from_date + timedelta(days=1)
 
         if next_day.weekday() == 0:
             # Следующий день был бы понедельником следующей недели
             target_col = next_week_col
         else:
-            target_col = COLUMN_IDS[WEEKDAY_COLUMNS[next_day.weekday()]]
+            target_col = self._logic.column_ids[WEEKDAY_COLUMNS[next_day.weekday()]]
 
         for card in cards:
             try:
@@ -577,9 +577,9 @@ class MorningLogic:
         preloaded = await self._load_week_cards()
 
         yesterday     = today - timedelta(days=1)
-        yest_col_id   = COLUMN_IDS[WEEKDAY_COLUMNS[yesterday.weekday()]]
-        today_col_id  = COLUMN_IDS[WEEKDAY_COLUMNS[today.weekday()]]
-        next_week_col = COLUMN_IDS["Следующая неделя"]
+        yest_col_id   = self._logic.column_ids[WEEKDAY_COLUMNS[yesterday.weekday()]]
+        today_col_id  = self._logic.column_ids[WEEKDAY_COLUMNS[today.weekday()]]
+        next_week_col = self._logic.column_ids["Следующая неделя"]
 
         is_weekday = today.weekday() <= 4   # пн=0 … пт=4
 
@@ -632,11 +632,11 @@ class MorningLogic:
         """
         logger.info("morning [monday]: {}", today.isoformat())
 
-        monday_col     = COLUMN_IDS["Понедельник"]
-        sunday_col     = COLUMN_IDS["Воскресенье"]
-        saturday_col   = COLUMN_IDS["Суббота"]
-        next_week_col  = COLUMN_IDS["Следующая неделя"]
-        far_future_col = COLUMN_IDS["Далекие времена"]
+        monday_col     = self._logic.column_ids["Понедельник"]
+        sunday_col     = self._logic.column_ids["Воскресенье"]
+        saturday_col   = self._logic.column_ids["Суббота"]
+        next_week_col  = self._logic.column_ids["Следующая неделя"]
+        far_future_col = self._logic.column_ids["Далекие времена"]
 
         tag_weekly  = TAG_IDS["еженедельно"]
         tag_weekend = TAG_IDS["по выходным"]
@@ -656,10 +656,10 @@ class MorningLogic:
 
         # ── Шаг 2: Сборка пула (пн–вс + следующая неделя) ───────────────────
         week_col_ids = [
-            COLUMN_IDS["Понедельник"], COLUMN_IDS["Вторник"],
-            COLUMN_IDS["Среда"],       COLUMN_IDS["Четверг"],
-            COLUMN_IDS["Пятница"],     COLUMN_IDS["Суббота"],
-            COLUMN_IDS["Воскресенье"], next_week_col,
+            self._logic.column_ids["Понедельник"], self._logic.column_ids["Вторник"],
+            self._logic.column_ids["Среда"],       self._logic.column_ids["Четверг"],
+            self._logic.column_ids["Пятница"],     self._logic.column_ids["Суббота"],
+            self._logic.column_ids["Воскресенье"], next_week_col,
         ]
 
         pool: list[Card] = []
@@ -694,7 +694,7 @@ class MorningLogic:
         )
         for card in event_day_cards:
             et_local   = card.event_time.astimezone(_TZ_MSK)
-            target_col = COLUMN_IDS[WEEKDAY_COLUMNS[et_local.date().weekday()]]
+            target_col = self._logic.column_ids[WEEKDAY_COLUMNS[et_local.date().weekday()]]
             sec        = BoardLogic.section_by_event_time(card)
             await self._move(card, target_col, sec, preloaded)
 
@@ -723,7 +723,7 @@ class MorningLogic:
 
         # Маппинг «ПН»…«ВС» → column_id
         wd_to_col: dict[str, int] = {
-            k: COLUMN_IDS[v]
+            k: self._logic.column_ids[v]
             for k, v in zip(
                 ["ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС"],
                 WEEKDAY_COLUMNS,

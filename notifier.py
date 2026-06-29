@@ -2,7 +2,8 @@
 notifier.py — модуль отправки уведомлений в Telegram без входящего апдейта.
 
 Использует httpx напрямую (POST на api.telegram.org).
-Конфиг из .env: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID.
+Конфиг из .env: TELEGRAM_TOKEN.
+chat_id передаётся явно при создании экземпляра — поддержка мульти-пользователей.
 
 Предназначен для вызова из scheduler.py и других модулей,
 где нет входящего Update от пользователя.
@@ -21,8 +22,7 @@ load_dotenv()
 
 # ── Конфиг ────────────────────────────────────────────────────────────────────
 
-_TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
-_TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+_TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_TOKEN", "")
 
 _TELEGRAM_API_BASE = "https://api.telegram.org"
 _SEND_MESSAGE_TIMEOUT = 15  # секунд
@@ -61,19 +61,13 @@ def _split_text(text: str, max_len: int = _MAX_MESSAGE_LEN) -> list[str]:
 class Notifier:
     """Отправляет сообщения в Telegram-чат через Bot API без Update."""
 
-    def __init__(
-        self,
-        token: str = _TELEGRAM_TOKEN,
-        chat_id: str = _TELEGRAM_CHAT_ID,
-    ) -> None:
-        if not token:
+    def __init__(self, chat_id: int) -> None:
+        if not _TELEGRAM_TOKEN:
             logger.warning("Notifier: TELEGRAM_TOKEN не задан")
-        if not chat_id:
-            logger.warning("Notifier: TELEGRAM_CHAT_ID не задан")
 
-        self._token   = token
         self._chat_id = chat_id
-        self._api_url = f"{_TELEGRAM_API_BASE}/bot{token}/sendMessage"
+        self._token = _TELEGRAM_TOKEN
+        self._api_url = f"{_TELEGRAM_API_BASE}/bot{self._token}/sendMessage"
 
     # ── Внутренний хелпер ─────────────────────────────────────────────────────
 
