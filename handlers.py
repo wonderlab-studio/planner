@@ -27,7 +27,7 @@ from telegram.ext import (
     filters,
 )
 
-from board_logic import BoardLogic, COLUMN_IDS, COLUMN_NAME_BY_ID, WEEKDAY_COLUMNS
+from board_logic import BoardLogic, WEEKDAY_COLUMNS
 from claude_client import ClaudeClient
 from kaiten_client import Card, KaitenClient, TAG_IDS
 from notifier import Notifier
@@ -172,13 +172,13 @@ async def _load_active_cards(user_ctx: UserHandlerCtx) -> list[dict]:
     Возвращает список простых словарей для передачи в claude.search_card_by_title.
     """
     active_columns = [
-        col_id for name, col_id in COLUMN_IDS.items()
+        col_id for name, col_id in user_ctx.logic.column_ids.items()
         if name != "Архив"
     ]
 
     all_cards: list[dict] = []
     for col_id in active_columns:
-        col_name = next(k for k, v in COLUMN_IDS.items() if v == col_id)
+        col_name = next(k for k, v in user_ctx.logic.column_ids.items() if v == col_id)
         try:
             cards = await user_ctx.kaiten.get_cards(col_id)
             for card in cards:
@@ -332,11 +332,11 @@ async def _handle_create(
     deadline     = intent.get("deadline")
     importance   = intent.get("importance")
 
-    if column_name and column_name in COLUMN_IDS:
-        column_id = COLUMN_IDS[column_name]
+    if column_name and column_name in user_ctx.logic.column_ids:
+        column_id = user_ctx.logic.column_ids[column_name]
     else:
         column_id = user_ctx.logic.get_today_column_id()
-        column_name = next((k for k, v in COLUMN_IDS.items() if v == column_id), "сегодня")
+        column_name = next((k for k, v in user_ctx.logic.column_ids.items() if v == column_id), "сегодня")
 
     try:
         sort_order = await user_ctx.logic.get_section_sort_order(column_id, section)
@@ -466,13 +466,13 @@ async def _handle_move(
         await _reply(update, f"❓ Не нашёл карточку по запросу «{query}».")
         return
 
-    if column_name and column_name in COLUMN_IDS:
-        target_column_id   = COLUMN_IDS[column_name]
+    if column_name and column_name in user_ctx.logic.column_ids:
+        target_column_id   = user_ctx.logic.column_ids[column_name]
         target_column_name = column_name
     else:
         tomorrow_wd        = (date.today() + timedelta(days=1)).weekday()
         target_column_name = WEEKDAY_COLUMNS[tomorrow_wd]
-        target_column_id   = COLUMN_IDS[target_column_name]
+        target_column_id   = user_ctx.logic.column_ids[target_column_name]
 
     try:
         sort_order = await user_ctx.logic.get_section_sort_order(target_column_id, section)
@@ -607,44 +607,29 @@ async def _resend_card_buttons(
 
 # ── Вспомогательная логика для кнопки «Все на сегодня» ───────────────────────
 
-def _next_col_for_regular(card: Card, today: date) -> int:
-    """Возвращает column_id следующего подходящего дня для регулярной задачи.
-
-    Правила:
-        еженедельно  → «Следующая неделя» (Monday run распределит по weekday-полю)
-        ежедневно    → завтра
-        по будням    → ближайший пн–пт начиная с завтра
-        по выходным  → ближайший сб–вс начиная с завтра
-
-    Для нерегулярных карточек возвращает завтра (нейтральный дефолт,
-    вызывающий код должен проверять is_regular_task перед вызовом).
-    """
+def _next_col_for_regular(card: Card, today: date, column_ids: dict[str, int]) -> int:
+    """Возвращает column_id следующего подходящего дня для регулярной задачи."""
     tags = set(card.tag_ids)
 
-    # Еженедельные → следующая неделя: Monday run поставит в нужный день по weekday-полю
     if TAG_IDS["еженедельно"] in tags:
-        return COLUMN_IDS["Следующая неделя"]
+        return column_ids["Следующая неделя"]
 
-    # Для остальных ищем ближайший подходящий день (максимум 7 шагов вперёд)
     for days_ahead in range(1, 8):
         candidate = today + timedelta(days=days_ahead)
-        wd = candidate.weekday()  # 0=Пн … 6=Вс
+        wd = candidate.weekday()
 
         if TAG_IDS["ежедневно"] in tags:
-            break                                        # любой день — берём завтра
-
+            break
         if TAG_IDS["по будням"] in tags and wd <= 4:
-            break                                        # нашли ближайший будний
-
+            break
         if TAG_IDS["по выходным"] in tags and wd >= 5:
-            break                                        # нашли ближайний выходной
+            break
     else:
-        # Теоретически недостижимо для корректных тегов, но страхуемся
         logger.warning("_next_col_for_regular: не нашли слот за 7 дней, card_id={}", card.id)
-        return COLUMN_IDS["Следующая неделя"]
+        return column_ids["Следующая неделя"]
 
     target_wd = (today + timedelta(days=days_ahead)).weekday()
-    return COLUMN_IDS[WEEKDAY_COLUMNS[target_wd]]
+    return column_ids[WEEKDAY_COLUMNS[target_wd]]
 
 
 # ── Фабрика хендлеров ─────────────────────────────────────────────────────────
@@ -907,20 +892,20 @@ def build_handlers(cfg: HandlersConfig) -> Application:
             # Для регулярных задач — стартуем с колонки по метке,
             # для обычных — с завтра.
             if user_ctx.logic.is_regular_task(card):
-                start_col_id = _next_col_for_regular(card, date.today())
+                start_col_id = _next_col_for_regular(card, date.today(), user_ctx.logic.column_ids)
             else:
                 tomorrow     = date.today() + timedelta(days=1)
-                start_col_id = COLUMN_IDS[WEEKDAY_COLUMNS[tomorrow.weekday()]]
+                start_col_id = user_ctx.logic.column_ids[WEEKDAY_COLUMNS[tomorrow.weekday()]]
 
             slot = await user_ctx.logic.find_slot_for_card(card, start_col_id)
             if slot is None:
-                slot = (COLUMN_IDS["Следующая неделя"], "Утро")
+                slot = (user_ctx.logic.column_ids["Следующая неделя"], "Утро")
 
             target_col_id, target_section = slot
             sort_order = await user_ctx.logic.get_section_sort_order(target_col_id, target_section)
             await user_ctx.kaiten.move_card(card_id, target_col_id, sort_order)
 
-            target_col_name = COLUMN_NAME_BY_ID.get(target_col_id, str(target_col_id))
+            target_col_name = user_ctx.logic.column_name_by_id.get(target_col_id, str(target_col_id))
             await update.message.reply_text(
                 f"✅ «{title}»: размер {hours} ч → *{target_col_name} / {target_section}*",
                 parse_mode=ParseMode.MARKDOWN,
@@ -964,13 +949,13 @@ def build_handlers(cfg: HandlersConfig) -> Application:
         column_name = intent.get("column")
         section     = intent.get("section") or "Утро"
 
-        if column_name and column_name in COLUMN_IDS:
-            target_col_id   = COLUMN_IDS[column_name]
+        if column_name and column_name in user_ctx.logic.column_ids:
+            target_col_id   = user_ctx.logic.column_ids[column_name]
             target_col_name = column_name
         else:
             tomorrow        = date.today() + timedelta(days=1)
             target_col_name = WEEKDAY_COLUMNS[tomorrow.weekday()]
-            target_col_id   = COLUMN_IDS[target_col_name]
+            target_col_id   = user_ctx.logic.column_ids[target_col_name]
 
         try:
             sort_order = await user_ctx.logic.get_section_sort_order(target_col_id, section)

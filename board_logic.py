@@ -26,9 +26,7 @@ from kaiten_client import (
 # ── Константы ─────────────────────────────────────────────────────────────────
 
 # Индекс 0=Пн … 6=Вс — совпадает с datetime.weekday()
-WEEKDAY_COLUMNS: list[str] = [
-    "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье",
-]
+WEEKDAY_COLUMNS: list[str] = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
 # Приоритет секций в порядке заполнения
 SECTIONS_ORDER: list[str] = ["Утро", "День", "Вечер"]
@@ -78,6 +76,10 @@ class BoardLogic:
     @property
     def column_ids(self) -> dict[str, int]:
         return self._column_ids
+
+    @property
+    def column_name_by_id(self) -> dict[int, str]:
+        return self._column_name_by_id
 
     # ── Навигация по колонкам ─────────────────────────────────────────────────
 
