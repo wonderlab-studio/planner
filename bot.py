@@ -80,12 +80,21 @@ async def main() -> None:
         client = KaitenClient(board_id=user.kaiten_board_id, lane_id=user.kaiten_lane_id)
         kaiten_clients.append(client)
 
-        # 2. Настроить доску (создать колонки/разделители, определить lane_id)
-        try:
-            column_ids = await setup_board(client, user)
-        except Exception as exc:
-            logger.error("setup_board failed for user={}: {}", user.user_id, exc)
-            raise
+        # 2. Настроить доску (если column_ids не заданы явно в конфиге)
+        if user.column_ids:
+            column_ids = user.column_ids
+            if user.kaiten_lane_id == 0:
+                lanes = await client.get_lanes()
+                if lanes:
+                    user.kaiten_lane_id = lanes[0]["id"]
+                    client._lane_id = user.kaiten_lane_id
+            logger.info("bot: column_ids для user={} взяты из конфига, board_setup пропущен", user.user_id)
+        else:
+            try:
+                column_ids = await setup_board(client, user)
+            except Exception as exc:
+                logger.error("setup_board failed for user={}: {}", user.user_id, exc)
+                raise
 
         # 3. Создать зависимости
         logic = BoardLogic(client, column_ids)

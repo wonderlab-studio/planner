@@ -14,6 +14,20 @@ _SECTIONS = ["Утро", "День", "Вечер", "На контроле"]
 # Желаемый порядок колонок (sort_order задаётся позицией * 1000)
 _COLUMN_ORDER = REQUIRED_COLUMN_NAMES
 
+# Маппинг: реальное имя на доске → стандартное имя сервиса
+_NAME_ALIASES: dict[str, str] = {
+    "Понедельник":     "Пн",
+    "Вторник":         "Вт",
+    "Среда":           "Ср",
+    "Четверг":         "Чт",
+    "Пятница":         "Пт",
+    "Суббота":         "Сб",
+    "Воскресенье":     "Вс",
+    "Далекие времена": "Далёкое будущее",
+    "Далёкие времена": "Далёкое будущее",
+    "Далёкое будущее": "Далёкое будущее",  # на случай если уже стандартное
+}
+
 
 async def setup_board(client: KaitenClient, user: UserConfig) -> dict[str, int]:
     """
@@ -39,8 +53,39 @@ async def setup_board(client: KaitenClient, user: UserConfig) -> dict[str, int]:
 
     # 2. Получить существующие колонки
     existing = await client.get_columns()   # list[Column] с атрибутами .id, .title
-    existing_by_name: dict[str, int] = {col.title: col.id for col in existing}
     existing_by_id: dict[int, str] = {col.id: col.title for col in existing}
+    required_set = set(REQUIRED_COLUMN_NAMES)
+
+    existing_by_name: dict[str, int] = {}
+    for col in existing:
+        if col.title in _NAME_ALIASES:
+            # Реальное имя на доске → стандартное имя (alias всегда перезаписывает)
+            standard = _NAME_ALIASES[col.title]
+            existing_by_name[standard] = col.id
+        elif col.title in required_set:
+            # Стандартное имя — добавляем только если alias ещё не занял место
+            if col.title not in existing_by_name:
+                existing_by_name[col.title] = col.id
+
+    # 2.5 Удалить пустые стандартно-названные колонки, если их место уже занято alias-маппингом
+    for col in existing:
+        if col.title not in required_set:
+            continue  # нестандартное имя — обрабатывается в шаге 4
+        mapped_id = existing_by_name.get(col.title)
+        if mapped_id is not None and mapped_id != col.id:
+            # Эта стандартная колонка — дубль (alias-маппинг уже занял её место)
+            dup_cards = await client.get_cards(col.id)
+            if not dup_cards:
+                deleted = await client.delete_column(col.id)
+                if deleted:
+                    logger.info(
+                        "board_setup: удалена дублирующая пустая колонка «{}» id={}", col.title, col.id
+                    )
+            else:
+                logger.warning(
+                    "board_setup: дублирующая колонка «{}» id={} не пуста — пропускаем удаление",
+                    col.title, col.id,
+                )
 
     # 3. Создать недостающие колонки
     for i, name in enumerate(_COLUMN_ORDER):
@@ -54,19 +99,19 @@ async def setup_board(client: KaitenClient, user: UserConfig) -> dict[str, int]:
                 logger.error("board_setup: не удалось создать колонку «{}»", name)
 
     # 4. Удалить лишние колонки (только пустые)
-    required_names = set(REQUIRED_COLUMN_NAMES)
     for col in existing:
-        if col.title not in required_names:
-            cards = await client.get_cards(col.id)
-            if cards:
-                logger.warning(
-                    "board_setup: колонка «{}» (id={}) не входит в стандартный набор, но не пуста — пропускаем",
-                    col.title, col.id
-                )
-            else:
-                deleted = await client.delete_column(col.id)
-                if deleted:
-                    logger.info("board_setup: удалена лишняя колонка «{}» id={}", col.title, col.id)
+        if col.title in required_set or col.title in _NAME_ALIASES:
+            continue  # стандартное имя или alias-источник — не трогаем
+        cards = await client.get_cards(col.id)
+        if cards:
+            logger.warning(
+                "board_setup: колонка «{}» (id={}) не входит в стандартный набор, но не пуста — пропускаем",
+                col.title, col.id
+            )
+        else:
+            deleted = await client.delete_column(col.id)
+            if deleted:
+                logger.info("board_setup: удалена лишняя колонка «{}» id={}", col.title, col.id)
 
     # 5. В дневных колонках создать разделители (если отсутствуют)
     for col_name in _DAY_COLUMNS:

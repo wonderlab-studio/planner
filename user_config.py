@@ -16,7 +16,7 @@ class UserConfig:
     kaiten_lane_id: int                   # 0 = определить автоматически при setup
     kaiten_space_id: int
     timezone: str = "Europe/Moscow"
-    column_ids: dict[str, int] = field(default_factory=dict)  # заполняется board_setup
+    column_ids: dict[str, int] = field(default_factory=dict)  # заполняется board_setup или из конфига
 
 
 def load_users() -> list[UserConfig]:
@@ -30,6 +30,7 @@ def load_users() -> list[UserConfig]:
 
 
 def _parse_user(item: dict) -> UserConfig:
+    column_ids = {k: int(v) for k, v in item.get("column_ids", {}).items()}
     return UserConfig(
         user_id=item["user_id"],
         telegram_chat_id=int(item["telegram_chat_id"]),
@@ -37,6 +38,7 @@ def _parse_user(item: dict) -> UserConfig:
         kaiten_lane_id=int(item.get("kaiten_lane_id", 0)),
         kaiten_space_id=int(item.get("kaiten_space_id", os.getenv("KAITEN_SPACE_ID", "197396"))),
         timezone=item.get("timezone", "Europe/Moscow"),
+        column_ids=column_ids,
     )
 
 
