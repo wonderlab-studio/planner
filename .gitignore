@@ -4,3 +4,4 @@ logs/
 __pycache__/
 users.json
 .CLAUDE/settings.json
+users.json.example
