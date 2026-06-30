@@ -25,7 +25,7 @@
 users.json / env → load_users() → list[UserConfig]
   ↓ bot.py main()
 для каждого user:
-  KaitenClient(board_id, lane_id)           # per-user
+  KaitenClient(board_id, lane_id, token, base_url)  # per-user
   setup_board(client, user) → column_ids    # пропуск если user.column_ids задан
   BoardLogic(client, column_ids)            # per-user
   MorningLogic(client, logic)              # per-user
@@ -42,7 +42,7 @@ HandlersConfig(users={chat_id: ctx}, claude)  # роутинг по chat_id
 |---|---|
 | user_config.py | UserConfig dataclass, load_users(), REQUIRED_COLUMN_NAMES |
 | board_setup.py | Идемпотентная настройка доски, alias-маппинг имён |
-| kaiten_client.py | HTTP-клиент, KaitenClient(board_id, lane_id) |
+| kaiten_client.py | HTTP-клиент, KaitenClient(board_id, lane_id, token, base_url) |
 | board_logic.py | BoardLogic(client, column_ids), WEEKDAY_COLUMNS |
 | morning_logic.py | Алгоритм утра v4, MorningLogic(client, logic) |
 | scheduler.py | APScheduler джобы, UserSchedulerCtx, мульти-user цикл |
@@ -92,13 +92,44 @@ blocked = True
 
 ---
 
+## Безопасность: секреты всегда в env
+
+**КРИТИЧНО: никогда не хранить токены/пароли напрямую в конфиг-файлах (users.json и т.д.).**
+
+Паттерн: в конфиге хранится только **имя** env-переменной, значение читается при старте.
+
+```json
+// users.json — ПРАВИЛЬНО
+{
+  "kaiten_token_env": "KAITEN_TOKEN_ALICE",
+  "kaiten_base_url_env": "KAITEN_BASE_URL_ALICE"
+}
+```
+
+```python
+# user_config.py — разрешение ссылки при загрузке
+token_env = item.get("kaiten_token_env")        # "KAITEN_TOKEN_ALICE"
+kaiten_token = os.getenv(token_env) if token_env else None  # реальный токен из env
+```
+
+Правило: **значение секрета** живёт только в env (Railway Variables / .env). В любом файле, который попадает в git или передаётся между агентами, хранится лишь имя переменной.
+
+---
+
 ## Мульти-пользовательские интерфейсы
 
 ### KaitenClient
 ```python
-KaitenClient(board_id: int, lane_id: int)
-# KAITEN_TOKEN, KAITEN_BASE_URL, KAITEN_SPACE_ID — из env (общие для всех)
-# board_id и lane_id — per-user
+KaitenClient(
+    board_id: int,
+    lane_id: int,
+    token: str | None = None,    # если None → fallback на KAITEN_TOKEN из env
+    base_url: str | None = None, # если None → fallback на KAITEN_BASE_URL из env
+)
+# token и base_url — per-user (берутся из UserConfig.kaiten_token / .kaiten_base_url)
+# Пример создания в bot.py:
+# KaitenClient(board_id=user.kaiten_board_id, lane_id=user.kaiten_lane_id,
+#              token=user.kaiten_token, base_url=user.kaiten_base_url)
 ```
 
 ### BoardLogic
@@ -222,12 +253,15 @@ python -c "import bot, handlers, morning_logic, scheduler, kaiten_client, board_
     "telegram_chat_id": 123456789,
     "kaiten_board_id": 999999,
     "kaiten_lane_id": 0,
-    "kaiten_space_id": 197396
+    "kaiten_space_id": 197396,
+    "kaiten_token_env": "KAITEN_TOKEN_ALICE",
+    "kaiten_base_url_env": "KAITEN_BASE_URL_ALICE"
   }
 ]
 ```
-2. `kaiten_lane_id: 0` → определится автоматически при board_setup
-3. Перезапустить сервис → board_setup создаст колонки и разделители
+2. Добавить `KAITEN_TOKEN_ALICE` и `KAITEN_BASE_URL_ALICE` в Railway Variables (или .env)
+3. `kaiten_lane_id: 0` → определится автоматически при board_setup
+4. Перезапустить сервис → board_setup создаст колонки и разделители
 
 Если доска уже настроена (известны ID колонок) — добавить `column_ids` в users.json,
 тогда board_setup будет пропущен.
