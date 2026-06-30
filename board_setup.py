@@ -6,7 +6,7 @@ from kaiten_client import KaitenClient, KAITEN_SPACE_ID
 from user_config import UserConfig, REQUIRED_COLUMN_NAMES
 
 # Колонки дней (только в них создаются разделители)
-_DAY_COLUMNS = {"Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс", "Следующая неделя"}
+_DAY_COLUMNS = {"Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"}
 
 # Порядок разделителей внутри дневной колонки
 _SECTIONS = ["Утро", "День", "Вечер", "На контроле"]

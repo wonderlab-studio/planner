@@ -1259,6 +1259,7 @@ def build_handlers(cfg: HandlersConfig) -> Application:
         ],
         per_chat=True,
         per_user=True,
+        per_message=False,
         allow_reentry=True,  # позволяет войти заново нажав другую кнопку
     )
 
