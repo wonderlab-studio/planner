@@ -77,7 +77,12 @@ async def main() -> None:
 
     for user in users:
         # 1. Создать KaitenClient (lane_id=0 → определится в setup_board)
-        client = KaitenClient(board_id=user.kaiten_board_id, lane_id=user.kaiten_lane_id)
+        client = KaitenClient(
+            board_id=user.kaiten_board_id,
+            lane_id=user.kaiten_lane_id,
+            token=user.kaiten_token,
+            base_url=user.kaiten_base_url,
+        )
         kaiten_clients.append(client)
 
         # 2. Настроить доску (если column_ids не заданы явно в конфиге)

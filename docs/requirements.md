@@ -339,12 +339,25 @@ users.json            # Конфиг пользователей (не в git, о
       "Понедельник": 1688101,
       "Вторник": 1689798
     }
+  },
+  {
+    "user_id": "alice",
+    "telegram_chat_id": 222222222,
+    "kaiten_board_id": 999999,
+    "kaiten_lane_id": 0,
+    "kaiten_space_id": 197396,
+    "kaiten_token_env": "KAITEN_TOKEN_ALICE",
+    "kaiten_base_url_env": "KAITEN_BASE_URL_ALICE"
   }
 ]
 ```
 
 Если `users.json` отсутствует — сервис читает конфиг из env-переменных (обратная совместимость):
 `TELEGRAM_CHAT_ID`, `KAITEN_BOARD_ID`, `KAITEN_LANE_ID`, `KAITEN_SPACE_ID`.
+
+**Токены Kaiten:** хранятся в env-переменных Railway, не в `users.json`.
+В JSON прописывается только имя переменной (`kaiten_token_env`). Если поле отсутствует —
+используется глобальный `KAITEN_TOKEN` из env (для пользователей на одном аккаунте).
 
 ### 13.2. Изоляция пользователей
 

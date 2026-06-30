@@ -84,11 +84,18 @@ DELETE /cards/{card_id}                      — удалить
 BoardLogic(client: KaitenClient, column_ids: dict[str, int])
 # Доступ: logic.column_ids["Понедельник"], logic.column_name_by_id[1688101]
 ```
-`KaitenClient` также per-instance:
+`KaitenClient` per-instance, token и base_url опциональны (fallback → env):
 ```python
-KaitenClient(board_id: int, lane_id: int)
-# KAITEN_TOKEN, KAITEN_BASE_URL, KAITEN_SPACE_ID — из env (общие для всех)
+KaitenClient(
+    board_id: int,
+    lane_id: int,
+    token: str | None = None,    # если None → KAITEN_TOKEN из env
+    base_url: str | None = None, # если None → KAITEN_BASE_URL из env
+)
 ```
+- КРИТИЧНО: токен НИКОГДА не хранится напрямую в users.json — только ссылка на имя env-переменной (`kaiten_token_env`).
+- `load_users()` в `user_config.py` разрешает `kaiten_token_env` → `os.getenv(token_env)` и передаёт результат в `UserConfig.kaiten_token`.
+- `bot.py` создаёт клиент: `KaitenClient(board_id=..., lane_id=..., token=user.kaiten_token, base_url=user.kaiten_base_url)`
 
 ## Паттерны кода
 

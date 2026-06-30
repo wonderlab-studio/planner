@@ -17,6 +17,8 @@ class UserConfig:
     kaiten_space_id: int
     timezone: str = "Europe/Moscow"
     column_ids: dict[str, int] = field(default_factory=dict)  # заполняется board_setup или из конфига
+    kaiten_token: str | None = None       # уже разрешённый токен (заполняется при загрузке из env)
+    kaiten_base_url: str | None = None    # уже разрешённый base_url (заполняется при загрузке)
 
 
 def load_users() -> list[UserConfig]:
@@ -31,6 +33,10 @@ def load_users() -> list[UserConfig]:
 
 def _parse_user(item: dict) -> UserConfig:
     column_ids = {k: int(v) for k, v in item.get("column_ids", {}).items()}
+    token_env = item.get("kaiten_token_env")       # например "KAITEN_TOKEN_ALICE"
+    base_url_env = item.get("kaiten_base_url_env") # например "KAITEN_BASE_URL_ALICE"
+    kaiten_token = os.getenv(token_env) if token_env else None
+    kaiten_base_url = os.getenv(base_url_env) if base_url_env else None
     return UserConfig(
         user_id=item["user_id"],
         telegram_chat_id=int(item["telegram_chat_id"]),
@@ -39,6 +45,8 @@ def _parse_user(item: dict) -> UserConfig:
         kaiten_space_id=int(item.get("kaiten_space_id", os.getenv("KAITEN_SPACE_ID", "197396"))),
         timezone=item.get("timezone", "Europe/Moscow"),
         column_ids=column_ids,
+        kaiten_token=kaiten_token,
+        kaiten_base_url=kaiten_base_url,
     )
 
 
@@ -58,4 +66,6 @@ def _load_from_env() -> list[UserConfig]:
         kaiten_board_id=int(board_id),
         kaiten_lane_id=int(lane_id),
         kaiten_space_id=int(space_id),
+        kaiten_token=None,
+        kaiten_base_url=None,
     )]

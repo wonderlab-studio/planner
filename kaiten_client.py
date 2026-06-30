@@ -2,13 +2,15 @@
 kaiten_client.py — асинхронный HTTP-клиент к Kaiten API.
 
 Конфиг из .env (модульные globals, общие для всего приложения):
-    KAITEN_TOKEN      — Bearer-токен
+    KAITEN_TOKEN      — Bearer-токен (fallback если token не передан в __init__)
     KAITEN_BASE_URL   — https://wonderlabst.kaiten.ru/api/latest
     KAITEN_SPACE_ID   — ID пространства (197396)
 
 Board-специфичные параметры передаются в __init__:
     board_id  — ID доски (напр. 476640)
     lane_id   — ID дорожки (напр. 623640)
+    token     — Bearer-токен пользователя (опционально, fallback → KAITEN_TOKEN из env)
+    base_url  — базовый URL API (опционально, fallback → KAITEN_BASE_URL из env)
 """
 
 from __future__ import annotations
@@ -187,18 +189,31 @@ class KaitenClient:
     """Асинхронный клиент к Kaiten REST API.
 
     board_id и lane_id — board-специфичные параметры, передаются в __init__.
-    token и base_url берутся из модульных глобалей KAITEN_TOKEN, KAITEN_BASE_URL.
+    token и base_url — опциональные per-user параметры; при отсутствии
+    используются KAITEN_TOKEN / KAITEN_BASE_URL из env.
     """
 
-    def __init__(self, board_id: int, lane_id: int) -> None:
+    def __init__(
+        self,
+        board_id: int,
+        lane_id: int,
+        token: str | None = None,
+        base_url: str | None = None,
+    ) -> None:
         self._board_id = board_id
         self._lane_id = lane_id
-        if not KAITEN_TOKEN:
-            logger.warning("KAITEN_TOKEN не задан — запросы к API будут падать с 401")
+        self._token = token or os.getenv("KAITEN_TOKEN", "")
+        self._base_url = base_url or os.getenv("KAITEN_BASE_URL", "")
+        if not self._token:
+            logger.error("KaitenClient: KAITEN_TOKEN не задан для board_id={}", board_id)
+            raise RuntimeError("KAITEN_TOKEN не задан")
+        if not self._base_url:
+            logger.error("KaitenClient: KAITEN_BASE_URL не задан для board_id={}", board_id)
+            raise RuntimeError("KAITEN_BASE_URL не задан")
         self._client = httpx.AsyncClient(
-            base_url=KAITEN_BASE_URL,
+            base_url=self._base_url,
             headers={
-                "Authorization": f"Bearer {KAITEN_TOKEN}",
+                "Authorization": f"Bearer {self._token}",
                 "Content-Type": "application/json",
             },
             timeout=30,
