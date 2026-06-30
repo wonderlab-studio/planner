@@ -25,7 +25,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from loguru import logger
 
 import db
-from kaiten_client import Card, KaitenClient, TAG_IDS, ARCHIVE_COLUMN_ID
+from kaiten_client import Card, KaitenClient, TAG_IDS
 from board_logic import BoardLogic
 from claude_client import ClaudeClient
 from notifier import Notifier
@@ -409,7 +409,8 @@ class Scheduler:
                 user_id, cutoff.date().isoformat(),
             )
 
-            cards = await user_ctx.kaiten.get_cards(ARCHIVE_COLUMN_ID)
+            archive_col_id = user_ctx.logic.column_ids["Архив"]
+            cards = await user_ctx.kaiten.get_cards(archive_col_id)
             deleted = 0
 
             for card in cards:
