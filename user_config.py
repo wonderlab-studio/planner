@@ -22,11 +22,15 @@ class UserConfig:
 
 
 def load_users() -> list[UserConfig]:
-    """Загружает список пользователей из users.json или из env (обратная совместимость)."""
+    """Загружает список пользователей из users.json, USERS_JSON env или одиночного env (обратная совместимость)."""
     path = os.getenv("USERS_CONFIG_PATH", "users.json")
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
+        return [_parse_user(item) for item in data]
+    users_json_env = os.getenv("USERS_JSON")
+    if users_json_env:
+        data = json.loads(users_json_env)
         return [_parse_user(item) for item in data]
     return _load_from_env()
 
