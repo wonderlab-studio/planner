@@ -121,7 +121,8 @@ git push  # Railway подхватывает автоматически
 ```
 
 Логи: Railway Dashboard → вкладка Logs.
-Сброс флага утра: `python -c "import db; db.reset_flags('YYYY-MM-DD')"` через Railway Shell.
+Сброс флага утра для конкретного пользователя: `python -c "import db; db.reset_flags('YYYY-MM-DD', 'user_id')"` через Railway Shell.
+Сброс для всех пользователей: `python -c "import sqlite3, os; conn=sqlite3.connect(os.getenv('DB_PATH','state.db')); conn.execute(\"UPDATE daily_flags SET morning_done=0 WHERE date='YYYY-MM-DD'\"); conn.commit(); print('done')"` через Railway Shell.
 
 ---
 

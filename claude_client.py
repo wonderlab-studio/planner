@@ -51,14 +51,28 @@ def _format_card(card: dict) -> str:
     if card.get("importance"):
         parts.append(f"  важность: {card['importance']}")
 
-    # Показываем временные слоты из segments (приоритет над event_time)
-    segments = card.get("segments") or []
-    if segments:
-        # Формат: "время: 09:00–09:45, 10:30–11:15"
-        segs_str = ", ".join(f"{s}–{e}" for s, e in segments)
-        parts.append(f"  время: {segs_str}")
-    elif card.get("event_time"):
-        parts.append(f"  время: {card['event_time']}")
+    # Для секции «На контроле» — время не показываем (это ожидание, не запланированное событие)
+    is_control = card.get("section") == "На контроле"
+
+    if not is_control:
+        segments = card.get("segments") or []
+        if segments:
+            segs_str = ", ".join(f"{s}–{e}" for s, e in segments)
+            parts.append(f"  время: {segs_str}")
+        elif card.get("event_time"):
+            et = card["event_time"]  # "HH:MM"
+            size = card.get("size")
+            if size and size != 999:
+                # Вычисляем конец из event_time + size (fallback когда segments не заданы)
+                try:
+                    h, m = int(et[:2]), int(et[3:5])
+                    total = h * 60 + m + round(size * 60)
+                    end_h, end_m = divmod(total, 60)
+                    parts.append(f"  время: {et}–{end_h:02d}:{end_m:02d}")
+                except Exception:
+                    parts.append(f"  время: {et}")
+            else:
+                parts.append(f"  время: {et}")
 
     if card.get("due_date"):
         parts.append(f"  дедлайн: {card['due_date']}")

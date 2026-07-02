@@ -3,6 +3,7 @@ morning_logic.py — утренняя логика.
 
 [UPD 4] Полная перезапись для v4: алгоритм фаз 1–4.
 
+Фаза 0 : резервация слотов для карточек уже в сегодняшней колонке
 Фаза 1 : карточки с event_time.date() == today → фиксированные слоты
 Фаза 2 : сортировка оставшихся по 9 группам приоритета
 Фаза 3 : назначение event_time через update_card + перемещение в секцию
@@ -272,7 +273,7 @@ class MorningLogic:
             )
             return False
 
-    # ── Фазы 1–4: расписание для одного дня ─────────────────────────────────
+    # ── Фазы 0–4: расписание для одного дня ─────────────────────────────────
 
     async def _schedule_today(
         self,
@@ -280,7 +281,7 @@ class MorningLogic:
         today: date,
         preloaded: dict[int, list[Card]],
     ) -> list[Card]:
-        """Размещает кандидатов в сегодняшней колонке по алгоритму фаз 1–4.
+        """Размещает кандидатов в сегодняшней колонке по алгоритму фаз 0–4.
 
         Заполняет self.last_segments: {card_id: [("HH:MM", "HH:MM"), ...]}.
         Возвращает свежие карточки сегодняшней колонки из API.
@@ -292,6 +293,33 @@ class MorningLogic:
         # Единый рабочий блок 09:00–19:00 (Утро и День — ярлыки приоритета, не окна)
         work_sched    = _BlockScheduler(_WORK_START,    _WORK_END)
         evening_sched = _BlockScheduler(_EVENING_START, _EVENING_END)
+
+        # ── Фаза 0: резервируем слоты для карточек уже в сегодняшней колонке ──
+        # Карточки уже в today_col_id не перемещаются (они на месте), но их временной
+        # слот нужно зарезервировать чтобы фазы 1–3 не ставили задачи поверх них.
+        for card in preloaded.get(today_col_id, []):
+            if card.blocked or card.archived:
+                continue
+            et = card.event_time
+            if et is None:
+                continue
+            et_local = et.astimezone(_TZ_MSK) if et.tzinfo else et.replace(tzinfo=_TZ_MSK)
+            if et_local.date() != today:
+                continue
+            if (et_local.hour, et_local.minute) == (0, 0):
+                continue
+            start_min = et_local.hour * 60 + et_local.minute
+            size_h = card.size if (card.size and card.size != 999) else _DEFAULT_HOURS
+            end_min = start_min + round(size_h * 60)
+            if et_local.hour < 19:
+                work_sched.reserve(start_min, end_min)
+            else:
+                evening_sched.reserve(start_min, end_min)
+            self.last_segments[card.id] = [(_fmt_min(start_min), _fmt_min(end_min))]
+            logger.debug(
+                "phase0 reserve: «{}» (id={}) {}–{}",
+                card.title, card.id, _fmt_min(start_min), _fmt_min(end_min),
+            )
 
         # ── Фаза 1: фиксированные события ─────────────────────────────────────
         # Попадают: event_time.date() == today
@@ -529,7 +557,8 @@ class MorningLogic:
         """Перемещает карточки в следующий день (без назначения event_time).
 
         После воскресенья (weekday=6) → «Следующая неделя».
-        Следующее утро само запланирует их по алгоритму фаз 1–4.
+        Карточки с тегом «вечерняя» попадают в секцию «Вечер», остальные — «Утро».
+        Следующее утро само запланирует их по алгоритму фаз 0–4.
         """
         next_week_col = self._logic.column_ids["Следующая неделя"]
         next_day = from_date + timedelta(days=1)
@@ -542,7 +571,8 @@ class MorningLogic:
 
         for card in cards:
             try:
-                so     = await self._logic.get_section_sort_order(target_col, "Утро")
+                section = "Вечер" if _TAG_EVENING in card.tag_ids else "Утро"
+                so     = await self._logic.get_section_sort_order(target_col, section)
                 result = await self._client.move_card(card.id, target_col, so)
                 if result:
                     old_col = card.column_id
@@ -552,8 +582,8 @@ class MorningLogic:
                     card.sort_order = so
                     preloaded.setdefault(target_col, []).append(card)
                     logger.info(
-                        "overflow → col={}: «{}» (id={})",
-                        target_col, card.title, card.id,
+                        "overflow → col={} sec={}: «{}» (id={})",
+                        target_col, section, card.title, card.id,
                     )
                 else:
                     logger.error("overflow FAIL: id={} «{}»", card.id, card.title)
@@ -569,7 +599,7 @@ class MorningLogic:
         2. Маршрутизирует: еженедельно → следующая неделя,
            На контроле → сегодняшний «На контроле»,
            по будням на выходной / по выходным в будни → следующая неделя,
-           остальные → кандидаты для фаз 1–4.
+           остальные → кандидаты для фаз 0–4.
         3. Запускает _schedule_today.
         """
         logger.info("morning [regular]: {}", today.isoformat())
@@ -628,7 +658,7 @@ class MorningLogic:
         """Утренняя логика понедельника.
 
         Сборка карточек со всей недели — без изменений (v3).
-        Размещение в понедельник — через фазы 1–4 (UPD 4).
+        Размещение в понедельник — через фазы 0–4 (UPD 4).
         """
         logger.info("morning [monday]: {}", today.isoformat())
 
@@ -754,7 +784,7 @@ class MorningLogic:
 
         logger.info("morning [monday]: кандидатов для расписания={}", len(monday_candidates))
 
-        # ── Фазы 1–4 для понедельника ─────────────────────────────────────────
+        # ── Фазы 0–4 для понедельника ─────────────────────────────────────────
         result = await self._schedule_today(monday_candidates, today, preloaded)
 
         # ── Далёкие времена → Следующая неделя ────────────────────────────────
