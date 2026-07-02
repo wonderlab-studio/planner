@@ -33,7 +33,9 @@ ANTHROPIC_API_KEY=...
 | Обновить карточку | PATCH | `/cards/{card_id}` |
 | Удалить карточку | DELETE | `/cards/{card_id}` — возвращает 204 |
 | Добавить комментарий | POST | `/cards/{card_id}/comments` |
+| Получить комментарии | GET | `/cards/{card_id}/comments` |
 | Добавить тег | POST | `/cards/{card_id}/tags` — body: `{"name": "tagname"}` |
+| Заблокировать карточку | POST | `/cards/{card_id}/blockers` — body: `{"reason": "Утро"}` |
 
 > ⚠️ Авторизация: заголовок `Authorization: Bearer {KAITEN_TOKEN}`  
 > ⚠️ API возвращает максимум 100 карточек за запрос — необходима пагинация  
@@ -42,7 +44,8 @@ ANTHROPIC_API_KEY=...
 **Не работают в этом инстансе:**
 - `GET /columns/{id}/cards` — возвращает 404
 - `PATCH /cards/{id}` с полем `tag_ids` — теги игнорируются, использовать `POST /cards/{id}/tags`
-- `POST /cards` с полями `blocked`/`block_reason` — игнорируются; нужен отдельный `PATCH` после создания
+- `POST /cards` с полями `blocked`/`block_reason` — игнорируются Kaiten при создании
+- `PATCH /cards/{id}` с полями `blocked`/`block_reason` — также игнорируется; для блокировки использовать `POST /cards/{id}/blockers`
 
 ---
 
@@ -209,6 +212,14 @@ sort_order ≈ 3.30   │ [РАЗДЕЛИТЕЛЬ] block_reason="На контр
 }
 ```
 
+### Пример блокировки карточки (POST /cards/{card_id}/blockers)
+
+```json
+{
+  "reason": "Утро"
+}
+```
+
 ---
 
 ## 2. KaitenClient — публичные методы
@@ -264,22 +275,43 @@ class KaitenClient:
         """POST /cards/{card_id}/comments  body={"text": text}
         Возвращает True при успехе."""
 
+    async def get_comments(self, card_id: int) -> list[str]:
+        """GET /cards/{card_id}/comments
+        Возвращает список текстов комментариев (пустой список при ошибке)."""
+
     async def delete_card(self, card_id: int) -> bool:
         """DELETE /cards/{card_id} — удаляет карточку навсегда.
         Kaiten возвращает 204 при успехе.
         Возвращает True при успехе, False при ошибке."""
+
+    async def get_lanes(self) -> list[dict]:
+        """GET /boards/{board_id}/lanes
+        Возвращает список дорожек доски (сырые dict с полями id, title и т.д.)."""
+
+    async def create_column(self, title: str, sort_order: float = 1000.0) -> dict | None:
+        """POST /boards/{board_id}/columns
+        Создаёт колонку. Возвращает сырой dict с id или None при ошибке."""
+
+    async def delete_column(self, column_id: int) -> bool:
+        """DELETE /boards/{board_id}/columns/{column_id}
+        Удаляет колонку. Возвращает True при успехе, False при ошибке."""
 
     async def add_tag_by_name(self, card_id: int, tag_name: str) -> bool:
         """POST /cards/{card_id}/tags  body={"name": tag_name}
         Добавляет тег по имени (не по ID) — совместимо с мульти-пользовательским режимом.
         Возвращает True при успехе, False при ошибке."""
 
+    async def block_card(self, card_id: int, reason: str) -> bool:
+        """POST /cards/{card_id}/blockers  body={"reason": reason}
+        Единственный рабочий способ заблокировать карточку (PATCH с blocked/block_reason
+        игнорируется Kaiten API). Возвращает True при успехе (статус 200), False при ошибке."""
+
     async def create_blocked_card(
         self, column_id: int, title: str, block_reason: str, sort_order: float = 1.0
     ) -> dict | None:
         """Создаёт карточку-разделитель (blocked=True).
-        POST /cards → получить id → PATCH /cards/{id} с blocked=True и block_reason.
-        (Kaiten игнорирует blocked/block_reason при POST — нужен отдельный PATCH.)
+        POST /cards → получить id → POST /cards/{id}/blockers с reason=block_reason.
+        (Kaiten игнорирует blocked/block_reason при POST и при PATCH — нужен /blockers.)
         Возвращает итоговый dict карточки или None при ошибке."""
 ```
 
@@ -377,8 +409,9 @@ class Card:
     properties: dict = field(default_factory=dict)
     archived: bool = False
     state: int = 1
+    updated_at: str | None = None  # ISO datetime последнего изменения
 
-    # Удобные свойства (вычисляются из properties)
+    # Удобные свойства (вычисляются из properties / полей)
     @property
     def event_time(self) -> datetime | None:
         """Парсит properties.id_590358 → datetime (UTC+3)"""
@@ -390,6 +423,14 @@ class Card:
     @property
     def weekday(self) -> str | None:
         """Парсит properties.id_590359 → 'ПН'/'ВТ'/...'ВС'"""
+
+    @property
+    def updated_at_parsed(self) -> datetime | None:
+        """Парсит updated_at → datetime aware (UTC+3)"""
+
+    @property
+    def due_date_parsed(self) -> datetime | None:
+        """Парсит due_date → datetime aware (UTC+3)"""
 ```
 
 ---
@@ -403,3 +444,4 @@ class Card:
 | 3 | Пагинация: точные параметры offset/limit | ✅ Решено | limit=100, offset+=100 пока len(batch) < limit |
 | 4 | Эндпоинт архивирования: PATCH move или отдельный | ✅ Решено | PATCH /cards/{id} с column_id=6122269 |
 | 5 | Разделители в других колонках | 🔲 Открыт | sort_order получать динамически, не хардкодить |
+| 6 | Блокировка карточки через API | ✅ Решено | POST /cards/{id}/blockers с {"reason": "..."} (PATCH игнорируется) |

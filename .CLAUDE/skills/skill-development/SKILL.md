@@ -71,7 +71,7 @@ DELETE /cards/{id}
 
 ### Особенности Kaiten API (из продакшена)
 
-- КРИТИЧНО: `blocked=True` при `POST /cards` **игнорируется Kaiten API** — карточка создаётся разблокированной. Для создания разделителя нужен отдельный `PATCH /cards/{id}` с `{"blocked": True, "block_reason": "..."}` после POST.
+- КРИТИЧНО: `blocked=True` при `POST /cards` **игнорируется Kaiten API**, `PATCH /cards/{id}` с `{"blocked": True}` тоже игнорируется. Единственный рабочий способ заблокировать карточку: `POST /cards/{card_id}/blockers` с `{"reason": "..."}`. Используй `KaitenClient.block_card(card_id, reason)`.
 - КРИТИЧНО: теги добавляются ТОЛЬКО через `POST /cards/{id}/tags` с `{"name": "tagname"}` — поле `tag_ids` в PATCH игнорируется.
 - КРИТИЧНО: `archive_card` всегда через `BoardLogic.archive_card()`, не через `KaitenClient` напрямую — только BoardLogic знает `archive_column_id`.
 

@@ -86,10 +86,10 @@ class Card:
     column_id: int
     sort_order: float
     blocked: bool
-    block_reason: str | None        # "Утро" / "День" / "Вечер" / "На контроле"
+    block_reason: str | None
     description: str | None = None
-    size: int | None = None         # complexity (часы)
-    due_date: str | None = None     # ISO datetime строка
+    size: int | None = None
+    due_date: str | None = None
     tag_ids: list[int] = field(default_factory=list)
     tags: list[Tag] = field(default_factory=list)
     properties: dict = field(default_factory=dict)
@@ -97,101 +97,106 @@ class Card:
     state: int = 1
     updated_at: str | None = None
 
+    # ── Computed properties ───────────────────────────────────────────────────
+
     @property
     def event_time(self) -> datetime | None:
-        """Парсит properties["id_590358"] → datetime в UTC+3."""
+        """Парсит properties.id_590358 → datetime (UTC+3).
+
+        Формат значения: {"date": "YYYY-MM-DD", "time": "HH:MM:SS", "tzOffset": 180}
+        Возвращает None если поле отсутствует или не парсится.
+        """
         raw = self.properties.get("id_590358")
         if not raw or not isinstance(raw, dict):
             return None
         try:
             date_str = raw.get("date", "")
             time_str = raw.get("time", "00:00:00")
-            tz_offset = raw.get("tzOffset", 180)
-            tz = timezone(timedelta(minutes=tz_offset))
-            return datetime.fromisoformat(f"{date_str}T{time_str}").replace(tzinfo=tz)
-        except Exception:
+            dt_str   = f"{date_str}T{time_str}"
+            dt = datetime.fromisoformat(dt_str)
+            return dt.replace(tzinfo=TZ_MSK)
+        except (ValueError, TypeError):
             return None
 
     @property
     def importance(self) -> str | None:
-        """Парсит properties["id_590382"] → 'среднее'/'важное'/'критическое'."""
+        """Парсит properties.id_590382 → 'среднее'/'важное'/'критическое' или None."""
         raw = self.properties.get("id_590382")
-        if not raw or not isinstance(raw, list):
+        if not raw or not isinstance(raw, list) or len(raw) == 0:
             return None
         return IMPORTANCE_BY_ID.get(raw[0])
 
     @property
     def weekday(self) -> str | None:
-        """Парсит properties["id_590359"] → 'ПН'/'ВТ'/...'ВС'."""
+        """Парсит properties.id_590359 → 'ПН'/'ВТ'/.../'ВС' или None."""
         raw = self.properties.get("id_590359")
-        if not raw or not isinstance(raw, list):
+        if not raw or not isinstance(raw, list) or len(raw) == 0:
             return None
         return WEEKDAY_BY_ID.get(raw[0])
 
     @property
-    def due_date_parsed(self) -> datetime | None:
-        """Парсит due_date → datetime (UTC)."""
-        if not self.due_date:
-            return None
-        try:
-            return datetime.fromisoformat(self.due_date.replace("Z", "+00:00"))
-        except Exception:
-            return None
-
-    @property
     def updated_at_parsed(self) -> datetime | None:
+        """Парсит поле updated_at → datetime (aware, UTC+3) или None."""
         if not self.updated_at:
             return None
         try:
-            return datetime.fromisoformat(self.updated_at.replace("Z", "+00:00"))
-        except Exception:
+            # Kaiten возвращает ISO 8601 со смещением или без него
+            dt = datetime.fromisoformat(self.updated_at.replace("Z", "+00:00"))
+            return dt.astimezone(TZ_MSK)
+        except (ValueError, TypeError):
+            return None
+
+    @property
+    def due_date_parsed(self) -> datetime | None:
+        """Парсит поле due_date → datetime (aware, UTC+3) или None."""
+        if not self.due_date:
+            return None
+        try:
+            dt = datetime.fromisoformat(self.due_date.replace("Z", "+00:00"))
+            return dt.astimezone(TZ_MSK)
+        except (ValueError, TypeError):
             return None
 
 
-# ── Фабричные функции ─────────────────────────────────────────────────────────
+# ── Вспомогательные парсеры ───────────────────────────────────────────────────
 
-def _parse_tag(raw: dict) -> Tag:
-    return Tag(id=raw["id"], name=raw.get("name", ""))
-
-
-def _parse_card(raw: dict) -> Card:
-    tags_raw = raw.get("tags") or []
-    return Card(
-        id=raw["id"],
-        title=raw.get("title", ""),
-        column_id=raw.get("column_id", 0),
-        sort_order=float(raw.get("sort_order") or 0),
-        blocked=bool(raw.get("blocked", False)),
-        block_reason=raw.get("block_reason"),
-        description=raw.get("description"),
-        size=raw.get("size"),
-        due_date=raw.get("due_date"),
-        tag_ids=raw.get("tag_ids") or [],
-        tags=[_parse_tag(t) for t in tags_raw],
-        properties=raw.get("properties") or {},
-        archived=bool(raw.get("archived", False)),
-        state=raw.get("state", 1),
-        updated_at=raw.get("updated_at"),
+def _parse_column(data: dict) -> Column:
+    return Column(
+        id=data["id"],
+        title=data.get("title", ""),
+        sort_order=float(data.get("sort_order", 0)),
     )
 
 
-def _parse_column(raw: dict) -> Column:
-    return Column(
-        id=raw["id"],
-        title=raw.get("title", ""),
-        sort_order=float(raw.get("sort_order") or 0),
+def _parse_tag(data: dict) -> Tag:
+    return Tag(id=data["id"], name=data.get("name", ""))
+
+
+def _parse_card(data: dict) -> Card:
+    tags_raw = data.get("tags") or []
+    return Card(
+        id=data["id"],
+        title=data.get("title", ""),
+        column_id=data.get("column_id", 0),
+        sort_order=float(data.get("sort_order", 0)),
+        blocked=bool(data.get("blocked", False)),
+        block_reason=data.get("block_reason"),
+        description=data.get("description"),
+        size=data.get("size"),
+        due_date=data.get("due_date"),
+        tag_ids=data.get("tag_ids") or [],
+        tags=[_parse_tag(t) for t in tags_raw if isinstance(t, dict)],
+        properties=data.get("properties") or {},
+        archived=bool(data.get("archived", False)),
+        state=data.get("state", 1),
+        updated_at=data.get("updated_at"),
     )
 
 
 # ── KaitenClient ──────────────────────────────────────────────────────────────
 
 class KaitenClient:
-    """Асинхронный клиент к Kaiten REST API.
-
-    board_id и lane_id — board-специфичные параметры, передаются в __init__.
-    token и base_url — опциональные per-user параметры; при отсутствии
-    используются KAITEN_TOKEN / KAITEN_BASE_URL из env.
-    """
+    """Асинхронный HTTP-клиент к Kaiten REST API."""
 
     def __init__(
         self,
@@ -276,9 +281,8 @@ class KaitenClient:
         Запрашивает страницами по 100 пока API не вернёт меньше limit.
         """
         all_cards: list[Card] = []
-        limit = 100
+        limit  = 100
         offset = 0
-
         while True:
             data = await self._request(
                 "GET",
@@ -286,26 +290,22 @@ class KaitenClient:
                 params={"column_id": column_id, "limit": limit, "offset": offset},
             )
             if not isinstance(data, list):
-                logger.warning("get_cards({}): неожиданный ответ на offset={}", column_id, offset)
+                logger.warning(
+                    "get_cards: неожиданный ответ для col_id={}: {}", column_id, data
+                )
                 break
-
-            batch = [_parse_card(c) for c in data]
-            all_cards.extend(batch)
-            logger.debug(
-                "get_cards({}): offset={} получено={} накоплено={}",
-                column_id, offset, len(batch), len(all_cards),
-            )
-
+            all_cards.extend(_parse_card(c) for c in data)
             if len(data) < limit:
-                break  # последняя страница
+                break
             offset += limit
-
+        logger.debug("get_cards: col_id={} итого={}", column_id, len(all_cards))
         return all_cards
 
     async def get_card(self, card_id: int) -> Card | None:
-        """GET /cards/{card_id} — полная структура карточки."""
+        """GET /cards/{card_id} → полная структура карточки или None."""
         data = await self._request("GET", f"/cards/{card_id}")
-        if not data:
+        if not data or not isinstance(data, dict):
+            logger.warning("get_card: карточка id={} не найдена", card_id)
             return None
         return _parse_card(data)
 
@@ -321,15 +321,12 @@ class KaitenClient:
         tag_ids: list[int] | None = None,
         properties: dict | None = None,
     ) -> Card | None:
-        """POST /cards — создаёт карточку.
-
-        board_id и lane_id подставляются автоматически из self._board_id / self._lane_id.
-        """
-        body: dict[str, Any] = {
-            "board_id": self._board_id,
-            "lane_id":  self._lane_id,
+        """POST /cards → создаёт карточку. lane_id и board_id подставляются автоматически."""
+        body: dict = {
+            "title":     title,
+            "board_id":  self._board_id,
             "column_id": column_id,
-            "title": title,
+            "lane_id":   self._lane_id,
         }
         if description is not None:
             body["description"] = description
@@ -339,79 +336,64 @@ class KaitenClient:
             body["due_date"] = due_date
         if sort_order is not None:
             body["sort_order"] = sort_order
-        if tag_ids is not None:
+        if tag_ids:
             body["tag_ids"] = tag_ids
-        if properties is not None:
+        if properties:
             body["properties"] = properties
 
         data = await self._request("POST", "/cards", json=body)
-        if not data:
+        if not data or not isinstance(data, dict):
             logger.error("create_card: не удалось создать карточку «{}»", title)
             return None
         card = _parse_card(data)
-        logger.info("create_card: создана карточка id={} «{}»", card.id, card.title)
+        logger.info("create_card: создана «{}» id={}", title, card.id)
         return card
 
     async def move_card(self, card_id: int, column_id: int, sort_order: float) -> Card | None:
-        """PATCH /cards/{card_id} — перемещает карточку в другую колонку."""
+        """PATCH /cards/{card_id} → перемещает карточку в другую колонку."""
         data = await self._request(
             "PATCH",
             f"/cards/{card_id}",
             json={"column_id": column_id, "sort_order": sort_order},
         )
-        if not data:
-            logger.error("move_card: не удалось переместить карточку id={}", card_id)
+        if not data or not isinstance(data, dict):
+            logger.error(
+                "move_card: не удалось переместить id={} → col={}", card_id, column_id
+            )
             return None
-        card = _parse_card(data)
-        logger.info(
-            "move_card: карточка id={} перемещена в column_id={} sort_order={}",
-            card_id, column_id, sort_order,
-        )
-        return card
+        logger.debug("move_card: id={} → col={} so={:.4f}", card_id, column_id, sort_order)
+        return _parse_card(data)
 
-    async def update_card(self, card_id: int, **fields: Any) -> Card | None:
-        """PATCH /cards/{card_id} — обновляет произвольные поля карточки."""
-        if not fields:
-            logger.warning("update_card({}): нет полей для обновления", card_id)
-            return None
+    async def update_card(self, card_id: int, **fields) -> Card | None:
+        """PATCH /cards/{card_id} → обновляет произвольные поля карточки."""
         data = await self._request("PATCH", f"/cards/{card_id}", json=fields)
-        if not data:
-            logger.error("update_card: не удалось обновить карточку id={}", card_id)
+        if not data or not isinstance(data, dict):
+            logger.error("update_card: не удалось обновить id={} fields={}", card_id, fields)
             return None
-        logger.info("update_card: обновлена карточка id={} поля={}", card_id, list(fields))
+        logger.debug("update_card: id={} fields={}", card_id, list(fields.keys()))
         return _parse_card(data)
 
     async def archive_card(
-        self,
-        card_id: int,
-        archive_column_id: int,
-        comment: str | None = None,
+        self, card_id: int, archive_column_id: int, comment: str | None = None
     ) -> bool:
-        """Архивирует карточку: сначала добавляет комментарий (если передан),
-        затем перемещает в колонку Архив.
+        """Архивирует карточку: перемещает в архивную колонку.
 
-        archive_column_id — ID колонки-архива (предоставляется вызывающим кодом,
-        не хранится в KaitenClient).
+        Если передан comment — добавляет его перед перемещением.
         Возвращает True при успехе.
         """
         if comment:
             await self.add_comment(card_id, comment)
-
-        data = await self._request(
-            "PATCH",
-            f"/cards/{card_id}",
-            json={"column_id": archive_column_id},
-        )
-        if not data:
-            logger.error("archive_card: не удалось архивировать карточку id={}", card_id)
+        result = await self.move_card(card_id, archive_column_id, 1.0)
+        if result is None:
+            logger.error("archive_card: не удалось архивировать id={}", card_id)
             return False
-        logger.info("archive_card: карточка id={} перемещена в Архив (col={})", card_id, archive_column_id)
+        logger.info("archive_card: id={} → col={}", card_id, archive_column_id)
         return True
 
     async def add_comment(self, card_id: int, text: str) -> bool:
         """POST /cards/{card_id}/comments — добавляет комментарий к карточке.
 
-        Возвращает True при успехе.
+        Возвращает True при успехе, False при ошибке.
         """
         data = await self._request(
             "POST",
@@ -419,53 +401,83 @@ class KaitenClient:
             json={"text": text},
         )
         if data is None:
-            logger.error("add_comment: не удалось добавить комментарий к карточке id={}", card_id)
+            logger.error("add_comment: не удалось добавить комментарий к id={}", card_id)
             return False
-        logger.info("add_comment: комментарий добавлен к карточке id={}", card_id)
+        logger.info("add_comment: комментарий добавлен к id={}", card_id)
         return True
 
     async def get_comments(self, card_id: int) -> list[str]:
-        """GET /cards/{card_id}/comments — список текстов комментариев."""
+        """GET /cards/{card_id}/comments → список текстов комментариев.
+
+        Возвращает пустой список при ошибке или если комментариев нет.
+        """
         data = await self._request("GET", f"/cards/{card_id}/comments")
         if not isinstance(data, list):
+            logger.debug("get_comments: нет комментариев для id={}", card_id)
             return []
-        return [c.get("text", "") for c in data if c.get("text")]
-
-    async def get_lanes(self) -> list[dict]:
-        """GET /boards/{board_id}/lanes — список lanes (swimlanes) доски."""
-        data = await self._request("GET", f"/boards/{self._board_id}/lanes")
-        return data if isinstance(data, list) else []
-
-    async def create_column(self, title: str, sort_order: float) -> dict | None:
-        """POST /boards/{board_id}/columns — создаёт колонку на доске."""
-        return await self._request(
-            "POST",
-            f"/boards/{self._board_id}/columns",
-            json={"title": title, "sort_order": sort_order},
-        )
-
-    async def delete_column(self, column_id: int) -> bool:
-        """DELETE /boards/{board_id}/columns/{column_id} — удаляет колонку.
-
-        Возвращает True при успехе.
-        """
-        result = await self._request(
-            "DELETE",
-            f"/boards/{self._board_id}/columns/{column_id}",
-        )
-        return result is not None
+        texts: list[str] = []
+        for item in data:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("body") or ""
+                if text:
+                    texts.append(str(text))
+        logger.debug("get_comments: id={} комментариев={}", card_id, len(texts))
+        return texts
 
     async def delete_card(self, card_id: int) -> bool:
         """DELETE /cards/{card_id} — удаляет карточку навсегда.
 
-        Kaiten API возвращает 204 при успехе.
+        Kaiten возвращает 204 при успехе.
         Возвращает True при успехе, False при ошибке.
         """
-        result = await self._request("DELETE", f"/cards/{card_id}")
-        if result is None:
-            logger.error("delete_card: не удалось удалить карточку id={}", card_id)
+        data = await self._request("DELETE", f"/cards/{card_id}")
+        if data is None:
+            logger.error("delete_card: не удалось удалить id={}", card_id)
             return False
-        logger.info("delete_card: карточка id={} удалена", card_id)
+        logger.info("delete_card: удалена карточка id={}", card_id)
+        return True
+
+    async def get_lanes(self) -> list[dict]:
+        """GET /boards/{board_id}/lanes → список дорожек доски.
+
+        Возвращает список сырых dict (поля id, title и т.д.).
+        """
+        data = await self._request("GET", f"/boards/{self._board_id}/lanes")
+        if not isinstance(data, list):
+            logger.warning("get_lanes: неожиданный ответ: {}", data)
+            return []
+        logger.debug("get_lanes: получено {} дорожек", len(data))
+        return data
+
+    async def create_column(self, title: str, sort_order: float = 1000.0) -> dict | None:
+        """POST /boards/{board_id}/columns → создаёт колонку.
+
+        Возвращает сырой dict с id или None при ошибке.
+        """
+        data = await self._request(
+            "POST",
+            f"/boards/{self._board_id}/columns",
+            json={"title": title, "sort_order": sort_order},
+        )
+        if not data or not isinstance(data, dict):
+            logger.error("create_column: не удалось создать колонку «{}»", title)
+            return None
+        logger.info("create_column: создана «{}» id={}", title, data.get("id"))
+        return data
+
+    async def delete_column(self, column_id: int) -> bool:
+        """DELETE /boards/{board_id}/columns/{column_id} → удаляет колонку.
+
+        Возвращает True при успехе, False при ошибке.
+        """
+        data = await self._request(
+            "DELETE",
+            f"/boards/{self._board_id}/columns/{column_id}",
+        )
+        if data is None:
+            logger.error("delete_column: не удалось удалить колонку id={}", column_id)
+            return False
+        logger.info("delete_column: удалена колонка id={}", column_id)
         return True
 
     async def add_tag_by_name(self, card_id: int, tag_name: str) -> bool:
@@ -486,6 +498,27 @@ class KaitenClient:
         logger.info("add_tag_by_name: тег «{}» добавлен к карточке id={}", tag_name, card_id)
         return True
 
+    async def block_card(self, card_id: int, reason: str) -> bool:
+        """POST /cards/{card_id}/blockers — блокирует карточку.
+
+        Единственный рабочий способ заблокировать карточку через Kaiten API
+        (PATCH с blocked/block_reason игнорируется API).
+        Возвращает True при успехе (статус 200), False при ошибке.
+        """
+        data = await self._request(
+            "POST",
+            f"/cards/{card_id}/blockers",
+            json={"reason": reason},
+        )
+        if data is None:
+            logger.warning(
+                "block_card: не удалось заблокировать карточку id={} reason=«{}»",
+                card_id, reason,
+            )
+            return False
+        logger.info("block_card: карточка id={} заблокирована, reason=«{}»", card_id, reason)
+        return True
+
     async def create_blocked_card(
         self,
         column_id: int,
@@ -496,7 +529,7 @@ class KaitenClient:
         """Создаёт карточку-разделитель (blocked=True) в указанной колонке.
 
         Kaiten API игнорирует поля blocked/block_reason при POST, поэтому
-        после создания карточки выполняется отдельный PATCH для их установки.
+        после создания карточки выполняется отдельный POST /blockers для блокировки.
         """
         body = {
             "title": title,
@@ -512,14 +545,10 @@ class KaitenClient:
         card_id = data.get("id")
         if not card_id:
             return data
-        # Отдельный PATCH для установки blocked (Kaiten игнорирует его при POST)
-        patch = await self._request(
-            "PATCH",
-            f"/cards/{card_id}",
-            json={"blocked": True, "block_reason": block_reason},
-        )
-        if not patch:
+        # Блокируем через /blockers (PATCH с blocked/block_reason игнорируется Kaiten)
+        ok = await self.block_card(card_id, block_reason)
+        if not ok:
             logger.warning(
                 "create_blocked_card: карточка создана (id={}) но не заблокирована", card_id
             )
-        return patch or data
+        return data
