@@ -69,6 +69,12 @@ DELETE /cards/{id}
 **sort_order:** float, вставка между двумя картами = среднее арифметическое их sort_order.
 **Разделители** (Утро/День/Вечер/На контроле): `blocked=True`, `title="-"`, секция из `block_reason`.
 
+### Особенности Kaiten API (из продакшена)
+
+- КРИТИЧНО: `blocked=True` при `POST /cards` **игнорируется Kaiten API** — карточка создаётся разблокированной. Для создания разделителя нужен отдельный `PATCH /cards/{id}` с `{"blocked": True, "block_reason": "..."}` после POST.
+- КРИТИЧНО: теги добавляются ТОЛЬКО через `POST /cards/{id}/tags` с `{"name": "tagname"}` — поле `tag_ids` в PATCH игнорируется.
+- КРИТИЧНО: `archive_card` всегда через `BoardLogic.archive_card()`, не через `KaitenClient` напрямую — только BoardLogic знает `archive_column_id`.
+
 ---
 
 ## Claude API — паттерны
@@ -114,9 +120,12 @@ def _split_text(text: str, max_len: int = 4096) -> list[str]:
         text = text[cut:].lstrip("\n")
     return parts
 
-# Fallback при ошибке Markdown
-if "can't parse" in description.lower():
-    return await self._post(text, parse_mode="text")
+# Fallback при ошибке Markdown — НЕ передавать parse_mode="text" (Telegram API не принимает)
+# Правильный fallback: повторить запрос БЕЗ параметра parse_mode вообще
+try:
+    await bot.send_message(chat_id, text, parse_mode="Markdown")
+except Exception:
+    await bot.send_message(chat_id, text)  # без parse_mode — plain text
 ```
 
 ---
@@ -149,6 +158,13 @@ async def _safe_morning(self):
 
 Причина: написание кода в главной сессии засоряет контекст оркестратора деталями реализации.
 При сложных задачах контекст нужен для архитектурных решений и координации, а не для кода.
+
+---
+
+## Правила реализации новых методов KaitenClient
+
+- КРИТИЧНО: перед использованием нового метода `KaitenClient` в `handlers.py`, `scheduler.py`, `morning_logic.py` — убедиться, что метод РЕАЛЬНО существует в `kaiten_client.py`. Grep: `grep -n "def имя_метода" kaiten_client.py`
+- КРИТИЧНО: при добавлении нового метода в `docs/interfaces.md` — сразу реализовать его в `kaiten_client.py` в том же PR/задаче. Документация без реализации ломает импортирующие модули.
 
 ---
 

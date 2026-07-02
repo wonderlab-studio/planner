@@ -1026,7 +1026,7 @@ def build_handlers(cfg: HandlersConfig) -> Application:
         try:
             answer = await cfg.claude.generate_card_advice(
                 question=question,
-                title=title,
+                card_title=title,
                 description=description,
                 comments=comments,
             )

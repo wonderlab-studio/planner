@@ -204,6 +204,15 @@ await scheduler.run_morning_for_user(user_sched_ctx)
 
 ---
 
+## Особенности Kaiten API (поведение из продакшена)
+
+- КРИТИЧНО: `blocked=True` в теле `POST /cards` **игнорируется Kaiten API** — карточка создаётся разблокированной. Для создания разделителя (blocked card) нужен отдельный `PATCH /cards/{id}` с `{"blocked": True, "block_reason": "..."}` после POST.
+- КРИТИЧНО: теги добавляются ТОЛЬКО через `POST /cards/{id}/tags` с телом `{"name": "tagname"}`. Поле `tag_ids` в PATCH молча игнорируется — теги не появятся.
+- КРИТИЧНО: `archive_card` вызывать только через `BoardLogic.archive_card(card_id)`. `KaitenClient.archive_card` требует явного `archive_column_id` — только `BoardLogic` его знает. Прямой вызов через `user_ctx.kaiten.archive_card(...)` из handlers/scheduler — ошибка.
+- КРИТИЧНО: при добавлении нового метода в `KaitenClient` (документируешь в docs/interfaces.md) — реализовать метод в `kaiten_client.py` в том же PR. Ссылка на несуществующий метод из handlers/scheduler вызовет AttributeError в рантайме.
+
+---
+
 ## Правила безопасного рефакторинга
 
 ### Перед удалением/переименованием константы из модуля

@@ -73,6 +73,22 @@ await notifier.send_morning_plan(plan_text)
 Автоматический fallback: при Markdown-ошибке повторяет без форматирования.
 Разбивка длинных сообщений: `_split_text()` режет по `\n` если > 4096 символов.
 
+### Notifier fallback — КРИТИЧНО
+
+- КРИТИЧНО: `parse_mode="text"` **не принимается Telegram API** — вызывает ошибку. Сообщение не отправляется.
+- Правильный fallback при ошибке Markdown: повторить вызов **без параметра `parse_mode` вообще** (или `parse_mode=None`).
+
+```python
+# НЕПРАВИЛЬНО — Telegram отклонит:
+await bot.send_message(chat_id, text, parse_mode="text")
+
+# ПРАВИЛЬНО — plain text без форматирования:
+try:
+    await bot.send_message(chat_id, text, parse_mode="Markdown")
+except Exception:
+    await bot.send_message(chat_id, text)  # parse_mode не передаётся
+```
+
 ## Routines (bot.py)
 
 `morning_routine` и `evening_routine` — async замыкания в `main()`, создаются per-user:
@@ -89,7 +105,7 @@ async def _reply(update, text):
         try:
             await update.message.reply_text(part, parse_mode="Markdown")
         except Exception:
-            await update.message.reply_text(part)  # без форматирования
+            await update.message.reply_text(part)  # без parse_mode — plain text
 ```
 
 ## Команда "перенести" — важно
@@ -106,6 +122,12 @@ intent = await cfg.claude.parse_intent(f"перенести {text}")
 - Один `InlineKeyboardMarkup`, одна кнопка в строке
 - `callback_data = f"card:{card.id}"`
 - Максимум 20 кнопок, название обрезается до 40 символов
+
+## Работа с карточками через BoardLogic (КРИТИЧНО)
+
+- КРИТИЧНО: для архивации карточки использовать `user_ctx.logic.archive_card(card_id)`, **не** `user_ctx.kaiten.archive_card(card_id, archive_column_id)` напрямую — только BoardLogic знает archive_column_id.
+- КРИТИЧНО: для добавления тега использовать метод `KaitenClient.add_tag(card_id, tag_name)` — метод должен существовать в kaiten_client.py до вызова из handlers.py. Если метода нет — это блокер, делегировать kaiten-агенту.
+- КРИТИЧНО: для удаления карточки использовать `KaitenClient.delete_card(card_id)` — проверить наличие метода через grep перед использованием.
 
 ## Критические правила
 

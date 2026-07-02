@@ -62,6 +62,12 @@ DELETE /cards/{card_id}                      — удалить
 - `GET /columns/{id}/cards` — возвращает 404
 - `PATCH /cards/{id}` с полем `tag_ids` — теги игнорируются, использовать POST /tags
 
+### Особенности Kaiten API (поведение из продакшена)
+
+- КРИТИЧНО: `blocked=True` в теле `POST /cards` **игнорируется Kaiten API** — карточка создаётся разблокированной. После создания нужен отдельный `PATCH /cards/{id}` с `{"blocked": True, "block_reason": "..."}`.
+- КРИТИЧНО: `add_tag` работает только через `POST /cards/{id}/tags` с `{"name": "tagname"}`. Поле `tag_ids` в PATCH молча игнорируется.
+- КРИТИЧНО: `archive_card` вызывать только через `BoardLogic.archive_card()`, **не** через `KaitenClient` напрямую — `KaitenClient.archive_card(card_id)` требует `archive_column_id`, только `BoardLogic` его знает.
+
 **Формат event_time (dict, не строка!):**
 ```python
 {"id_590358": {"date": "2026-06-23", "time": "09:00:00", "tzOffset": 180}}
@@ -120,6 +126,8 @@ KaitenClient(
 - Реальные имена: "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"
 - Разделители: title="-", block_reason="Утро"/"День"/"Вечер"/"На контроле"
 - COLUMN_IDS НЕ экспортируются как глобальные — они живут в экземпляре BoardLogic (column_ids)
+- КРИТИЧНО: при добавлении нового метода в `docs/interfaces.md` — реализовать его в `kaiten_client.py` в этой же задаче. Документация без реализации ломает handlers/scheduler при старте.
+- КРИТИЧНО: если в handlers.py или scheduler.py используется `user_ctx.kaiten.archive_card(...)` — это НЕПРАВИЛЬНО. Использовать `user_ctx.logic.archive_card(card_id)`.
 
 ## Проверка изменений
 
