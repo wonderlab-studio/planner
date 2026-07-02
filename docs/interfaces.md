@@ -31,11 +31,18 @@ ANTHROPIC_API_KEY=...
 | Одна карточка | GET | `/cards/{card_id}` |
 | Создать карточку | POST | `/cards` |
 | Обновить карточку | PATCH | `/cards/{card_id}` |
+| Удалить карточку | DELETE | `/cards/{card_id}` — возвращает 204 |
 | Добавить комментарий | POST | `/cards/{card_id}/comments` |
+| Добавить тег | POST | `/cards/{card_id}/tags` — body: `{"name": "tagname"}` |
 
 > ⚠️ Авторизация: заголовок `Authorization: Bearer {KAITEN_TOKEN}`  
 > ⚠️ API возвращает максимум 100 карточек за запрос — необходима пагинация  
 > (параметры: `?limit=100&offset=0` — уточнить при интеграции)
+
+**Не работают в этом инстансе:**
+- `GET /columns/{id}/cards` — возвращает 404
+- `PATCH /cards/{id}` с полем `tag_ids` — теги игнорируются, использовать `POST /cards/{id}/tags`
+- `POST /cards` с полями `blocked`/`block_reason` — игнорируются; нужен отдельный `PATCH` после создания
 
 ---
 
@@ -194,6 +201,14 @@ sort_order ≈ 3.30   │ [РАЗДЕЛИТЕЛЬ] block_reason="На контр
 }
 ```
 
+### Пример добавления тега (POST /cards/{card_id}/tags)
+
+```json
+{
+  "name": "ежедневно"
+}
+```
+
 ---
 
 ## 2. KaitenClient — публичные методы
@@ -213,7 +228,7 @@ class KaitenClient:
         Возвращает ВСЕ карточки колонки с пагинацией (limit=100, offset).
         Включает и разделители (blocked=True), и задачи."""
 
-    async def get_card(self, card_id: int) -> Card:
+    async def get_card(self, card_id: int) -> Card | None:
         """GET /cards/{card_id}
         Полная структура карточки включая properties, tags, members."""
 
@@ -228,24 +243,44 @@ class KaitenClient:
         sort_order: float | None = None,
         tag_ids: list[int] | None = None,
         properties: dict | None = None,
-    ) -> Card:
+    ) -> Card | None:
         """POST /cards
         Создаёт карточку. lane_id и board_id подставляются автоматически."""
 
-    async def move_card(self, card_id: int, column_id: int, sort_order: float) -> Card:
+    async def move_card(self, card_id: int, column_id: int, sort_order: float) -> Card | None:
         """PATCH /cards/{card_id}
         Перемещает карточку в другую колонку с указанным sort_order."""
 
-    async def update_card(self, card_id: int, **fields) -> Card:
+    async def update_card(self, card_id: int, **fields) -> Card | None:
         """PATCH /cards/{card_id}
         Обновляет произвольные поля карточки."""
 
-    async def archive_card(self, card_id: int, comment: str | None = None) -> None:
-        """Перемещает карточку в колонку Архив (id=6122269).
-        Если передан comment — добавляет комментарий перед перемещением."""
+    async def archive_card(self, card_id: int, archive_column_id: int, comment: str | None = None) -> bool:
+        """Перемещает карточку в колонку Архив (archive_column_id передаётся снаружи).
+        Если передан comment — добавляет комментарий перед перемещением.
+        Возвращает True при успехе."""
 
-    async def add_comment(self, card_id: int, text: str) -> None:
-        """POST /cards/{card_id}/comments  body={"text": text}"""
+    async def add_comment(self, card_id: int, text: str) -> bool:
+        """POST /cards/{card_id}/comments  body={"text": text}
+        Возвращает True при успехе."""
+
+    async def delete_card(self, card_id: int) -> bool:
+        """DELETE /cards/{card_id} — удаляет карточку навсегда.
+        Kaiten возвращает 204 при успехе.
+        Возвращает True при успехе, False при ошибке."""
+
+    async def add_tag_by_name(self, card_id: int, tag_name: str) -> bool:
+        """POST /cards/{card_id}/tags  body={"name": tag_name}
+        Добавляет тег по имени (не по ID) — совместимо с мульти-пользовательским режимом.
+        Возвращает True при успехе, False при ошибке."""
+
+    async def create_blocked_card(
+        self, column_id: int, title: str, block_reason: str, sort_order: float = 1.0
+    ) -> dict | None:
+        """Создаёт карточку-разделитель (blocked=True).
+        POST /cards → получить id → PATCH /cards/{id} с blocked=True и block_reason.
+        (Kaiten игнорирует blocked/block_reason при POST — нужен отдельный PATCH.)
+        Возвращает итоговый dict карточки или None при ошибке."""
 ```
 
 ---
@@ -365,6 +400,6 @@ class Card:
 |---|---|---|---|
 | 1 | option_id для importance | ✅ Решено | среднее=17244396, важное=17244397, критическое=17244398 |
 | 2 | option_id для weekday | ✅ Решено | ПН=17244346 … ВС=17244352 |
-| 3 | Пагинация: точные параметры offset/limit | 🔲 Открыт | Проверить при реализации `get_cards()` |
-| 4 | Эндпоинт архивирования: PATCH move или отдельный | 🔲 Открыт | Проверить `PATCH /cards/{id}` с `"column_id": 6122269` |
+| 3 | Пагинация: точные параметры offset/limit | ✅ Решено | limit=100, offset+=100 пока len(batch) < limit |
+| 4 | Эндпоинт архивирования: PATCH move или отдельный | ✅ Решено | PATCH /cards/{id} с column_id=6122269 |
 | 5 | Разделители в других колонках | 🔲 Открыт | sort_order получать динамически, не хардкодить |

@@ -410,7 +410,7 @@ async def _handle_done(
 
     comment = f"Выполнено {date.today().isoformat()}"
     try:
-        ok = await user_ctx.kaiten.archive_card(matched["id"], comment=comment)
+        ok = await user_ctx.logic.archive_card(matched["id"], comment=comment)
     except Exception as exc:
         logger.exception("handle_done: archive_card error — {}", exc)
         await _reply(update, "⚠️ Не удалось архивировать карточку. Попробуй позже.")
@@ -810,7 +810,7 @@ def build_handlers(cfg: HandlersConfig) -> Application:
 
         if action == "done":
             try:
-                ok = await user_ctx.kaiten.archive_card(card_id, comment=comment_text or None)
+                ok = await user_ctx.logic.archive_card(card_id, comment=comment_text or None)
                 if ok:
                     await update.message.reply_text(
                         f"✅ «{title}» выполнено и перемещено в архив."
@@ -1134,12 +1134,11 @@ def build_handlers(cfg: HandlersConfig) -> Application:
             return ConversationHandler.END
 
         # Добавляем тег «напомнить» если его ещё нет
-        remind_tag = TAG_IDS["напомнить"]
         try:
             card = await user_ctx.kaiten.get_card(card_id)
-            current_tags = list(card.tag_ids) if card else []
-            if remind_tag not in current_tags:
-                await user_ctx.kaiten.add_tag(card_id, remind_tag)
+            current_tag_names = [t.name for t in card.tags] if card else []
+            if "напомнить" not in current_tag_names:
+                await user_ctx.kaiten.add_tag_by_name(card_id, "напомнить")
                 logger.info("received_reminder_time_cb: тег «напомнить» добавлен к id={}", card_id)
         except Exception as exc:
             logger.warning("received_reminder_time_cb: не удалось добавить тег — {}", exc)

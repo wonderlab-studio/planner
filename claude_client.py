@@ -50,8 +50,16 @@ def _format_card(card: dict) -> str:
     parts = [f"• {card.get('title', '(без названия)')}"]
     if card.get("importance"):
         parts.append(f"  важность: {card['importance']}")
-    if card.get("event_time"):
+
+    # Показываем временные слоты из segments (приоритет над event_time)
+    segments = card.get("segments") or []
+    if segments:
+        # Формат: "время: 09:00–09:45, 10:30–11:15"
+        segs_str = ", ".join(f"{s}–{e}" for s, e in segments)
+        parts.append(f"  время: {segs_str}")
+    elif card.get("event_time"):
         parts.append(f"  время: {card['event_time']}")
+
     if card.get("due_date"):
         parts.append(f"  дедлайн: {card['due_date']}")
     if card.get("size"):
@@ -130,7 +138,7 @@ class ClaudeClient:
 
         Параметры:
             cards    — список карточек: [{title, description, importance, size,
-                        due_date, event_time, section}, ...]
+                        due_date, event_time, segments, section}, ...]
             date_str — дата в формате "21 мая 2026, четверг"
 
         Возвращает:
@@ -144,7 +152,7 @@ class ClaudeClient:
             [Утро]
             • Позвонить заказчику
               важность: критическое
-              время: 09:00
+              время: 09:00–10:00
               ~1 ч
             ..."
         """

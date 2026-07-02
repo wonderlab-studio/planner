@@ -71,16 +71,18 @@ class Notifier:
 
     # ── Внутренний хелпер ─────────────────────────────────────────────────────
 
-    async def _post(self, text: str, parse_mode: str = "Markdown") -> bool:
+    async def _post(self, text: str, parse_mode: str | None = "Markdown") -> bool:
         """Отправляет одно сообщение. Возвращает True при успехе.
 
         При ошибке парсинга Markdown автоматически повторяет без форматирования.
         """
         payload: dict[str, Any] = {
-            "chat_id":    self._chat_id,
-            "text":       text,
-            "parse_mode": parse_mode,
+            "chat_id": self._chat_id,
+            "text":    text,
         }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+
         try:
             async with httpx.AsyncClient(timeout=_SEND_MESSAGE_TIMEOUT) as client:
                 resp = await client.post(self._api_url, json=payload)
@@ -90,16 +92,16 @@ class Notifier:
 
                 # Telegram вернул ошибку — логируем детали
                 body = resp.json() if resp.content else {}
-                error_code    = body.get("error_code", resp.status_code)
-                description   = body.get("description", "")
+                error_code  = body.get("error_code", resp.status_code)
+                description = body.get("description", "")
 
                 # Если ошибка в разметке — повторяем без parse_mode
-                if parse_mode != "text" and "can't parse" in description.lower():
+                if parse_mode is not None and "can't parse" in description.lower():
                     logger.warning(
                         "Notifier._post: Markdown-ошибка ({}), повтор без форматирования",
                         description,
                     )
-                    return await self._post(text, parse_mode="text")
+                    return await self._post(text, parse_mode=None)
 
                 logger.error(
                     "Notifier._post: Telegram API error {} — {}",

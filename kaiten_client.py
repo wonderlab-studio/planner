@@ -455,6 +455,37 @@ class KaitenClient:
         )
         return result is not None
 
+    async def delete_card(self, card_id: int) -> bool:
+        """DELETE /cards/{card_id} — удаляет карточку навсегда.
+
+        Kaiten API возвращает 204 при успехе.
+        Возвращает True при успехе, False при ошибке.
+        """
+        result = await self._request("DELETE", f"/cards/{card_id}")
+        if result is None:
+            logger.error("delete_card: не удалось удалить карточку id={}", card_id)
+            return False
+        logger.info("delete_card: карточка id={} удалена", card_id)
+        return True
+
+    async def add_tag_by_name(self, card_id: int, tag_name: str) -> bool:
+        """POST /cards/{card_id}/tags — добавляет тег к карточке по имени.
+
+        Тег передаётся по имени (не по ID), что обеспечивает совместимость
+        с мульти-пользовательским режимом, где ID тегов могут отличаться.
+        Возвращает True при успехе, False при ошибке.
+        """
+        data = await self._request(
+            "POST",
+            f"/cards/{card_id}/tags",
+            json={"name": tag_name},
+        )
+        if data is None:
+            logger.error("add_tag_by_name: не удалось добавить тег «{}» к карточке id={}", tag_name, card_id)
+            return False
+        logger.info("add_tag_by_name: тег «{}» добавлен к карточке id={}", tag_name, card_id)
+        return True
+
     async def create_blocked_card(
         self,
         column_id: int,
@@ -462,14 +493,33 @@ class KaitenClient:
         block_reason: str,
         sort_order: float = 1.0,
     ) -> dict | None:
-        """POST /cards — создаёт карточку-разделитель (blocked=True) в указанной колонке."""
+        """Создаёт карточку-разделитель (blocked=True) в указанной колонке.
+
+        Kaiten API игнорирует поля blocked/block_reason при POST, поэтому
+        после создания карточки выполняется отдельный PATCH для их установки.
+        """
         body = {
             "title": title,
             "board_id": self._board_id,
             "column_id": column_id,
             "lane_id": self._lane_id,
-            "blocked": True,
-            "block_reason": block_reason,
             "sort_order": sort_order,
         }
-        return await self._request("POST", "/cards", json=body)
+        data = await self._request("POST", "/cards", json=body)
+        if not data or not isinstance(data, dict):
+            logger.error("create_blocked_card: не удалось создать карточку «{}»", title)
+            return None
+        card_id = data.get("id")
+        if not card_id:
+            return data
+        # Отдельный PATCH для установки blocked (Kaiten игнорирует его при POST)
+        patch = await self._request(
+            "PATCH",
+            f"/cards/{card_id}",
+            json={"blocked": True, "block_reason": block_reason},
+        )
+        if not patch:
+            logger.warning(
+                "create_blocked_card: карточка создана (id={}) но не заблокирована", card_id
+            )
+        return patch or data
