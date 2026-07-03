@@ -68,6 +68,10 @@ DELETE /cards/{card_id}                      — удалить
 - КРИТИЧНО: `add_tag` работает только через `POST /cards/{id}/tags` с `{"name": "tagname"}`. Поле `tag_ids` в PATCH молча игнорируется.
 - КРИТИЧНО: `archive_card` вызывать только через `BoardLogic.archive_card()`, **не** через `KaitenClient` напрямую — `KaitenClient.archive_card(card_id)` требует `archive_column_id`, только `BoardLogic` его знает.
 
+## Нестандартные операции Kaiten API: сначала docs/interfaces.md, не угадывай
+
+Kaiten API не следует стандартному REST-паттерну: изменение поля через PATCH может молча игнорироваться, а нужный эффект достигается через отдельный sub-resource endpoint (`/blockers`, `/tags`). Перед реализацией любой нестандартной операции (блокировка, теги, архивация, изменение состояния) — сначала ищи рабочий эндпоинт в `docs/interfaces.md`. Если его там нет — не предполагай поведение по аналогии с другими полями. Добавь TODO в `docs/interfaces.md` и сообщи оркестратору что нужна проверка реального поведения API.
+
 **Формат event_time (dict, не строка!):**
 ```python
 {"id_590358": {"date": "2026-06-23", "time": "09:00:00", "tzOffset": 180}}

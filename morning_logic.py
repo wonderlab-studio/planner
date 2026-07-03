@@ -5,6 +5,7 @@ morning_logic.py — утренняя логика.
 
 Фаза 0 : резервация слотов для карточек уже в сегодняшней колонке
 Фаза 1 : карточки с event_time.date() == today → фиксированные слоты
+Фаза 1б: карточки с event_time.date() > today → нужная колонка
 Фаза 2 : сортировка оставшихся по 9 группам приоритета
 Фаза 3 : назначение event_time через update_card + перемещение в секцию
 Фаза 4 : переполнение → следующий день / «Следующая неделя»
@@ -372,6 +373,37 @@ class MorningLogic:
             await self._move(card, today_col_id, section, preloaded)
             self.last_segments[card.id] = [(_fmt_min(start_min), _fmt_min(end_min))]
 
+        # ── Фаза 1б: карточки с событием в будущей дате → в нужную колонку ───
+        this_week_sun = today + timedelta(days=6 - today.weekday())  # воскресенье этой недели
+        future_candidates: list[Card] = []
+        true_remaining: list[Card] = []
+        for card in remaining:
+            et = card.event_time
+            if et is not None:
+                et_local = et.astimezone(_TZ_MSK) if et.tzinfo else et.replace(tzinfo=_TZ_MSK)
+                if et_local.date() > today:
+                    future_candidates.append(card)
+                    continue
+            true_remaining.append(card)
+        remaining = true_remaining
+
+        for card in future_candidates:
+            et = card.event_time
+            et_local = et.astimezone(_TZ_MSK) if et.tzinfo else et.replace(tzinfo=_TZ_MSK)
+            event_date = et_local.date()
+            if event_date <= this_week_sun:
+                target_col = self._logic.column_ids[WEEKDAY_COLUMNS[event_date.weekday()]]
+            elif event_date <= this_week_sun + timedelta(days=7):
+                target_col = self._logic.column_ids["Следующая неделя"]
+            else:
+                target_col = self._logic.column_ids["Далекие времена"]
+            section = BoardLogic.section_by_event_time(card) or "Утро"
+            await self._move(card, target_col, section, preloaded)
+            logger.info(
+                "future-event → col={} sec={}: «{}» (id={}) event_date={}",
+                target_col, section, card.title, card.id, event_date,
+            )
+
         logger.info(
             "_schedule_today: phase1={} remaining={}",
             len(phase1), len(remaining),
@@ -595,7 +627,7 @@ class MorningLogic:
     async def _run_regular(self, today: date) -> list[Card]:
         """Утренняя логика обычного дня (вт–вс).
 
-        1. Загружает карточки вчерашней колонки.
+        1. Загружает карточки вчерашней колонки + stale-карточки сегодняшней.
         2. Маршрутизирует: еженедельно → следующая неделя,
            На контроле → сегодняшний «На контроле»,
            по будням на выходной / по выходным в будни → следующая неделя,
@@ -618,8 +650,30 @@ class MorningLogic:
         tag_weekend = TAG_IDS["по выходным"]
 
         yest_sorted = _sorted_by_order(preloaded.get(yest_col_id, []))
-        tasks = [c for c in yest_sorted if not c.blocked and not c.archived]
-        logger.info("morning [regular]: вчера col={} задач={}", yest_col_id, len(tasks))
+        yest_tasks = [c for c in yest_sorted if not c.blocked and not c.archived]
+        logger.info("morning [regular]: вчера col={} задач={}", yest_col_id, len(yest_tasks))
+
+        # Карточки в сегодняшней колонке с устаревшей датой события (нуждаются в переработке).
+        # phase0 уже зарезервирует те у которых event_time.date()==today, их не трогаем.
+        # Карточки в «На контроле» оставляем на месте.
+        today_sorted_stale = _sorted_by_order(preloaded.get(today_col_id, []))
+        today_stale: list[Card] = []
+        for _c in today_sorted_stale:
+            if _c.blocked or _c.archived:
+                continue
+            if _get_card_section(today_sorted_stale, _c) == "На контроле":
+                continue
+            _et = _c.event_time
+            if _et is None:
+                today_stale.append(_c)
+                continue
+            _et_local = _et.astimezone(_TZ_MSK) if _et.tzinfo else _et.replace(tzinfo=_TZ_MSK)
+            if _et_local.date() < today:
+                today_stale.append(_c)
+        if today_stale:
+            logger.info("morning [regular]: сегодня stale задач={}", len(today_stale))
+
+        tasks = yest_tasks + today_stale
 
         candidates: list[Card] = []
 
