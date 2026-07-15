@@ -559,6 +559,7 @@ async def _handle_move(
 
     query        = intent.get("title") or raw_text
     column_name  = intent.get("column")
+    deadline     = intent.get("deadline")
     section      = intent.get("section") or "Утро"
 
     await update.message.reply_text("🔍 Ищу карточку…")
@@ -575,13 +576,27 @@ async def _handle_move(
         await _reply(update, f"❓ Не нашёл карточку по запросу «{query}».")
         return
 
-    if column_name and column_name in user_ctx.logic.column_ids:
-        target_column_id   = user_ctx.logic.column_ids[column_name]
-        target_column_name = column_name
-    else:
-        tomorrow_wd        = (datetime.now(TZ_MSK).date() + timedelta(days=1)).weekday()
-        target_column_name = WEEKDAY_COLUMNS[tomorrow_wd]
-        target_column_id   = user_ctx.logic.column_ids[target_column_name]
+    target_column_id: int | None = None
+    target_column_name: str | None = None
+
+    if deadline:
+        try:
+            target_date = date.fromisoformat(deadline)
+            target_column_id = user_ctx.logic.resolve_column_for_date(target_date)
+            target_column_name = user_ctx.logic.column_name_by_id.get(
+                target_column_id, str(target_column_id)
+            )
+        except ValueError:
+            logger.warning("_handle_move: не удалось разобрать deadline={!r}", deadline)
+
+    if target_column_id is None:
+        if column_name and column_name in user_ctx.logic.column_ids:
+            target_column_id   = user_ctx.logic.column_ids[column_name]
+            target_column_name = column_name
+        else:
+            tomorrow_wd        = (datetime.now(TZ_MSK).date() + timedelta(days=1)).weekday()
+            target_column_name = WEEKDAY_COLUMNS[tomorrow_wd]
+            target_column_id   = user_ctx.logic.column_ids[target_column_name]
 
     try:
         sort_order = await user_ctx.logic.get_section_sort_order(target_column_id, section)
@@ -1156,15 +1171,32 @@ def build_handlers(cfg: HandlersConfig) -> Application:
             return AWAITING_MOVE_TARGET
 
         column_name = intent.get("column")
+        deadline    = intent.get("deadline")
         section     = intent.get("section") or "Утро"
 
-        if column_name and column_name in user_ctx.logic.column_ids:
-            target_col_id   = user_ctx.logic.column_ids[column_name]
-            target_col_name = column_name
-        else:
-            tomorrow        = datetime.now(TZ_MSK).date() + timedelta(days=1)
-            target_col_name = WEEKDAY_COLUMNS[tomorrow.weekday()]
-            target_col_id   = user_ctx.logic.column_ids[target_col_name]
+        target_col_id: int | None = None
+        target_col_name: str | None = None
+
+        if deadline:
+            try:
+                target_date = date.fromisoformat(deadline)
+                target_col_id = user_ctx.logic.resolve_column_for_date(target_date)
+                target_col_name = user_ctx.logic.column_name_by_id.get(
+                    target_col_id, str(target_col_id)
+                )
+            except ValueError:
+                logger.warning(
+                    "received_move_target_cb: не удалось разобрать deadline={!r}", deadline
+                )
+
+        if target_col_id is None:
+            if column_name and column_name in user_ctx.logic.column_ids:
+                target_col_id   = user_ctx.logic.column_ids[column_name]
+                target_col_name = column_name
+            else:
+                tomorrow        = datetime.now(TZ_MSK).date() + timedelta(days=1)
+                target_col_name = WEEKDAY_COLUMNS[tomorrow.weekday()]
+                target_col_id   = user_ctx.logic.column_ids[target_col_name]
 
         # Мягкое сопротивление: критическая задача с дедлайном сегодня/завтра
         try:

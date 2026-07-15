@@ -127,6 +127,25 @@ class BoardLogic:
             return None  # после воскресенья → следующая неделя
         return self._column_ids[WEEKDAY_COLUMNS[next_idx]]
 
+    def resolve_column_for_date(self, target_date: date) -> int:
+        """Возвращает column_id для конкретной даты.
+
+        Если дата попадает в текущую неделю (по сегодняшний-и-до-воскресенья включительно
+        от МСК-сегодня) — колонка соответствующего дня недели.
+        Если на следующей неделе — «Следующая неделя».
+        Иначе — «Далекие времена».
+        Та же логика, что уже используется в morning_logic.py (Фаза 1б) для карточек
+        с будущим event_time — здесь вынесена в переиспользуемый метод.
+        """
+        today = datetime.now(TZ_MSK).date()
+        this_week_sun = today + timedelta(days=6 - today.weekday())
+        if target_date <= this_week_sun:
+            return self._column_ids[WEEKDAY_COLUMNS[target_date.weekday()]]
+        elif target_date <= this_week_sun + timedelta(days=7):
+            return self._column_ids["Следующая неделя"]
+        else:
+            return self._column_ids["Далекие времена"]
+
     # ── Позиционирование в секции ─────────────────────────────────────────────
 
     async def get_section_sort_order(self, column_id: int, section: str) -> float:
