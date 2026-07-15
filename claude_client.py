@@ -35,7 +35,7 @@ load_dotenv()
 # ── Конфиг ────────────────────────────────────────────────────────────────────
 
 MODEL = "claude-sonnet-4-6"
-MAX_TOKENS = 1500
+MAX_TOKENS = 2500
 MAX_TOKENS_INTENT = 256   # JSON-ответ короткий — экономим
 MAX_TOKENS_SEARCH = 64    # {"id": 123} — минимум токенов
 MAX_TOKENS_ADVICE = 600   # совет по карточке
@@ -279,6 +279,7 @@ class ClaudeClient:
                 "section":    str | None,   # "Утро" / "День" / "Вечер" / "На контроле"
                 "deadline":   str | None,   # "YYYY-MM-DD"
                 "importance": str | None,   # "среднее" / "важное" / "критическое"
+                "size":       float | None,  # часы, например 2 или 0.5
                 "note":       str | None,
             }
             При ошибке парсинга возвращает {"action": "unknown", "raw": user_text}.
@@ -289,7 +290,7 @@ class ClaudeClient:
         Пример ответа модели (только JSON, без пояснений):
             {"action": "create", "title": "Позвонить маме", "column": null,
              "section": "Утро", "deadline": "2026-05-22", "importance": "важное",
-             "note": null}
+             "size": null, "note": null}
         """
         today_str = datetime.now(timezone(timedelta(hours=3))).date().isoformat()
         system_prompt = PARSE_INTENT_SYSTEM.format(today=today_str)

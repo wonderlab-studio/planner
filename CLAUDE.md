@@ -141,6 +141,7 @@ git push  # Railway подхватывает автоматически
 | Scheduler | `.claude/agents/scheduler-agent.md` | morning_logic.py, scheduler.py, db.py утренняя/вечерняя логика, APScheduler|
 | Telegram | `.claude/agents/telegram-agent.md` | bot.py, handlers.py, notifier.py бот, хендлеры, ConversationHandler|
 | Claude API | `.claude/agents/claude-api-agent.md` | claude_client.py, prompts.py промпты, Claude API интеграция|
+| Persona | `.claude/agents/persona-agent.md` | симуляция использования сервиса воображаемой персоной (скилл feedback) |
 
 Скилл разработки: `.claude/skills/development/SKILL.md` — читать перед любыми изменениями кода.
 

@@ -19,6 +19,11 @@ class UserConfig:
     column_ids: dict[str, int] = field(default_factory=dict)  # заполняется board_setup или из конфига
     kaiten_token: str | None = None       # уже разрешённый токен (заполняется при загрузке из env)
     kaiten_base_url: str | None = None    # уже разрешённый base_url (заполняется при загрузке)
+    # Параметризованные маппинги для мульти-аккаунта (опциональны — если None, используются дефолты)
+    tag_ids: dict[str, int] | None = None
+    importance_options: dict[str, int] | None = None
+    weekday_options: dict[str, int] | None = None
+    field_ids: dict[str, str] | None = None   # keys: "event", "importance", "weekday"
 
 
 def load_users() -> list[UserConfig]:
@@ -41,6 +46,19 @@ def _parse_user(item: dict) -> UserConfig:
     base_url_env = item.get("kaiten_base_url_env") # например "KAITEN_BASE_URL_ALICE"
     kaiten_token = os.getenv(token_env) if token_env else None
     kaiten_base_url = os.getenv(base_url_env) if base_url_env else None
+    # Параметризованные маппинги для мульти-аккаунта
+    tag_ids = (
+        {k: int(v) for k, v in item["tag_ids"].items()} if item.get("tag_ids") else None
+    )
+    importance_options = (
+        {k: int(v) for k, v in item["importance_options"].items()}
+        if item.get("importance_options") else None
+    )
+    weekday_options = (
+        {k: int(v) for k, v in item["weekday_options"].items()}
+        if item.get("weekday_options") else None
+    )
+    field_ids = dict(item["field_ids"]) if item.get("field_ids") else None
     return UserConfig(
         user_id=item["user_id"],
         telegram_chat_id=int(item["telegram_chat_id"]),
@@ -51,6 +69,10 @@ def _parse_user(item: dict) -> UserConfig:
         column_ids=column_ids,
         kaiten_token=kaiten_token,
         kaiten_base_url=kaiten_base_url,
+        tag_ids=tag_ids,
+        importance_options=importance_options,
+        weekday_options=weekday_options,
+        field_ids=field_ids,
     )
 
 

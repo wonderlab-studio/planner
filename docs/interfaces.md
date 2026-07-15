@@ -37,9 +37,9 @@ ANTHROPIC_API_KEY=...
 | Добавить тег | POST | `/cards/{card_id}/tags` — body: `{"name": "tagname"}` |
 | Заблокировать карточку | POST | `/cards/{card_id}/blockers` — body: `{"reason": "Утро"}` |
 
-> ⚠️ Авторизация: заголовок `Authorization: Bearer {KAITEN_TOKEN}`  
-> ⚠️ API возвращает максимум 100 карточек за запрос — необходима пагинация  
-> (параметры: `?limit=100&offset=0` — уточнить при интеграции)
+> Авторизация: заголовок `Authorization: Bearer {KAITEN_TOKEN}`
+> API возвращает максимум 100 карточек за запрос — необходима пагинация
+> (параметры: `?limit=100&offset=0`)
 
 **Не работают в этом инстансе:**
 - `GET /columns/{id}/cards` — возвращает 404
@@ -89,6 +89,8 @@ ANTHROPIC_API_KEY=...
 | `state` | int | 1=открыта, 2=в работе, 3=завершена |
 | `archived` | bool | Архивирована ли |
 | `condition` | int | Состояние дорожки |
+| `updated_at` | str \| null | ISO 8601 — дата последнего изменения |
+| `last_moved_at` | str \| null | ISO 8601 — дата последнего перемещения между колонками (может отсутствовать в ответе API — см. TODO #7) |
 
 #### Кастомные свойства (`properties`)
 
@@ -162,7 +164,7 @@ sort_order ≈ 3.30   │ [РАЗДЕЛИТЕЛЬ] block_reason="На контр
 | Вечер | 64879984 | 3.2065135812174335 |
 | На контроле | 17953300 | 3.2980453752078267 |
 
-> ℹ️ sort_order разделителей одинаковы во всех колонках — они создаются один раз  
+> sort_order разделителей одинаковы во всех колонках — они создаются один раз
 > и не меняются. Получать их нужно динамически при старте системы.
 
 ---
@@ -230,6 +232,35 @@ sort_order ≈ 3.30   │ [РАЗДЕЛИТЕЛЬ] block_reason="На контр
 
 class KaitenClient:
 
+    def __init__(
+        self,
+        board_id: int,
+        lane_id: int,
+        token: str | None = None,             # fallback → KAITEN_TOKEN из env
+        base_url: str | None = None,          # fallback → KAITEN_BASE_URL из env
+        tag_ids: dict[str, int] | None = None,            # fallback → глобальный TAG_IDS
+        importance_options: dict[str, int] | None = None, # fallback → глобальный IMPORTANCE_OPTIONS
+        weekday_options: dict[str, int] | None = None,    # fallback → глобальный WEEKDAY_OPTIONS
+        field_ids: dict[str, str] | None = None,          # fallback → {"event": "id_590358", ...}
+    ): ...
+    # field_ids canonical keys: "event", "importance", "weekday"
+    # Все параметры опциональны — обратная совместимость полная.
+
+    # ── Методы-билдеры для мульти-аккаунта ──────────────────────────────────
+
+    def tag_id(self, name: str) -> int | None:
+        """Возвращает ID тега по имени для данного Kaiten-аккаунта или None."""
+
+    def event_time_property(self, dt: datetime) -> dict:
+        """dt — aware datetime. Возвращает {field_key: {...}} готовое для update_card(properties=...).
+        Использует реальный ключ поля из self._field_ids["event"]."""
+
+    def importance_property(self, name: str) -> dict | None:
+        """name — 'среднее'|'важное'|'критическое'.
+        Возвращает {field_key: [option_id]} или None если имя не найдено."""
+
+    # ── Основные методы ──────────────────────────────────────────────────────
+
     async def get_columns(self) -> list[Column]:
         """GET /boards/{board_id}/columns
         Возвращает все колонки доски с id и title."""
@@ -269,7 +300,8 @@ class KaitenClient:
     async def archive_card(self, card_id: int, archive_column_id: int, comment: str | None = None) -> bool:
         """Перемещает карточку в колонку Архив (archive_column_id передаётся снаружи).
         Если передан comment — добавляет комментарий перед перемещением.
-        Возвращает True при успехе."""
+        Возвращает True при успехе.
+        КРИТИЧНО: вызывать только через BoardLogic.archive_card() — он знает archive_column_id."""
 
     async def add_comment(self, card_id: int, text: str) -> bool:
         """POST /cards/{card_id}/comments  body={"text": text}
@@ -343,10 +375,10 @@ class BoardLogic:
         """'Понедельник' → 1688101. Поддерживает и доп. колонки."""
 
     def get_today_column_id(self) -> int:
-        """Возвращает column_id колонки текущего дня недели."""
+        """Возвращает column_id колонки текущего дня недели (UTC+3)."""
 
     def get_yesterday_column_id(self) -> int:
-        """Возвращает column_id колонки вчерашнего дня."""
+        """Возвращает column_id колонки вчерашнего дня (UTC+3)."""
 
     async def get_section_sort_order(
         self,
@@ -358,7 +390,7 @@ class BoardLogic:
         или среднее между разделителем и первой задачей секции."""
 
     def sort_cards_by_priority(self, cards: list[Card]) -> list[Card]:
-        """Сортировка задач для расстановки по дню.
+        """Сортировка задач для расстановки по дню (UTC+3 для определения «сегодня»).
         Порядок: 1) есть event_time → по времени события
                  2) due_date == сегодня → срочные вперёд
                  3) importance: критическое > важное > среднее
@@ -366,7 +398,8 @@ class BoardLogic:
         Разделители (blocked=True) из сортировки исключаются."""
 
     def is_regular_task(self, card: Card) -> bool:
-        """True если карточка имеет тег ежедневно/по будням/по выходным/еженедельно."""
+        """True если карточка имеет тег ежедневно/по будням/по выходным/еженедельно.
+        Использует self._regular_tag_ids — per-instance множество из tag_id() клиента."""
 
     def should_include_today(self, card: Card, today: date) -> bool:
         """Проверяет, должна ли регулярная задача появиться сегодня.
@@ -409,7 +442,9 @@ class Card:
     properties: dict = field(default_factory=dict)
     archived: bool = False
     state: int = 1
-    updated_at: str | None = None  # ISO datetime последнего изменения
+    updated_at: str | None = None      # ISO datetime последнего изменения
+    last_moved_at: str | None = None   # ISO datetime последнего перемещения между колонками
+                                        # (может отсутствовать в ответе API — fallback на updated_at)
 
     # Удобные свойства (вычисляются из properties / полей)
     @property
@@ -429,6 +464,11 @@ class Card:
         """Парсит updated_at → datetime aware (UTC+3)"""
 
     @property
+    def last_moved_at_parsed(self) -> datetime | None:
+        """Парсит last_moved_at → datetime aware (UTC+3).
+        Fallback на updated_at если last_moved_at отсутствует в ответе API."""
+
+    @property
     def due_date_parsed(self) -> datetime | None:
         """Парсит due_date → datetime aware (UTC+3)"""
 ```
@@ -439,9 +479,109 @@ class Card:
 
 | # | Вопрос | Статус | Как решить |
 |---|---|---|---|
-| 1 | option_id для importance | ✅ Решено | среднее=17244396, важное=17244397, критическое=17244398 |
-| 2 | option_id для weekday | ✅ Решено | ПН=17244346 … ВС=17244352 |
-| 3 | Пагинация: точные параметры offset/limit | ✅ Решено | limit=100, offset+=100 пока len(batch) < limit |
-| 4 | Эндпоинт архивирования: PATCH move или отдельный | ✅ Решено | PATCH /cards/{id} с column_id=6122269 |
-| 5 | Разделители в других колонках | 🔲 Открыт | sort_order получать динамически, не хардкодить |
-| 6 | Блокировка карточки через API | ✅ Решено | POST /cards/{id}/blockers с {"reason": "..."} (PATCH игнорируется) |
+| 1 | option_id для importance | Решено | среднее=17244396, важное=17244397, критическое=17244398 |
+| 2 | option_id для weekday | Решено | ПН=17244346 … ВС=17244352 |
+| 3 | Пагинация: точные параметры offset/limit | Решено | limit=100, offset+=100 пока len(batch) < limit |
+| 4 | Эндпоинт архивирования: PATCH move или отдельный | Решено | PATCH /cards/{id} с column_id=6122269 |
+| 5 | Разделители в других колонках | Открыт | sort_order получать динамически, не хардкодить |
+| 6 | Блокировка карточки через API | Решено | POST /cards/{id}/blockers с {"reason": "..."} (PATCH игнорируется) |
+| 7 | Поле last_moved_at в ответе API | Открыт | Добавлено в Card и _parse_card, нужно проверить реально ли Kaiten возвращает это поле. Если нет — last_moved_at_parsed автоматически использует updated_at как fallback. |
+
+---
+
+## 6. Мультиаккаунт Kaiten: онбординг нового пользователя
+
+> Механизм параметризации реализован в задаче C (июль 2026).
+> Wave 2 (проводка из users.json в bot.py + переход handlers/scheduler на builder-методы) — отдельная задача, ещё не выполнена.
+
+### Шаг 1 — Создать кастомные поля вручную в Kaiten UI
+
+Kaiten API не поддерживает создание custom fields через API. Для каждого нового Kaiten-аккаунта нужно создать три поля вручную через интерфейс Kaiten (настройки пространства или доски):
+
+| Поле | Тип | Варианты select (важен порядок!) |
+|---|---|---|
+| «Событие» | Дата + время | — |
+| «Важность» | Select (одиночный) | среднее, важное, критическое |
+| «День недели» | Select (одиночный) | ПН, ВТ, СР, ЧТ, ПТ, СБ, ВС |
+
+Порядок вариантов select определяет их ID — первый вариант получит наименьший ID. Если создать варианты в другом порядке — ID будут другими и их нужно указать явно в конфиге пользователя.
+
+### Шаг 2 — Узнать ID полей и вариантов
+
+После создания полей нужно получить их реальные ключи и option ID:
+
+```bash
+# Создать тестовую карточку, заполнить все три поля, затем:
+GET /cards/{card_id}
+# В ответе найти объект properties — ключи вида "id_XXXXXX" и значения
+```
+
+Пример ответа:
+```json
+{
+  "properties": {
+    "id_590358": {"date": "2026-07-15", "time": "10:00:00", "tzOffset": 180},
+    "id_590382": [17244397],
+    "id_590359": [17244347]
+  }
+}
+```
+
+Из этого определяем `field_ids` и значения `importance_options` / `weekday_options`.
+
+### Шаг 3 — Добавить конфиг пользователя в users.json
+
+Новые опциональные ключи (если не заданы — используются дефолтные значения основного аккаунта):
+
+```json
+{
+  "user_id": "bob",
+  "telegram_chat_id": 987654321,
+  "kaiten_board_id": 123456,
+  "kaiten_lane_id": 0,
+  "kaiten_space_id": 197396,
+  "kaiten_token_env": "KAITEN_TOKEN_BOB",
+  "kaiten_base_url_env": "KAITEN_BASE_URL_BOB",
+  "tag_ids": {
+    "ежедневно":   2000001,
+    "по будням":   2000002,
+    "по выходным": 2000003,
+    "еженедельно": 2000004,
+    "напомнить":   2000005
+  },
+  "importance_options": {
+    "среднее":     20000010,
+    "важное":      20000011,
+    "критическое": 20000012
+  },
+  "weekday_options": {
+    "ПН": 20000020,
+    "ВТ": 20000021,
+    "СР": 20000022,
+    "ЧТ": 20000023,
+    "ПТ": 20000024,
+    "СБ": 20000025,
+    "ВС": 20000026
+  },
+  "field_ids": {
+    "event":      "id_600000",
+    "importance": "id_600001",
+    "weekday":    "id_600002"
+  }
+}
+```
+
+Если все четыре ключа отсутствуют — `KaitenClient` и `BoardLogic` используют глобальные дефолты из `kaiten_client.py` (значения основного аккаунта).
+
+### Шаг 4 — Статус реализации
+
+**Уже реализовано (Wave 1):**
+- `KaitenClient.__init__` принимает `tag_ids`, `importance_options`, `weekday_options`, `field_ids`
+- `_parse_card` нормализует properties под канонические ключи при нестандартных `field_ids`
+- `BoardLogic._regular_tag_ids` строится через `client.tag_id()` — per-user множество
+- Builder-методы: `client.tag_id()`, `client.event_time_property()`, `client.importance_property()`
+
+**Ещё не сделано (Wave 2):**
+- `user_config.py`: чтение `tag_ids`, `importance_options`, `weekday_options`, `field_ids` из users.json в `UserConfig`
+- `bot.py`: передача этих значений в `KaitenClient(...)` при создании per-user клиента
+- `morning_logic.py` / `handlers.py`: переход с хардкода на `client.event_time_property()` и `client.importance_property()`

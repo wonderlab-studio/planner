@@ -11,11 +11,11 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Callable, Awaitable
 
 from loguru import logger
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -29,7 +29,7 @@ from telegram.ext import (
 
 from board_logic import BoardLogic, WEEKDAY_COLUMNS
 from claude_client import ClaudeClient
-from kaiten_client import Card, KaitenClient, TAG_IDS
+from kaiten_client import Card, KaitenClient, TAG_IDS, TZ_MSK
 from notifier import Notifier
 
 # ── Тип для routine-коллбэков ─────────────────────────────────────────────────
@@ -40,22 +40,23 @@ RoutineCallable = Callable[[], Awaitable[str]]
 
 CARD_ACTION          = 0  # пользователь выбрал карточку, ждём действие
 AWAITING_COMMENT     = 1  # ждём текст комментария (для done или comment)
-AWAITING_HOURS       = 2  # ждём число часов для «Все на сегодня»
+AWAITING_HOURS       = 2  # ждём число часов для «Продолжить в другой день»
 AWAITING_MOVE_TARGET = 3  # ждём куда перенести
 AWAITING_QUESTION    = 4  # ждём вопрос для кнопки «Совет»
 AWAITING_REMINDER_TIME = 5  # ждём дату/время для кнопки «Напоминалка»
+CONFIRM_RISKY_MOVE   = 6  # ждём подтверждения переноса критической задачи с близким дедлайном
 
 # ── Фильтр «известные команды» — чтобы они не попадали в состояния диалога ────
 
 _MAIN_COMMANDS_FILTER = filters.Regex(
     r"(?i)^(утро|вечер|создать|создай|готово|выполнено|сделал|сделано"
-    r"|перенести|перенеси|переместить|заметка|комментарий)\b"
+    r"|перенести|перенеси|переместить|заметка|комментарий|пересобрать|перепланируй)\b"
 )
 
 # ── Лимиты ────────────────────────────────────────────────────────────────────
 
 _MAX_TG_LEN      = 4096   # символов в одном сообщении Telegram
-MAX_CARD_BUTTONS = 20     # максимум кнопок в списке карточек
+MAX_CARD_BUTTONS = 20     # максимум кнопок на одной странице
 _BTN_TITLE_LEN   = 40     # символов в тексте кнопки
 
 # ── Текст подсказки ───────────────────────────────────────────────────────────
@@ -66,19 +67,33 @@ HELP_TEXT = """\
 *Ключевые слова:*
 • `утро` — план на день + кнопки карточек
 • `вечер` — итог дня
+• `пересобрать` / `перепланируй` — пересобрать план с текущего момента
 
 *Задачи:*
-• `создать <описание>` — создать карточку
+• `создать <описание>` — создать карточку _(можно добавить «размер - 2» или «размер 0.5» для явного размера в часах)_
 • `создай <описание>` — то же самое
 • `/add <описание>` — создать карточку
 
 *Управление:*
-• `готово <описание>` — архивировать карточку
-• `/done <описание>` — архивировать карточку
+• `готово <описание>` — завершить задачу; для регулярных (ежедневно/по будням/по выходным/еженедельно) переносит на следующий цикл вместо архивации
+• `/done <описание>` — то же самое
 • `перенести <описание> <куда>` — переместить карточку
 • `/move <описание> <куда>` — переместить карточку
-• `заметка <название> // <текст>` — добавить комментарий
+• `заметка <название> // <текст>` — добавить комментарий к карточке
 • `/note <название> // <текст>` — добавить комментарий
+
+*Кнопки над карточкой:*
+• ✅ *Готово* — завершить (регулярные → следующий цикл)
+• ⏭ *Продолжить в другой день* — перенести остаток на следующий подходящий день
+• 💬 *Комментарий* — добавить заметку к карточке
+• 📅 *Перенести* — переместить в другой день/колонку
+• 🤖 *Совет* — получить совет от AI по задаче
+• 🔔 *Напоминалка* — установить время события (event\_time)
+• ← *Назад* — вернуться к списку карточек
+_Пагинация:_ кнопки «← Назад» / «Ещё →» при длинном списке карточек
+
+*Отмена:*
+• `/cancel` — отмена текущего диалога
 
 _Описание задачи может быть приблизительным — я найду нужную карточку._
 _Пример заметки:_ `заметка Редактура главы 11 // Остановился на стр. 42`\
@@ -97,6 +112,7 @@ class UserHandlerCtx:
     notifier: Notifier
     morning_routine: RoutineCallable
     evening_routine: RoutineCallable
+    replan_routine: RoutineCallable
 
 
 # ── HandlersConfig ────────────────────────────────────────────────────────────
@@ -135,22 +151,36 @@ def _split_text(text: str, max_len: int = _MAX_TG_LEN) -> list[str]:
     return parts
 
 
+async def _reply_and_return(
+    update: Update, text: str, parse_mode: str = ParseMode.MARKDOWN
+) -> list[Message]:
+    """Отправляет ответ пользователю, возвращает список отправленных Message-объектов.
+
+    Длинные тексты (> 4096 символов) автоматически разбиваются на части.
+    При ошибке Markdown повторяет без форматирования.
+    """
+    assert update.message is not None
+    sent: list[Message] = []
+    for part in _split_text(text):
+        try:
+            msg = await update.message.reply_text(part, parse_mode=parse_mode)
+            sent.append(msg)
+        except Exception:
+            try:
+                msg = await update.message.reply_text(part)
+                sent.append(msg)
+            except Exception as exc:
+                logger.error("_reply_and_return: не удалось отправить часть сообщения — {}", exc)
+    return sent
+
+
 async def _reply(update: Update, text: str, parse_mode: str = ParseMode.MARKDOWN) -> None:
     """Отправляет ответ пользователю.
 
     Длинные тексты (> 4096 символов) автоматически разбиваются на части.
     При ошибке Markdown повторяет без форматирования.
     """
-    assert update.message is not None
-
-    for part in _split_text(text):
-        try:
-            await update.message.reply_text(part, parse_mode=parse_mode)
-        except Exception:
-            try:
-                await update.message.reply_text(part)
-            except Exception as exc:
-                logger.error("_reply: не удалось отправить часть сообщения — {}", exc)
+    await _reply_and_return(update, text, parse_mode)
 
 
 def _strip_command_prefix(text: str, *prefixes: str) -> str:
@@ -204,19 +234,30 @@ async def send_card_buttons(
     cards: list[Card],
     bot: Bot,
     chat_id: int | str,
+    page: int = 0,
 ) -> None:
-    """Отправляет сообщение с InlineKeyboard из карточек сегодняшнего дня.
+    """Отправляет страницу InlineKeyboard из карточек сегодняшнего дня.
 
-    Каждая кнопка — одна карточка (название обрезается до 40 символов).
-    Максимум 20 кнопок (первые 20 карточек из списка).
+    Карточки сортируются по event_time: сначала задачи с временем (по возрастанию),
+    затем задачи без времени. Пагинация: MAX_CARD_BUTTONS кнопок на страницу.
     callback_data = "card:{card.id}"
+    Навигация: "← Назад" (page:{page-1}), "Ещё →" (page:{page+1}).
     """
     task_cards = [c for c in cards if not c.blocked and not c.archived]
     if not task_cards:
         logger.debug("send_card_buttons: нет карточек для отображения")
         return
 
-    shown = task_cards[:MAX_CARD_BUTTONS]
+    # Сортировка по event_time: с временем — впереди по возрастанию, без — в конец
+    task_cards.sort(
+        key=lambda c: (
+            c.event_time is None,
+            c.event_time or datetime.min.replace(tzinfo=TZ_MSK),
+        )
+    )
+
+    start = page * MAX_CARD_BUTTONS
+    shown = task_cards[start : start + MAX_CARD_BUTTONS]
     keyboard = [
         [InlineKeyboardButton(
             text=c.title[:_BTN_TITLE_LEN] + ("…" if len(c.title) > _BTN_TITLE_LEN else ""),
@@ -224,10 +265,18 @@ async def send_card_buttons(
         )]
         for c in shown
     ]
-    markup = InlineKeyboardMarkup(keyboard)
 
-    suffix = f" (показаны первые {MAX_CARD_BUTTONS})" if len(task_cards) > MAX_CARD_BUTTONS else ""
-    text = f"📋 *Карточки на сегодня{suffix}:*"
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("← Назад", callback_data=f"page:{page - 1}"))
+    if start + MAX_CARD_BUTTONS < len(task_cards):
+        nav_row.append(InlineKeyboardButton("Ещё →", callback_data=f"page:{page + 1}"))
+    if nav_row:
+        keyboard.append(nav_row)
+
+    markup = InlineKeyboardMarkup(keyboard)
+    total_pages = (len(task_cards) - 1) // MAX_CARD_BUTTONS + 1
+    text = f"📋 *Карточки на сегодня* (стр. {page + 1}/{total_pages}):"
 
     try:
         await bot.send_message(
@@ -236,12 +285,12 @@ async def send_card_buttons(
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=markup,
         )
-        logger.debug("send_card_buttons: отправлено {} кнопок", len(shown))
+        logger.debug("send_card_buttons: отправлено {} кнопок, стр={}", len(shown), page)
     except Exception as exc:
         logger.error("send_card_buttons: ошибка отправки — {}", exc)
 
 
-# ── Обработчики утро/вечер ────────────────────────────────────────────────────
+# ── Обработчики утро/вечер/пересобрать ───────────────────────────────────────
 
 async def _handle_morning(
     update: Update,
@@ -250,7 +299,8 @@ async def _handle_morning(
 ) -> None:
     """Запускает утреннюю рутину, отправляет план и кнопки карточек.
 
-    Если routine возвращает непустую строку — отвечает ею прямо в чат.
+    Если routine возвращает непустую строку — отвечает ею прямо в чат, затем
+    откепляет все ранее закреплённые сообщения и закрепляет последнее сообщение плана.
     Если пустую — значит scheduler уже отправил через Notifier, дубль не нужен.
     После плана всегда отправляет кнопки карточек сегодняшнего дня.
     """
@@ -261,7 +311,16 @@ async def _handle_morning(
     try:
         plan_text = await user_ctx.morning_routine()
         if plan_text:
-            await _reply(update, plan_text)
+            sent_messages = await _reply_and_return(update, plan_text)
+            if sent_messages and update.effective_chat:
+                try:
+                    await update.effective_chat.unpin_all_messages()
+                except Exception as exc:
+                    logger.warning("handle_morning: unpin_all_messages error — {}", exc)
+                try:
+                    await sent_messages[-1].pin(disable_notification=True)
+                except Exception as exc:
+                    logger.warning("handle_morning: pin error — {}", exc)
     except Exception as exc:
         logger.exception("handle_morning: ошибка — {}", exc)
         await _reply(update, "⚠️ Не удалось составить план. Попробуй позже.")
@@ -273,7 +332,7 @@ async def _handle_morning(
             today_col_id = user_ctx.logic.get_today_column_id()
             today_cards = await user_ctx.kaiten.get_cards(today_col_id)
             if today_cards:
-                await send_card_buttons(today_cards, context.bot, update.effective_chat.id)
+                await send_card_buttons(today_cards, context.bot, update.effective_chat.id, page=0)
         except Exception as exc:
             logger.warning("handle_morning: не удалось отправить кнопки карточек — {}", exc)
 
@@ -295,6 +354,42 @@ async def _handle_evening(update: Update, user_ctx: UserHandlerCtx) -> None:
     except Exception as exc:
         logger.exception("handle_evening: ошибка — {}", exc)
         await _reply(update, "⚠️ Не удалось подвести итог. Попробуй позже.")
+
+
+async def _handle_replan(
+    update: Update,
+    user_ctx: UserHandlerCtx,
+    context: ContextTypes.DEFAULT_TYPE | None = None,
+) -> None:
+    """Пересобирает расписание с текущего момента, отправляет план + pin + кнопки."""
+    assert update.message is not None
+    logger.info("handle_replan: запрос от пользователя")
+    await update.message.reply_text("🔄 Пересобираю план с текущего момента…")
+    try:
+        plan_text = await user_ctx.replan_routine()
+    except Exception as exc:
+        logger.exception("handle_replan: ошибка — {}", exc)
+        await _reply(update, "⚠️ Не удалось пересобрать план. Попробуй позже.")
+        return
+    if plan_text:
+        sent_messages = await _reply_and_return(update, plan_text)
+        if sent_messages and update.effective_chat:
+            try:
+                await update.effective_chat.unpin_all_messages()
+            except Exception as exc:
+                logger.warning("handle_replan: unpin_all_messages error — {}", exc)
+            try:
+                await sent_messages[-1].pin(disable_notification=True)
+            except Exception as exc:
+                logger.warning("handle_replan: pin error — {}", exc)
+    if context is not None and update.effective_chat:
+        try:
+            today_col_id = user_ctx.logic.get_today_column_id()
+            today_cards = await user_ctx.kaiten.get_cards(today_col_id)
+            if today_cards:
+                await send_card_buttons(today_cards, context.bot, update.effective_chat.id, page=0)
+        except Exception as exc:
+            logger.warning("handle_replan: не удалось отправить кнопки карточек — {}", exc)
 
 
 # ── Обработчик «создать» ──────────────────────────────────────────────────────
@@ -331,6 +426,7 @@ async def _handle_create(
     section      = intent.get("section") or "Утро"
     deadline     = intent.get("deadline")
     importance   = intent.get("importance")
+    size         = intent.get("size")
 
     if column_name and column_name in user_ctx.logic.column_ids:
         column_id = user_ctx.logic.column_ids[column_name]
@@ -346,10 +442,7 @@ async def _handle_create(
 
     properties: dict | None = None
     if importance:
-        from kaiten_client import IMPORTANCE_OPTIONS
-        opt_id = IMPORTANCE_OPTIONS.get(importance)
-        if opt_id:
-            properties = {"id_590382": [opt_id]}
+        properties = user_ctx.kaiten.importance_property(importance)
 
     due_date_iso: str | None = f"{deadline}T00:00:00.000Z" if deadline else None
 
@@ -360,6 +453,7 @@ async def _handle_create(
             due_date=due_date_iso,
             sort_order=sort_order,
             properties=properties,
+            size=size,
         )
     except Exception as exc:
         logger.exception("handle_create: create_card error — {}", exc)
@@ -375,6 +469,8 @@ async def _handle_create(
         parts.append(f"⏰ Дедлайн: {deadline}")
     if importance:
         parts.append(f"🔥 Важность: {importance}")
+    if size is not None:
+        parts.append(f"⏱ Размер: {size} ч")
     await _reply(update, "\n".join(parts))
 
 
@@ -386,7 +482,12 @@ async def _handle_done(
     raw_text: str,
     user_ctx: UserHandlerCtx,
 ) -> None:
-    """Ищет карточку и архивирует её."""
+    """Ищет карточку и завершает её.
+
+    Для регулярных задач (ежедневно/по будням/по выходным/еженедельно) вместо архивации
+    переносит на следующий подходящий день по тегу — чтобы не ломать ротацию.
+    Для обычных задач — архивирует с пометкой даты выполнения.
+    """
     assert update.message is not None
     logger.info("handle_done: raw_text={!r}", raw_text)
 
@@ -408,18 +509,26 @@ async def _handle_done(
         await _reply(update, f"❓ Не нашёл карточку по запросу «{raw_text}».")
         return
 
-    comment = f"Выполнено {date.today().isoformat()}"
+    done_comment = f"Выполнено {datetime.now(TZ_MSK).date().isoformat()}"
     try:
-        ok = await user_ctx.logic.archive_card(matched["id"], comment=comment)
+        card = await user_ctx.kaiten.get_card(matched["id"])
+        if card and user_ctx.logic.is_regular_task(card):
+            # Регулярная задача: добавляем отметку выполнения и переносим на следующий цикл
+            try:
+                await user_ctx.kaiten.add_comment(matched["id"], done_comment)
+            except Exception as exc:
+                logger.warning("handle_done: не удалось добавить комментарий — {}", exc)
+            ok, msg = await _postpone_card(user_ctx, card, hours=None)
+            await _reply(update, msg)
+        else:
+            ok = await user_ctx.logic.archive_card(matched["id"], comment=done_comment)
+            if ok:
+                await _reply(update, f"✅ Готово! Карточка «{matched['title']}» перемещена в архив.")
+            else:
+                await _reply(update, f"⚠️ Не удалось архивировать «{matched['title']}».")
     except Exception as exc:
-        logger.exception("handle_done: archive_card error — {}", exc)
-        await _reply(update, "⚠️ Не удалось архивировать карточку. Попробуй позже.")
-        return
-
-    if ok:
-        await _reply(update, f"✅ Готово! Карточка «{matched['title']}» перемещена в архив.")
-    else:
-        await _reply(update, f"⚠️ Не удалось архивировать «{matched['title']}».")
+        logger.exception("handle_done: error — {}", exc)
+        await _reply(update, "⚠️ Ошибка при завершении задачи. Попробуй позже.")
 
 
 # ── Обработчик «перенести» ────────────────────────────────────────────────────
@@ -470,7 +579,7 @@ async def _handle_move(
         target_column_id   = user_ctx.logic.column_ids[column_name]
         target_column_name = column_name
     else:
-        tomorrow_wd        = (date.today() + timedelta(days=1)).weekday()
+        tomorrow_wd        = (datetime.now(TZ_MSK).date() + timedelta(days=1)).weekday()
         target_column_name = WEEKDAY_COLUMNS[tomorrow_wd]
         target_column_id   = user_ctx.logic.column_ids[target_column_name]
 
@@ -492,6 +601,16 @@ async def _handle_move(
             update,
             f"📦 «{matched['title']}» перенесена → *{target_column_name} / {section}*",
         )
+        if section == "На контроле":
+            try:
+                today_str = datetime.now(TZ_MSK).date().isoformat()
+                await user_ctx.kaiten.add_comment(
+                    matched["id"], f"Задача переведена на контроль {today_str}"
+                )
+            except Exception as exc:
+                logger.warning(
+                    "_handle_move: не удалось добавить комментарий о контроле — {}", exc
+                )
     else:
         await _reply(update, f"⚠️ Не удалось переместить «{matched['title']}».")
 
@@ -574,13 +693,13 @@ async def _handle_note(
 def _action_keyboard() -> InlineKeyboardMarkup:
     """Клавиатура действий над карточкой."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Готово",          callback_data="action:done")],
-        [InlineKeyboardButton("➡️ Все на сегодня",  callback_data="action:today")],
-        [InlineKeyboardButton("💬 Комментарий",     callback_data="action:comment")],
-        [InlineKeyboardButton("📅 Перенести",       callback_data="action:move")],
-        [InlineKeyboardButton("🤖 Совет",           callback_data="action:advice")],
-        [InlineKeyboardButton("🔔 Напоминалка",     callback_data="action:reminder")],
-        [InlineKeyboardButton("← Назад",            callback_data="action:back")],
+        [InlineKeyboardButton("✅ Готово",                   callback_data="action:done")],
+        [InlineKeyboardButton("⏭ Продолжить в другой день", callback_data="action:today")],
+        [InlineKeyboardButton("💬 Комментарий",              callback_data="action:comment")],
+        [InlineKeyboardButton("📅 Перенести",                callback_data="action:move")],
+        [InlineKeyboardButton("🤖 Совет",                    callback_data="action:advice")],
+        [InlineKeyboardButton("🔔 Напоминалка",              callback_data="action:reminder")],
+        [InlineKeyboardButton("← Назад",                     callback_data="action:back")],
     ])
 
 
@@ -595,7 +714,7 @@ async def _resend_card_buttons(
         cards = await user_ctx.kaiten.get_cards(today_col_id)
         task_cards = [c for c in cards if not c.blocked and not c.archived]
         if task_cards:
-            await send_card_buttons(task_cards, context.bot, chat_id)
+            await send_card_buttons(task_cards, context.bot, chat_id, page=0)
         else:
             await context.bot.send_message(
                 chat_id=chat_id,
@@ -605,7 +724,7 @@ async def _resend_card_buttons(
         logger.warning("_resend_card_buttons: ошибка — {}", exc)
 
 
-# ── Вспомогательная логика для кнопки «Все на сегодня» ───────────────────────
+# ── Вспомогательная логика для кнопки «Продолжить в другой день» ─────────────
 
 def _next_col_for_regular(card: Card, today: date, column_ids: dict[str, int]) -> int:
     """Возвращает column_id следующего подходящего дня для регулярной задачи."""
@@ -632,6 +751,50 @@ def _next_col_for_regular(card: Card, today: date, column_ids: dict[str, int]) -
     return column_ids[WEEKDAY_COLUMNS[target_wd]]
 
 
+async def _postpone_card(
+    user_ctx: UserHandlerCtx,
+    card: Card,
+    hours: float | None,
+) -> tuple[bool, str]:
+    """Переносит карточку на следующий подходящий слот. Если hours задан — обновляет size.
+
+    Возвращает (успех, текст_результата_для_пользователя).
+    Для регулярных задач находит следующий день по тегу.
+    Для обычных задач — берёт завтра.
+    """
+    card_id = card.id
+    if hours is not None:
+        try:
+            await user_ctx.kaiten.update_card(card_id, size=hours)
+        except Exception as exc:
+            logger.exception("_postpone_card: update_card error — {}", exc)
+            return False, "⚠️ Не удалось обновить размер задачи."
+    try:
+        card = await user_ctx.kaiten.get_card(card_id)
+        if card is None:
+            raise ValueError(f"card {card_id} not found after update")
+        if user_ctx.logic.is_regular_task(card):
+            start_col_id = _next_col_for_regular(
+                card, datetime.now(TZ_MSK).date(), user_ctx.logic.column_ids
+            )
+        else:
+            tomorrow = datetime.now(TZ_MSK).date() + timedelta(days=1)
+            start_col_id = user_ctx.logic.column_ids[WEEKDAY_COLUMNS[tomorrow.weekday()]]
+        slot = await user_ctx.logic.find_slot_for_card(card, start_col_id)
+        if slot is None:
+            slot = (user_ctx.logic.column_ids["Следующая неделя"], "Утро")
+        target_col_id, target_section = slot
+        sort_order = await user_ctx.logic.get_section_sort_order(target_col_id, target_section)
+        await user_ctx.kaiten.move_card(card_id, target_col_id, sort_order)
+        target_col_name = user_ctx.logic.column_name_by_id.get(target_col_id, str(target_col_id))
+        hours_part = f": размер {hours} ч" if hours is not None else ""
+        return True, f"✅ «{card.title}»{hours_part} → *{target_col_name} / {target_section}*"
+    except Exception as exc:
+        logger.exception("_postpone_card: move error — {}", exc)
+        suffix = " ⚠️ Не удалось перенести карточку." if hours is not None else ""
+        return False, f"⚠️ Ошибка при переносе.{suffix}"
+
+
 # ── Фабрика хендлеров ─────────────────────────────────────────────────────────
 
 def build_handlers(cfg: HandlersConfig) -> Application:
@@ -640,8 +803,9 @@ def build_handlers(cfg: HandlersConfig) -> Application:
     Порядок регистрации (важно!):
         1. ConversationHandler — group=0, первым: перехватывает card:* коллбэки
            и ведёт диалог выбора действия над карточкой.
-        2. CommandHandlers — group=0.
-        3. MessageHandler (text_handler) — group=0, последним: роутер текста.
+        2. page_nav_cb — сразу за ConvHandler: перехватывает page:* коллбэки.
+        3. CommandHandlers — group=0.
+        4. MessageHandler (text_handler) — group=0, последним: роутер текста.
 
     ConversationHandler не мешает text_handler когда пользователь НЕ в диалоге:
         entry_points реагируют только на callback card:*, обычный текст
@@ -711,7 +875,7 @@ def build_handlers(cfg: HandlersConfig) -> Application:
         context.user_data["pending_action"] = "done"
         await query.edit_message_text(
             "💬 Добавь комментарий к выполненной задаче\n"
-            "_(или напиши «-» чтобы архивировать без комментария)_",
+            "_(или напиши «.» чтобы обойтись без комментария)_",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=None,
         )
@@ -720,12 +884,24 @@ def build_handlers(cfg: HandlersConfig) -> Application:
     async def action_today_cb(
         update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> int:
-        """➡️ Все на сегодня → запрашиваем число часов, потом перенесём."""
+        """⏭ Продолжить в другой день → для коротких задач сразу переносим, иначе спрашиваем часы."""
         query = update.callback_query
         assert query is not None
         await query.answer()
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        user_ctx = cfg.users.get(chat_id) if chat_id else None
+        card_id = context.user_data.get("selected_card_id")
+        card = await user_ctx.kaiten.get_card(card_id) if (user_ctx and card_id) else None
+
+        if card and card.size is not None and card.size <= 0.25 and card.size != 999:
+            ok, msg = await _postpone_card(user_ctx, card, hours=None)
+            await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN)
+            if update.effective_chat:
+                await _resend_card_buttons(user_ctx, context, update.effective_chat.id)
+            return ConversationHandler.END
+
         await query.edit_message_text(
-            "⏱ Сколько часов займёт задача? _(введи целое число)_",
+            "⏱ Сколько часов реально нужно ещё? Перенесу на следующий подходящий день. _(введи целое число)_",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=None,
         )
@@ -791,7 +967,11 @@ def build_handlers(cfg: HandlersConfig) -> Application:
     async def received_comment_cb(
         update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> int:
-        """Получен текст комментария: архивируем или добавляем комментарий."""
+        """Получен текст комментария: архивируем или добавляем комментарий.
+
+        Для «готово»: регулярные задачи переносятся на следующий подходящий день,
+        обычные — архивируются.
+        """
         assert update.message is not None
 
         chat_id = update.effective_chat.id if update.effective_chat else None
@@ -805,23 +985,52 @@ def build_handlers(cfg: HandlersConfig) -> Application:
         title     = context.user_data.get("selected_card_title", f"#{card_id}")
         action    = context.user_data.get("pending_action", "comment")
 
-        # «-» = пропустить комментарий (только для done)
-        comment_text: str | None = None if text == "-" else text
+        # «.» = пропустить комментарий (только для done)
+        comment_text: str | None = None if text == "." else text
 
         if action == "done":
             try:
-                ok = await user_ctx.logic.archive_card(card_id, comment=comment_text or None)
-                if ok:
-                    await update.message.reply_text(
-                        f"✅ «{title}» выполнено и перемещено в архив."
+                card = await user_ctx.kaiten.get_card(card_id)
+                if card and user_ctx.logic.is_regular_task(card):
+                    start_col_id = _next_col_for_regular(
+                        card, datetime.now(TZ_MSK).date(), user_ctx.logic.column_ids
                     )
+                    slot = await user_ctx.logic.find_slot_for_card(card, start_col_id)
+                    if slot is None:
+                        slot = (user_ctx.logic.column_ids["Следующая неделя"], "Утро")
+                    target_col_id, target_section = slot
+                    sort_order = await user_ctx.logic.get_section_sort_order(
+                        target_col_id, target_section
+                    )
+                    if comment_text:
+                        await user_ctx.kaiten.add_comment(card_id, comment_text)
+                    moved = await user_ctx.kaiten.move_card(card_id, target_col_id, sort_order)
+                    if moved:
+                        target_col_name = user_ctx.logic.column_name_by_id.get(
+                            target_col_id, str(target_col_id)
+                        )
+                        await update.message.reply_text(
+                            f"✅ «{title}» выполнено (регулярная задача) → следующий раз: "
+                            f"*{target_col_name} / {target_section}*",
+                            parse_mode=ParseMode.MARKDOWN,
+                        )
+                    else:
+                        await update.message.reply_text(
+                            f"⚠️ Не удалось перенести регулярную «{title}»."
+                        )
                 else:
-                    await update.message.reply_text(
-                        f"⚠️ Не удалось архивировать «{title}»."
-                    )
+                    ok = await user_ctx.logic.archive_card(card_id, comment=comment_text or None)
+                    if ok:
+                        await update.message.reply_text(
+                            f"✅ «{title}» выполнено и перемещено в архив."
+                        )
+                    else:
+                        await update.message.reply_text(
+                            f"⚠️ Не удалось архивировать «{title}»."
+                        )
             except Exception as exc:
-                logger.exception("received_comment_cb: archive error — {}", exc)
-                await update.message.reply_text("⚠️ Ошибка при архивации.")
+                logger.exception("received_comment_cb: done error — {}", exc)
+                await update.message.reply_text("⚠️ Ошибка при завершении задачи.")
 
         elif action == "comment":
             if comment_text:
@@ -849,7 +1058,10 @@ def build_handlers(cfg: HandlersConfig) -> Application:
     async def received_hours_cb(
         update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> int:
-        """Получено число часов: обновляем size и переносим на следующий слот."""
+        """Получено число часов: обновляем size и переносим на следующий слот.
+
+        Если карточка критическая с дедлайном сегодня/завтра — запрашиваем подтверждение.
+        """
         assert update.message is not None
 
         chat_id = update.effective_chat.id if update.effective_chat else None
@@ -860,7 +1072,6 @@ def build_handlers(cfg: HandlersConfig) -> Application:
 
         text    = update.message.text.strip()
         card_id = context.user_data.get("selected_card_id")
-        title   = context.user_data.get("selected_card_title", f"#{card_id}")
 
         # Парсим число
         try:
@@ -874,47 +1085,42 @@ def build_handlers(cfg: HandlersConfig) -> Application:
             )
             return AWAITING_HOURS  # остаёмся в том же состоянии
 
-        # Обновляем size
+        # Получаем карточку, проверяем risky-критерий, затем переносим
         try:
-            await user_ctx.kaiten.update_card(card_id, size=hours)
-            logger.info("received_hours_cb: card_id={} size={}", card_id, hours)
+            card_obj = await user_ctx.kaiten.get_card(card_id)
+            if card_obj is None:
+                await update.message.reply_text("⚠️ Карточка не найдена.")
+                return ConversationHandler.END
+
+            # Мягкое сопротивление: критическая задача с дедлайном сегодня/завтра
+            today_h = datetime.now(TZ_MSK).date()
+            tomorrow_h = today_h + timedelta(days=1)
+            due_dt_h = card_obj.due_date_parsed
+            due_date_h = due_dt_h.date() if due_dt_h else None
+            risky = card_obj.importance == "критическое" and due_date_h in (today_h, tomorrow_h)
+
+            if risky:
+                title_h = context.user_data.get("selected_card_title", f"#{card_id}")
+                context.user_data["pending_move"] = {
+                    "kind": "postpone",
+                    "card_id": card_id,
+                    "hours": hours,
+                }
+                await update.message.reply_text(
+                    f"⚠️ «{title_h}» — критическая задача с дедлайном {due_date_h}.\n"
+                    f"Точно перенести (часы: {hours})?",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("Да, перенести", callback_data="confirm:move"),
+                        InlineKeyboardButton("Отмена", callback_data="confirm:cancel"),
+                    ]]),
+                )
+                return CONFIRM_RISKY_MOVE
+
+            ok, msg = await _postpone_card(user_ctx, card_obj, hours)
+            await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
         except Exception as exc:
-            logger.exception("received_hours_cb: update_card error — {}", exc)
-            await update.message.reply_text("⚠️ Не удалось обновить размер задачи.")
-            return ConversationHandler.END
-
-        # Ищем следующий подходящий слот с учётом типа задачи
-        try:
-            card = await user_ctx.kaiten.get_card(card_id)
-            if card is None:
-                raise ValueError(f"card {card_id} not found after update")
-
-            # Для регулярных задач — стартуем с колонки по метке,
-            # для обычных — с завтра.
-            if user_ctx.logic.is_regular_task(card):
-                start_col_id = _next_col_for_regular(card, date.today(), user_ctx.logic.column_ids)
-            else:
-                tomorrow     = date.today() + timedelta(days=1)
-                start_col_id = user_ctx.logic.column_ids[WEEKDAY_COLUMNS[tomorrow.weekday()]]
-
-            slot = await user_ctx.logic.find_slot_for_card(card, start_col_id)
-            if slot is None:
-                slot = (user_ctx.logic.column_ids["Следующая неделя"], "Утро")
-
-            target_col_id, target_section = slot
-            sort_order = await user_ctx.logic.get_section_sort_order(target_col_id, target_section)
-            await user_ctx.kaiten.move_card(card_id, target_col_id, sort_order)
-
-            target_col_name = user_ctx.logic.column_name_by_id.get(target_col_id, str(target_col_id))
-            await update.message.reply_text(
-                f"✅ «{title}»: размер {hours} ч → *{target_col_name} / {target_section}*",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        except Exception as exc:
-            logger.exception("received_hours_cb: move error — {}", exc)
-            await update.message.reply_text(
-                f"✅ Размер обновлён ({hours} ч).\n⚠️ Не удалось перенести карточку."
-            )
+            logger.exception("received_hours_cb: error — {}", exc)
+            await update.message.reply_text("⚠️ Ошибка при переносе карточки.")
 
         if update.effective_chat:
             await _resend_card_buttons(user_ctx, context, update.effective_chat.id)
@@ -924,7 +1130,10 @@ def build_handlers(cfg: HandlersConfig) -> Application:
     async def received_move_target_cb(
         update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> int:
-        """Получен текст с целью переноса: парсим через Claude и двигаем карточку."""
+        """Получен текст с целью переноса: парсим через Claude и двигаем карточку.
+
+        Если карточка критическая с дедлайном сегодня/завтра — запрашиваем подтверждение.
+        """
         assert update.message is not None
 
         chat_id = update.effective_chat.id if update.effective_chat else None
@@ -953,9 +1162,39 @@ def build_handlers(cfg: HandlersConfig) -> Application:
             target_col_id   = user_ctx.logic.column_ids[column_name]
             target_col_name = column_name
         else:
-            tomorrow        = date.today() + timedelta(days=1)
+            tomorrow        = datetime.now(TZ_MSK).date() + timedelta(days=1)
             target_col_name = WEEKDAY_COLUMNS[tomorrow.weekday()]
             target_col_id   = user_ctx.logic.column_ids[target_col_name]
+
+        # Мягкое сопротивление: критическая задача с дедлайном сегодня/завтра
+        try:
+            card = await user_ctx.kaiten.get_card(card_id)
+        except Exception:
+            card = None
+        today = datetime.now(TZ_MSK).date()
+        tomorrow = today + timedelta(days=1)
+        due_dt = card.due_date_parsed if card else None
+        due_date = due_dt.date() if due_dt else None
+        risky = bool(card) and card.importance == "критическое" and due_date in (today, tomorrow)
+
+        if risky:
+            context.user_data["pending_move"] = {
+                "kind": "move",
+                "card_id": card_id,
+                "title": title,
+                "target_col_id": target_col_id,
+                "target_col_name": target_col_name,
+                "section": section,
+            }
+            await update.message.reply_text(
+                f"⚠️ «{title}» — критическая задача с дедлайном {due_date.isoformat()}.\n"
+                f"Точно перенести на {target_col_name}?",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("Да, перенести", callback_data="confirm:move"),
+                    InlineKeyboardButton("Отмена", callback_data="confirm:cancel"),
+                ]]),
+            )
+            return CONFIRM_RISKY_MOVE
 
         try:
             sort_order = await user_ctx.logic.get_section_sort_order(target_col_id, section)
@@ -965,6 +1204,17 @@ def build_handlers(cfg: HandlersConfig) -> Application:
                     f"📦 «{title}» → *{target_col_name} / {section}*",
                     parse_mode=ParseMode.MARKDOWN,
                 )
+                if section == "На контроле":
+                    try:
+                        today_str = datetime.now(TZ_MSK).date().isoformat()
+                        await user_ctx.kaiten.add_comment(
+                            card_id, f"Задача переведена на контроль {today_str}"
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "received_move_target_cb: не удалось добавить комментарий о контроле — {}",
+                            exc,
+                        )
             else:
                 await update.message.reply_text(f"⚠️ Не удалось переместить «{title}».")
         except Exception as exc:
@@ -974,6 +1224,86 @@ def build_handlers(cfg: HandlersConfig) -> Application:
         if update.effective_chat:
             await _resend_card_buttons(user_ctx, context, update.effective_chat.id)
 
+        return ConversationHandler.END
+
+    # ── Подтверждение переноса критической задачи ─────────────────────────────
+
+    async def confirm_move_cb(
+        update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        """Пользователь подтвердил перенос критической задачи — выполняем."""
+        query = update.callback_query
+        assert query is not None
+        await query.answer()
+
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        user_ctx = cfg.users.get(chat_id) if chat_id else None
+        pending = context.user_data.get("pending_move")
+
+        if not pending or user_ctx is None:
+            await query.edit_message_text("⚠️ Действие устарело, попробуй заново.")
+            return ConversationHandler.END
+
+        if pending["kind"] == "move":
+            try:
+                sort_order = await user_ctx.logic.get_section_sort_order(
+                    pending["target_col_id"], pending["section"]
+                )
+                moved = await user_ctx.kaiten.move_card(
+                    pending["card_id"], pending["target_col_id"], sort_order
+                )
+                if moved:
+                    await query.edit_message_text(
+                        f"📦 «{pending['title']}» → *{pending['target_col_name']} / {pending['section']}*",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                    if pending["section"] == "На контроле":
+                        try:
+                            today_str = datetime.now(TZ_MSK).date().isoformat()
+                            await user_ctx.kaiten.add_comment(
+                                pending["card_id"],
+                                f"Задача переведена на контроль {today_str}",
+                            )
+                        except Exception as exc:
+                            logger.warning("confirm_move_cb: комментарий о контроле — {}", exc)
+                else:
+                    await query.edit_message_text(
+                        f"⚠️ Не удалось переместить «{pending['title']}»."
+                    )
+            except Exception as exc:
+                logger.exception("confirm_move_cb: move error — {}", exc)
+                await query.edit_message_text("⚠️ Ошибка при перемещении карточки.")
+
+        elif pending["kind"] == "postpone":
+            try:
+                card = await user_ctx.kaiten.get_card(pending["card_id"])
+                if card is None:
+                    await query.edit_message_text("⚠️ Карточка не найдена.")
+                else:
+                    ok, msg = await _postpone_card(user_ctx, card, pending["hours"])
+                    await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN)
+            except Exception as exc:
+                logger.exception("confirm_move_cb: postpone error — {}", exc)
+                await query.edit_message_text("⚠️ Ошибка при переносе карточки.")
+
+        context.user_data.pop("pending_move", None)
+        if update.effective_chat and user_ctx:
+            await _resend_card_buttons(user_ctx, context, update.effective_chat.id)
+        return ConversationHandler.END
+
+    async def confirm_cancel_cb(
+        update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        """Пользователь отменил перенос критической задачи."""
+        query = update.callback_query
+        assert query is not None
+        await query.answer()
+        await query.edit_message_text("↩️ Перенос отменён.")
+        context.user_data.pop("pending_move", None)
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        user_ctx = cfg.users.get(chat_id) if chat_id else None
+        if user_ctx and update.effective_chat:
+            await _resend_card_buttons(user_ctx, context, update.effective_chat.id)
         return ConversationHandler.END
 
     # ── Кнопка «Совет» ───────────────────────────────────────────────────────
@@ -1176,6 +1506,8 @@ def build_handlers(cfg: HandlersConfig) -> Application:
             await _handle_morning(update, user_ctx, context)
         elif lower == "вечер":
             await _handle_evening(update, user_ctx)
+        elif lower in ("пересобрать", "перепланируй"):
+            await _handle_replan(update, user_ctx, context)
         elif re.match(r"^(создать|создай)\b", lower):
             await _handle_create(update, cfg, _strip_command_prefix(text, "создать", "создай"), user_ctx)
         elif re.match(r"^(готово|выполнено|сделал|сделано)\b", lower):
@@ -1213,6 +1545,25 @@ def build_handlers(cfg: HandlersConfig) -> Application:
             await update.callback_query.edit_message_text("↩️ Действие отменено.")
         return ConversationHandler.END
 
+    # ── Навигация по страницам карточек ──────────────────────────────────────
+
+    async def page_nav_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Навигация по страницам списка карточек (page:N callback)."""
+        query = update.callback_query
+        await query.answer()
+        chat_id = update.effective_chat.id
+        user_ctx = cfg.users.get(chat_id)
+        if user_ctx is None:
+            return
+        page = int(query.data.split(":")[1])
+        today_col_id = user_ctx.logic.get_today_column_id()
+        today_cards = await user_ctx.kaiten.get_cards(today_col_id)
+        try:
+            await query.delete_message()
+        except Exception:
+            pass
+        await send_card_buttons(today_cards, context.bot, chat_id, page=page)
+
     # ── Сборка ConversationHandler ────────────────────────────────────────────
 
     # Текстовый фильтр для состояний ожидания: не реагирует на известные команды
@@ -1246,6 +1597,10 @@ def build_handlers(cfg: HandlersConfig) -> Application:
             ],
             AWAITING_REMINDER_TIME: [
                 MessageHandler(_text_not_cmd, received_reminder_time_cb),
+            ],
+            CONFIRM_RISKY_MOVE: [
+                CallbackQueryHandler(confirm_move_cb,   pattern=r"^confirm:move$"),
+                CallbackQueryHandler(confirm_cancel_cb, pattern=r"^confirm:cancel$"),
             ],
         },
         fallbacks=[
@@ -1292,6 +1647,10 @@ def build_handlers(cfg: HandlersConfig) -> Application:
 
         if lower == "вечер":
             await _handle_evening(update, user_ctx)
+            return
+
+        if lower in ("пересобрать", "перепланируй"):
+            await _handle_replan(update, user_ctx, context)
             return
 
         if re.match(r"^(создать|создай)\b", lower):
@@ -1379,11 +1738,13 @@ def build_handlers(cfg: HandlersConfig) -> Application:
     # ── Регистрация в строгом порядке ─────────────────────────────────────────
     #
     # ConversationHandler — первым, чтобы перехватывать card:* коллбэки.
+    # page_nav_cb — сразу за ним: перехватывает page:* коллбэки (вне диалога).
     # Когда пользователь НЕ в диалоге, conv_handler не трогает текстовые
     # сообщения (его entry_points реагируют только на card:* коллбэки),
     # и update проваливается к text_handler ниже.
 
-    app.add_handler(conv_handler)                                           # ConvHandler
+    app.add_handler(conv_handler)                                                      # ConvHandler
+    app.add_handler(CallbackQueryHandler(page_nav_cb, pattern=r"^page:\d+$"))          # пагинация
 
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("help",   cmd_help))

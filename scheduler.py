@@ -212,14 +212,16 @@ class Scheduler:
             misfire_grace_time=60,
         )
 
-        # Очистка Архива — каждый понедельник в 06:00 (до утренней логики)
+        # Очистка Архива — каждый понедельник в 06:00 (до утренней логики).
+        # misfire_grace_time=21600 (6 ч): очистка не времязависима (в отличие от
+        # утреннего плана), широкое окно снижает риск пропуска при простое Railway.
         self._scheduler.add_job(
             self._safe_archive_cleanup,
             trigger=CronTrigger(day_of_week="mon", hour=6, minute=0, timezone="Europe/Moscow"),
             id="archive_cleanup_job",
             name="Очистка Архива",
             replace_existing=True,
-            misfire_grace_time=3600,
+            misfire_grace_time=21600,
         )
 
         logger.info(
@@ -285,12 +287,71 @@ class Scheduler:
         """Публичный метод для ручного запуска утренней логики (из handlers)."""
         await self._run_morning_for_user(user_ctx)
 
+    async def run_replan_for_user(self, user_ctx: UserSchedulerCtx) -> str:
+        """Пересобирает расписание пользователя с текущего момента и генерирует план.
+
+        НЕ трогает флаг morning_done — пересборка разрешена сколько угодно раз за день.
+        Не отправляет через notifier — возвращает готовый текст плана вызывающему коду
+        (handlers.py использует _reply с этим текстом).
+        """
+        user_id = user_ctx.user_cfg.user_id
+        now = _now_msk()
+        logger.info("replan user={}: старт ({})", user_id, now.isoformat())
+
+        try:
+            cards: list[Card] = await user_ctx.morning.replan(now)
+            segments_map = user_ctx.morning.last_segments
+        except Exception as exc:
+            logger.error("replan user={}: ошибка morning.replan — {}", user_id, exc)
+            return "Не удалось пересобрать план. Проверь логи."
+
+        task_cards = [c for c in cards if not c.blocked and not c.archived]
+        comments_list = await asyncio.gather(
+            *[user_ctx.kaiten.get_comments(c.id) for c in task_cards],
+            return_exceptions=True,
+        )
+        comments_map: dict[int, list[str]] = {
+            c.id: (cmts if isinstance(cmts, list) else [])
+            for c, cmts in zip(task_cards, comments_list)
+        }
+
+        cards_dicts = _extract_section_cards(
+            cards,
+            comments_map=comments_map,
+            segments_map=segments_map,
+        )
+
+        date_str = _format_date_ru(now.date())
+        try:
+            plan_text = await self._claude.generate_morning_plan(cards_dicts, date_str)
+        except Exception as exc:
+            logger.error("replan user={}: ошибка generate_morning_plan — {}", user_id, exc)
+            plan_text = (
+                f"*{date_str}*\n\n"
+                "Не удалось сгенерировать план. Посмотри доску вручную."
+            )
+
+        # Добавляем отчёт об overflow
+        overflow = user_ctx.morning.last_overflow
+        if overflow:
+            lines = [f"\n\n📤 *Перенесено на другое время* ({len(overflow)}):"]
+            for item in overflow:
+                marker = "⚠️ " if item.get("risky") else ""
+                lines.append(f"— {marker}{item['title']} → {item['target']}")
+            plan_text += "\n".join(lines)
+
+        logger.info(
+            "replan user={}: завершено, карточек={} overflow={}",
+            user_id, len(task_cards), len(overflow),
+        )
+        return plan_text
+
     async def _run_morning_for_user(self, user_ctx: UserSchedulerCtx) -> None:
         """Утренняя логика для одного пользователя: перенос карточек + план от Claude.
 
         Проверяет флаг в SQLite — если уже выполнено сегодня, пропускает.
         """
-        today   = date.today()
+        today   = _now_msk().date()   # московское время, не UTC-сервер
         user_id = user_ctx.user_cfg.user_id
         logger.info("morning_job user={}: старт ({})", user_id, today.isoformat())
 
@@ -356,14 +417,25 @@ class Scheduler:
                 "Не удалось сгенерировать план. Посмотри доску вручную."
             )
 
+        # ── Добавляем отчёт об overflow ───────────────────────────────────────
+        overflow = user_ctx.morning.last_overflow
+        if overflow:
+            lines = [f"\n\n📤 *Перенесено на другое время* ({len(overflow)}):"]
+            for item in overflow:
+                marker = "⚠️ " if item.get("risky") else ""
+                lines.append(f"— {marker}{item['title']} → {item['target']}")
+            plan_text += "\n".join(lines)
+
         # ── Отправляем в Telegram ─────────────────────────────────────────────
         try:
-            await user_ctx.notifier.send_morning_plan(plan_text)
+            await user_ctx.notifier.send_and_pin(plan_text)
         except Exception as exc:
-            logger.error(
-                "morning_job user={}: ошибка send_morning_plan — {}",
-                user_id, exc,
-            )
+            logger.error("morning_job user={}: ошибка send_and_pin — {}", user_id, exc)
+
+        try:
+            await user_ctx.notifier.send_card_buttons(task_cards)
+        except Exception as exc:
+            logger.error("morning_job user={}: ошибка send_card_buttons — {}", user_id, exc)
 
         # ── Ставим флаг ───────────────────────────────────────────────────────
         await loop.run_in_executor(None, db.set_morning_done, today, user_id)
@@ -398,8 +470,9 @@ class Scheduler:
     async def _run_archive_for_user(self, user_ctx: UserSchedulerCtx) -> None:
         """Удаляет из Архива карточки старше 30 дней для одного пользователя.
 
-        Фильтрация по полю updated_at — дата последнего изменения карточки.
-        Карточки без updated_at не трогаются.
+        Фильтрация по полю last_moved_at (с fallback на updated_at если
+        last_moved_at отсутствует в ответе API — реализовано в Card.last_moved_at_parsed).
+        Карточки без временной метки не трогаются.
         """
         user_id = user_ctx.user_cfg.user_id
         try:
@@ -411,30 +484,42 @@ class Scheduler:
 
             archive_col_id = user_ctx.logic.column_ids["Архив"]
             cards = await user_ctx.kaiten.get_cards(archive_col_id)
+
+            total = 0
+            skipped_blocked = 0
+            skipped_no_ts = 0
+            skipped_too_new = 0
             deleted = 0
 
             for card in cards:
+                total += 1
                 if card.blocked:
+                    skipped_blocked += 1
                     continue
-                ts = card.updated_at_parsed
-                if ts and ts < cutoff:
-                    ok = await user_ctx.kaiten.delete_card(card.id)
-                    if ok:
-                        deleted += 1
-                        logger.info(
-                            "archive_cleanup user={}: удалена «{}» (id={}) updated={}",
-                            user_id, card.title, card.id,
-                            ts.date().isoformat() if ts else "?",
-                        )
-                    else:
-                        logger.warning(
-                            "archive_cleanup user={}: не удалось удалить id={}",
-                            user_id, card.id,
-                        )
+                ts = card.last_moved_at_parsed
+                if ts is None:
+                    skipped_no_ts += 1
+                    continue
+                if ts >= cutoff:
+                    skipped_too_new += 1
+                    continue
+                ok = await user_ctx.kaiten.delete_card(card.id)
+                if ok:
+                    deleted += 1
+                    logger.info(
+                        "archive_cleanup user={}: удалена «{}» (id={}) moved={}",
+                        user_id, card.title, card.id,
+                        ts.date().isoformat(),
+                    )
+                else:
+                    logger.warning(
+                        "archive_cleanup user={}: не удалось удалить id={}",
+                        user_id, card.id,
+                    )
 
             logger.info(
-                "archive_cleanup user={}: удалено {} карточек старше 30 дней",
-                user_id, deleted,
+                "archive_cleanup user={}: всего={} удалено={} пропущено(blocked={}, no_ts={}, too_new={})",
+                user_id, total, deleted, skipped_blocked, skipped_no_ts, skipped_too_new,
             )
 
         except Exception as exc:

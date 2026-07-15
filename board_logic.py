@@ -19,6 +19,7 @@ from kaiten_client import (
     Column,
     KaitenClient,
     TAG_IDS,
+    TZ_MSK,
     WEEKDAY_OPTIONS,
     IMPORTANCE_OPTIONS,
 )
@@ -48,7 +49,7 @@ IMPORTANCE_RANK: dict[str | None, int] = {
     None:          3,
 }
 
-# Регулярные теги
+# Регулярные теги (модульная константа — оставляем для обратной совместимости)
 REGULAR_TAG_IDS: set[int] = {
     TAG_IDS["ежедневно"],
     TAG_IDS["по будням"],
@@ -74,6 +75,11 @@ class BoardLogic:
             for i, name in enumerate(WEEKDAY_COLUMNS)
             if name in column_ids
         }
+        # Инстанс-версия регулярных тегов — учитывает per-user tag_ids из KaitenClient
+        self._regular_tag_ids: set[int] = (
+            {self._client.tag_id(n) for n in ("ежедневно", "по будням", "по выходным", "еженедельно")}
+            - {None}
+        )
 
     @property
     def column_ids(self) -> dict[str, int]:
@@ -93,13 +99,17 @@ class BoardLogic:
         return col_id
 
     def get_today_column_id(self) -> int:
-        """Возвращает column_id колонки текущего дня недели (0=Пн … 6=Вс)."""
-        day_name = WEEKDAY_COLUMNS[date.today().weekday()]
+        """Возвращает column_id колонки текущего дня недели (0=Пн … 6=Вс).
+
+        Использует московское время (UTC+3), чтобы избежать расхождения с UTC
+        на Railway-сервере возле полуночи MSK.
+        """
+        day_name = WEEKDAY_COLUMNS[datetime.now(TZ_MSK).date().weekday()]
         return self._column_ids[day_name]
 
     def get_yesterday_column_id(self) -> int:
-        """Возвращает column_id колонки вчерашнего дня."""
-        yesterday = date.today() - timedelta(days=1)
+        """Возвращает column_id колонки вчерашнего дня (UTC+3)."""
+        yesterday = datetime.now(TZ_MSK).date() - timedelta(days=1)
         day_name = WEEKDAY_COLUMNS[yesterday.weekday()]
         return self._column_ids[day_name]
 
@@ -260,7 +270,7 @@ class BoardLogic:
            затем важные, затем обычные.
         6. Без дедлайна: сначала критические, потом важные, потом обычные.
         """
-        today = date.today()
+        today = datetime.now(TZ_MSK).date()
         tomorrow = today + timedelta(days=1)
 
         tasks = [c for c in cards if not c.blocked]
@@ -324,8 +334,12 @@ class BoardLogic:
         return True
 
     def is_regular_task(self, card: Card) -> bool:
-        """True если карточка имеет хотя бы один тег регулярности."""
-        return bool(set(card.tag_ids) & REGULAR_TAG_IDS)
+        """True если карточка имеет хотя бы один тег регулярности.
+
+        Использует self._regular_tag_ids — per-instance множество, построенное
+        из tag_id() клиента, чтобы корректно работать с per-user маппингами тегов.
+        """
+        return bool(set(card.tag_ids) & self._regular_tag_ids)
 
     def should_include_today(self, card: Card, today: date) -> bool:
         """Проверяет, должна ли регулярная задача попасть в текущий день.

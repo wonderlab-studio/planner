@@ -4,10 +4,10 @@ morning_logic.py — утренняя логика.
 [UPD 4] Полная перезапись для v4: алгоритм фаз 1–4.
 
 Фаза 0 : резервация слотов для карточек уже в сегодняшней колонке
-Фаза 1 : карточки с event_time.date() == today → фиксированные слоты
+Фаза 1 : карточки с event_time.date() == today → фиксированные слоты + тег «жёсткое событие»
 Фаза 1б: карточки с event_time.date() > today → нужная колонка
-Фаза 2 : сортировка оставшихся по 9 группам приоритета
-Фаза 3 : назначение event_time через update_card + перемещение в секцию
+Фаза 2 : сортировка оставшихся по 9 группам приоритета (_classify_groups)
+Фаза 3 : назначение event_time через update_card + перемещение в секцию (_place_groups)
 Фаза 4 : переполнение → следующий день / «Следующая неделя»
 
 Понедельничная сборка карточек — без изменений (v3).
@@ -45,6 +45,9 @@ _DEFAULT_HOURS = 0.25
 
 # Длительность size=999 если есть другие задачи в пуле (мин)
 _SIZE_999_DEFAULT_MIN = 60
+
+# Минимальная длина сегмента задачи (мин): не создаём сегменты короче этого значения
+_MIN_SEGMENT_MIN = 15
 
 
 # ── Вспомогательные функции ───────────────────────────────────────────────────
@@ -126,20 +129,28 @@ class _BlockScheduler:
         перепрыгивая через фиксированные события. Если суммарного свободного
         времени недостаточно — возвращает None (задача уходит в overflow).
 
+        Интервалы короче _MIN_SEGMENT_MIN пропускаются (не создаём микро-сегменты).
+        Если итоговый «хвост» задачи становится меньше _MIN_SEGMENT_MIN — округляем
+        вверх до _MIN_SEGMENT_MIN (незначительное превышение длительности).
+        Если все свободные интервалы короче _MIN_SEGMENT_MIN — используем их как есть
+        (last resort: лучше короткий сегмент чем overflow).
+
         Возвращает список сегментов [(start_min, end_min), ...] или None.
 
         Курсор продвигается до конца ПЕРВОГО сегмента (не последнего).
-        Это позволяет следующей задаче занять слоты сразу после первого сегмента
-        текущей задачи — не «перепрыгивать» через прерывистую задачу.
         """
         if duration_min <= 0:
             return None
 
         free = self.free_intervals_from_cursor()
         total_free = sum(e - s for s, e in free)
-
         if total_free < duration_min:
-            return None  # не влезает даже по частям
+            return None  # не влезает даже с учётом всех интервалов
+
+        # Считаем только «полноценные» интервалы (>= _MIN_SEGMENT_MIN).
+        # Если их недостаточно — переходим в режим last_resort (используем все).
+        total_usable = sum(e - s for s, e in free if e - s >= _MIN_SEGMENT_MIN)
+        last_resort = total_usable < duration_min
 
         segments: list[tuple[int, int]] = []
         remaining = duration_min
@@ -147,21 +158,49 @@ class _BlockScheduler:
         for seg_s, seg_e in free:
             if remaining <= 0:
                 break
-            chunk = min(remaining, seg_e - seg_s)
+
+            interval_size = seg_e - seg_s
+
+            if interval_size < _MIN_SEGMENT_MIN and not last_resort:
+                # Пропускаем крошечные интервалы: не хотим создавать < 15 мин сегменты
+                continue
+
+            # Если остаток задачи крошечный — округляем вверх до _MIN_SEGMENT_MIN,
+            # чтобы не создавать сегмент короче минимума.
+            effective_need = (
+                max(remaining, _MIN_SEGMENT_MIN)
+                if 0 < remaining < _MIN_SEGMENT_MIN
+                else remaining
+            )
+            chunk = min(effective_need, interval_size)
             seg_end = seg_s + chunk
             segments.append((seg_s, seg_end))
             self._occupied.append((seg_s, seg_end))
             remaining -= chunk
+            if remaining < 0:
+                remaining = 0
 
         self._occupied.sort()
         # Продвигаем курсор до конца ПЕРВОГО сегмента.
-        # Следующая задача начнёт с этой точки и сможет занять свободное время
-        # между сегментами текущей задачи (например, 09:30–12:00 если текущая
-        # прыгнула через фиксированное событие с 12:00).
         if segments:
             self._cursor = segments[0][1]
 
-        return segments
+        return segments if remaining == 0 else None
+
+    def try_place_atomic(self, duration_min: int) -> list[tuple[int, int]] | None:
+        """Как try_place_segmented, но НЕ дробит — ищет один непрерывный интервал.
+
+        Используется для карточек с тегом «не дробить».
+        Если непрерывного интервала нужной длины нет — возвращает None (overflow).
+        """
+        for seg_s, seg_e in self.free_intervals_from_cursor():
+            if seg_e - seg_s >= duration_min:
+                end = seg_s + duration_min
+                self._occupied.append((seg_s, end))
+                self._occupied.sort()
+                self._cursor = end
+                return [(seg_s, end)]
+        return None
 
 
 # ── MorningLogic ──────────────────────────────────────────────────────────────
@@ -173,8 +212,11 @@ class MorningLogic:
         self._client = client
         self._logic  = logic
         # Сегменты последнего запуска: {card_id: [("HH:MM", "HH:MM"), ...]}
-        # Доступен после run() — используется scheduler.py для card_dict["segments"]
+        # Доступен после run()/replan() — используется scheduler.py для card_dict["segments"]
         self.last_segments: dict[int, list[tuple[str, str]]] = {}
+        # Список overflow-карточек последнего запуска: [{title, target, risky}, ...]
+        # Доступен после run()/replan() — используется scheduler.py для отчёта пользователю
+        self.last_overflow: list[dict] = []
 
     # ── Точка входа ───────────────────────────────────────────────────────────
 
@@ -182,10 +224,12 @@ class MorningLogic:
         """Запускает утреннюю логику.
 
         Возвращает карточки сегодняшней колонки после всех перемещений.
-        После вызова self.last_segments содержит сегменты для каждой карточки.
+        После вызова self.last_segments содержит сегменты для каждой карточки,
+        self.last_overflow — список перенесённых в переполнение карточек.
         Не бросает исключения: ошибки отдельных карточек логируются и пропускаются.
         """
         self.last_segments = {}  # сбрасываем перед каждым запуском
+        self.last_overflow = []
         if today.weekday() == 0:
             return await self._run_monday(today)
         return await self._run_regular(today)
@@ -251,20 +295,22 @@ class MorningLogic:
     # ── Назначение event_time ────────────────────────────────────────────────
 
     async def _set_event_time(self, card: Card, dt: datetime) -> bool:
-        """Назначает event_time карточке через update_card (property id_590358)."""
+        """Назначает event_time карточке через update_card (builder-метод клиента,
+        учитывает per-user ID кастомного поля при мультиаккаунте)."""
         try:
-            prop_value = {
+            properties = self._client.event_time_property(dt)
+            await self._client.update_card(card.id, properties=properties)
+            # Локальный кэш карточки всегда обновляем под КАНОНИЧЕСКИМ ключом "id_590358" —
+            # Card.event_time (в kaiten_client.py) всегда читает именно этот ключ,
+            # независимо от реального ID поля на конкретном Kaiten-аккаунте.
+            card.properties["id_590358"] = {
                 "date": dt.strftime("%Y-%m-%d"),
                 "time": dt.strftime("%H:%M:%S"),
                 "tzOffset": 180,
             }
-            await self._client.update_card(
-                card.id, properties={"id_590358": prop_value}
-            )
-            card.properties["id_590358"] = prop_value
             logger.info(
                 "set_event_time: «{}» (id={}) → {}T{}",
-                card.title, card.id, prop_value["date"], prop_value["time"],
+                card.title, card.id, dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M:%S"),
             )
             return True
         except Exception as exc:
@@ -273,6 +319,170 @@ class MorningLogic:
                 card.title, card.id, exc,
             )
             return False
+
+    # ── Классификация по группам приоритета (Фаза 2) ─────────────────────────
+
+    def _classify_groups(
+        self,
+        cards: list[Card],
+        today: date,
+    ) -> tuple[list[list[Card]], list[Card]]:
+        """Классифицирует карточки по 9 группам приоритета.
+
+        Возвращает (groups, work_999):
+          - groups: список из 9 списков карточек (группы 0–8)
+          - work_999: карточки size=999 без тега «вечерняя» — обрабатываются последними
+            в рабочем блоке, чтобы корректно вычислить сколько времени осталось.
+
+        9 групп:
+          0: критическое + dl сегодня          → Утро,  sort by size ASC
+          1: важное + dl сегодня               → Утро,  sort by size ASC
+          2: критическое + dl скоро (завтра/+2)→ День
+          3: важное + dl скоро                 → День
+          4: среднее + dl сегодня или скоро    → День
+          5: все остальные (не вечерняя, size ≠ 999) → День
+          6: вечерняя + критическое + dl сегодня → Вечер, sort by size ASC
+          7: вечерняя + важное + dl сегодня      → Вечер, sort by size ASC
+          8: вечерняя + остальные                → Вечер
+        """
+        tomorrow  = today + timedelta(days=1)
+        day_after = today + timedelta(days=2)
+
+        groups: list[list[Card]] = [[] for _ in range(9)]
+        work_999: list[Card] = []
+
+        for card in cards:
+            tags   = set(card.tag_ids)
+            is_eve = _TAG_EVENING in tags
+            imp    = card.importance   # None / "среднее" / "важное" / "критическое"
+
+            dd_parsed = card.due_date_parsed
+            dl_date   = dd_parsed.date() if dd_parsed else None
+            today_dl  = (dl_date == today)                  if dl_date else False
+            soon_dl   = (dl_date in (tomorrow, day_after))  if dl_date else False
+
+            if not is_eve:
+                if card.size == 999:
+                    work_999.append(card)
+                elif imp == "критическое" and today_dl:  groups[0].append(card)
+                elif imp == "важное"       and today_dl:  groups[1].append(card)
+                elif imp == "критическое" and soon_dl:   groups[2].append(card)
+                elif imp == "важное"       and soon_dl:   groups[3].append(card)
+                elif imp == "среднее"      and soon_dl:   groups[4].append(card)
+                else:                                      groups[5].append(card)
+            else:
+                if   imp == "критическое" and today_dl:  groups[6].append(card)
+                elif imp == "важное"       and today_dl:  groups[7].append(card)
+                else:                                      groups[8].append(card)
+
+        # Группы 0, 1, 6, 7 — сортировка по size ASC (сначала быстрые)
+        for i in (0, 1, 6, 7):
+            groups[i].sort(key=lambda c: c.size if (c.size and c.size != 999) else 0)
+
+        logger.debug(
+            "_classify_groups: groups = {} work_999={}",
+            [len(g) for g in groups], len(work_999),
+        )
+
+        return groups, work_999
+
+    # ── Размещение карточек по времени (Фаза 3) ──────────────────────────────
+
+    async def _place_groups(
+        self,
+        processing_order: list[tuple[list[Card], _BlockScheduler, str]],
+        today: date,
+        today_col_id: int,
+        preloaded: dict[int, list[Card]],
+    ) -> list[Card]:
+        """Размещает карточки по временным слотам (Фаза 3).
+
+        Принимает processing_order — список (group_cards, sched, section).
+        Возвращает список overflow-карточек (не вошедших в блок).
+
+        Карточки с тегом «не дробить» размещаются атомарно (try_place_atomic);
+        остальные — сегментированно (try_place_segmented).
+        """
+        overflow: list[Card] = []
+
+        def _count_remaining_in_sched(
+            from_step: int,
+            from_card_idx: int,
+            target_sched: _BlockScheduler,
+        ) -> int:
+            """Количество карточек, которые будут обработаны в target_sched
+            после текущей позиции (from_step, from_card_idx)."""
+            count = 0
+            for step_idx, (step_cards, step_sched, _) in enumerate(processing_order):
+                if step_sched is not target_sched:
+                    continue
+                start_ci = from_card_idx + 1 if step_idx == from_step else 0
+                count += len(step_cards) - start_ci
+            return count
+
+        for step_idx, (group_cards, sched, section) in enumerate(processing_order):
+            for card_idx, card in enumerate(group_cards):
+                # Вычисляем нужную длительность
+                if card.size == 999:
+                    more_after = _count_remaining_in_sched(step_idx, card_idx, sched)
+                    if more_after > 0:
+                        dur_min = _SIZE_999_DEFAULT_MIN
+                        logger.debug(
+                            "size=999 «{}» (id={}): has_more={}, dur={}min",
+                            card.title, card.id, more_after, dur_min,
+                        )
+                    else:
+                        dur_min = sched.remaining_minutes()
+                        logger.debug(
+                            "size=999 «{}» (id={}): last in block, dur={}min",
+                            card.title, card.id, dur_min,
+                        )
+                elif card.size is None:
+                    dur_min = round(_DEFAULT_HOURS * 60)
+                else:
+                    dur_min = max(1, round(card.size * 60))
+
+                if dur_min == 0:
+                    logger.info(
+                        "overflow (block full): «{}» (id={}) step={}",
+                        card.title, card.id, step_idx,
+                    )
+                    overflow.append(card)
+                    continue
+
+                # Выбираем метод размещения по тегу «не дробить»
+                card_tag_names = {t.name for t in card.tags}
+                place_fn = (
+                    sched.try_place_atomic
+                    if "не дробить" in card_tag_names
+                    else sched.try_place_segmented
+                )
+                segments = place_fn(dur_min)
+
+                if segments is None:
+                    logger.info(
+                        "overflow (no free time): «{}» (id={}) step={}",
+                        card.title, card.id, step_idx,
+                    )
+                    overflow.append(card)
+                    continue
+
+                # Записываем сегменты в виде строк "HH:MM"
+                str_segs = [(_fmt_min(s), _fmt_min(e)) for s, e in segments]
+                self.last_segments[card.id] = str_segs
+                logger.info(
+                    "placed: «{}» (id={}) step={} segs={}",
+                    card.title, card.id, step_idx,
+                    " ".join(f"{s}–{e}" for s, e in str_segs),
+                )
+
+                # event_time = начало первого сегмента
+                h, m  = divmod(segments[0][0], 60)
+                ev_dt = datetime(today.year, today.month, today.day, h, m, tzinfo=_TZ_MSK)
+                await self._set_event_time(card, ev_dt)
+                await self._move(card, today_col_id, section, preloaded)
+
+        return overflow
 
     # ── Фазы 0–4: расписание для одного дня ─────────────────────────────────
 
@@ -285,11 +495,10 @@ class MorningLogic:
         """Размещает кандидатов в сегодняшней колонке по алгоритму фаз 0–4.
 
         Заполняет self.last_segments: {card_id: [("HH:MM", "HH:MM"), ...]}.
+        Заполняет self.last_overflow: [{title, target, risky}, ...].
         Возвращает свежие карточки сегодняшней колонки из API.
         """
         today_col_id  = self._logic.column_ids[WEEKDAY_COLUMNS[today.weekday()]]
-        tomorrow      = today + timedelta(days=1)
-        day_after     = today + timedelta(days=2)
 
         # Единый рабочий блок 09:00–19:00 (Утро и День — ярлыки приоритета, не окна)
         work_sched    = _BlockScheduler(_WORK_START,    _WORK_END)
@@ -373,6 +582,16 @@ class MorningLogic:
             await self._move(card, today_col_id, section, preloaded)
             self.last_segments[card.id] = [(_fmt_min(start_min), _fmt_min(end_min))]
 
+            # Помечаем жёсткое событие тегом, чтобы replan() мог его отличить
+            # от «мягких» авторазмещённых карточек
+            try:
+                await self._client.add_tag_by_name(card.id, "жёсткое событие")
+            except Exception as exc:
+                logger.warning(
+                    "phase1: не удалось добавить тег «жёсткое событие» id={} — {}",
+                    card.id, exc,
+                )
+
         # ── Фаза 1б: карточки с событием в будущей дате → в нужную колонку ───
         this_week_sun = today + timedelta(days=6 - today.weekday())  # воскресенье этой недели
         future_candidates: list[Card] = []
@@ -409,28 +628,8 @@ class MorningLogic:
             len(phase1), len(remaining),
         )
 
-        # ── Фаза 2: 9 групп приоритета ────────────────────────────────────────
-        #
-        # → Утро (не «вечерняя»):
-        #   0. Критическое + deadline сегодня, size ASC
-        #   1. Важное     + deadline сегодня, size ASC
-        # → День (не «вечерняя»):
-        #   2. Критическое + deadline завтра/послезавтра
-        #   3. Важное      + deadline завтра/послезавтра
-        #   4. Среднее     + deadline сегодня или завтра/послезавтра
-        #   5. Все остальные без тега «вечерняя», size не 999
-        #   (6 — см. ниже: size 999 вынесен в конец обработки)
-        # → Вечер (тег «вечерняя»):
-        #   6. Критическое + deadline сегодня, size ASC
-        #   7. Важное      + deadline сегодня, size ASC
-        #   8. Все остальные с тегом «вечерняя»
-        #
-        # Карточки size=999 без тега «вечерняя» собираются отдельно и
-        # обрабатываются ПОСЛЕДНИМИ в рабочем блоке (после групп 0–5),
-        # чтобы корректно вычислить сколько времени у них осталось.
-
-        groups: list[list[Card]] = [[] for _ in range(9)]
-        work_999: list[Card] = []   # size=999, не вечерняя — обрабатываются после групп 0–5
+        # ── Фазы 2–3: классификация и размещение ─────────────────────────────
+        groups, work_999 = self._classify_groups(remaining, today)
 
         # (sched, секция на доске)
         group_sched_section: list[tuple[_BlockScheduler, str]] = [
@@ -445,45 +644,6 @@ class MorningLogic:
             (evening_sched, "Вечер"),  # 8: вечерняя — остальные
         ]
 
-        for card in remaining:
-            tags   = set(card.tag_ids)
-            is_eve = _TAG_EVENING in tags
-            imp    = card.importance   # None / "среднее" / "важное" / "критическое"
-
-            dd_parsed = card.due_date_parsed
-            dl_date   = dd_parsed.date() if dd_parsed else None
-            today_dl  = (dl_date == today)               if dl_date else False
-            soon_dl   = (dl_date in (tomorrow, day_after)) if dl_date else False
-
-            if not is_eve:
-                if card.size == 999:
-                    # size=999 без тега «вечерняя» — откладываем на самый конец
-                    # рабочего блока, чтобы занять только оставшееся время
-                    work_999.append(card)
-                elif imp == "критическое" and today_dl:  groups[0].append(card)
-                elif imp == "важное"       and today_dl:  groups[1].append(card)
-                elif imp == "критическое" and soon_dl:   groups[2].append(card)
-                elif imp == "важное"       and soon_dl:   groups[3].append(card)
-                elif imp == "среднее"      and soon_dl:   groups[4].append(card)
-                else:                                      groups[5].append(card)
-            else:
-                if   imp == "критическое" and today_dl:  groups[6].append(card)
-                elif imp == "важное"       and today_dl:  groups[7].append(card)
-                else:                                      groups[8].append(card)
-
-        # Группы 0, 1, 6, 7 — сортировка по size ASC (сначала быстрые)
-        for i in (0, 1, 6, 7):
-            groups[i].sort(key=lambda c: c.size if (c.size and c.size != 999) else 0)
-
-        logger.debug(
-            "_schedule_today: groups = {} work_999={}",
-            [len(g) for g in groups], len(work_999),
-        )
-
-        # ── Фаза 3: сегментированное назначение времени и перемещение ────────
-        overflow: list[Card] = []
-
-        # Обрабатываем группы 0–8, затем work_999 отдельно в конце
         processing_order: list[tuple[list[Card], _BlockScheduler, str]] = []
         for g_idx, group_cards in enumerate(groups):
             sched, section = group_sched_section[g_idx]
@@ -491,80 +651,9 @@ class MorningLogic:
         # work_999 — последними в рабочем блоке
         processing_order.append((work_999, work_sched, "День"))
 
-        # Для вычисления has_more при size=999: считаем сколько задач
-        # ещё будет обработано в том же блоке (work_sched или evening_sched)
-        # после текущей позиции в processing_order.
-        def _count_remaining_in_sched(
-            from_step: int,
-            from_card_idx: int,
-            target_sched: _BlockScheduler,
-        ) -> int:
-            """Количество карточек, которые будут обработаны в target_sched
-            после текущей позиции (from_step, from_card_idx)."""
-            count = 0
-            for step_idx, (step_cards, step_sched, _) in enumerate(processing_order):
-                if step_sched is not target_sched:
-                    continue
-                start_ci = from_card_idx + 1 if step_idx == from_step else 0
-                count += len(step_cards) - start_ci
-            return count
-
-        for step_idx, (group_cards, sched, section) in enumerate(processing_order):
-            for card_idx, card in enumerate(group_cards):
-                # Вычисляем нужную длительность
-                if card.size == 999:
-                    # size=999: 1 час если в блоке ещё есть задачи,
-                    # иначе занять всё оставшееся свободное время.
-                    more_after = _count_remaining_in_sched(step_idx, card_idx, sched)
-                    if more_after > 0:
-                        dur_min = _SIZE_999_DEFAULT_MIN
-                        logger.debug(
-                            "size=999 «{}» (id={}): has_more={}, dur={}min",
-                            card.title, card.id, more_after, dur_min,
-                        )
-                    else:
-                        dur_min = sched.remaining_minutes()
-                        logger.debug(
-                            "size=999 «{}» (id={}): last in block, dur={}min",
-                            card.title, card.id, dur_min,
-                        )
-                elif card.size is None:
-                    dur_min = round(_DEFAULT_HOURS * 60)
-                else:
-                    dur_min = max(1, round(card.size * 60))
-
-                if dur_min == 0:
-                    logger.info(
-                        "overflow (block full): «{}» (id={}) step={}",
-                        card.title, card.id, step_idx,
-                    )
-                    overflow.append(card)
-                    continue
-
-                # Сегментированное размещение: задача огибает фиксированные события
-                segments = sched.try_place_segmented(dur_min)
-                if segments is None:
-                    logger.info(
-                        "overflow (no free time): «{}» (id={}) step={}",
-                        card.title, card.id, step_idx,
-                    )
-                    overflow.append(card)
-                    continue
-
-                # Записываем сегменты в виде строк "HH:MM"
-                str_segs = [(_fmt_min(s), _fmt_min(e)) for s, e in segments]
-                self.last_segments[card.id] = str_segs
-                logger.info(
-                    "placed: «{}» (id={}) step={} segs={}",
-                    card.title, card.id, step_idx,
-                    " ".join(f"{s}–{e}" for s, e in str_segs),
-                )
-
-                # event_time = начало первого сегмента
-                h, m  = divmod(segments[0][0], 60)
-                ev_dt = datetime(today.year, today.month, today.day, h, m, tzinfo=_TZ_MSK)
-                await self._set_event_time(card, ev_dt)
-                await self._move(card, today_col_id, section, preloaded)
+        overflow = await self._place_groups(
+            processing_order, today, today_col_id, preloaded
+        )
 
         # ── Фаза 4: переполнение ──────────────────────────────────────────────
         if overflow:
@@ -590,19 +679,26 @@ class MorningLogic:
 
         После воскресенья (weekday=6) → «Следующая неделя».
         Карточки с тегом «вечерняя» попадают в секцию «Вечер», остальные — «Утро».
+        Карточки с тегом «рабочая» не попадают в выходные — идут в «Следующая неделя».
         Следующее утро само запланирует их по алгоритму фаз 0–4.
+        Обновляет self.last_overflow записями {title, target, risky}.
         """
         next_week_col = self._logic.column_ids["Следующая неделя"]
-        next_day = from_date + timedelta(days=1)
-
-        if next_day.weekday() == 0:
-            # Следующий день был бы понедельником следующей недели
-            target_col = next_week_col
-        else:
-            target_col = self._logic.column_ids[WEEKDAY_COLUMNS[next_day.weekday()]]
 
         for card in cards:
             try:
+                next_day = from_date + timedelta(days=1)
+                card_tag_names = {t.name for t in card.tags}
+
+                if next_day.weekday() == 0:
+                    # Следующий день был бы понедельником следующей недели
+                    target_col = next_week_col
+                elif next_day.weekday() >= 5 and "рабочая" in card_tag_names:
+                    # Рабочая карточка не должна попасть в выходной
+                    target_col = next_week_col
+                else:
+                    target_col = self._logic.column_ids[WEEKDAY_COLUMNS[next_day.weekday()]]
+
                 section = "Вечер" if _TAG_EVENING in card.tag_ids else "Утро"
                 so     = await self._logic.get_section_sort_order(target_col, section)
                 result = await self._client.move_card(card.id, target_col, so)
@@ -613,14 +709,178 @@ class MorningLogic:
                     card.column_id = target_col
                     card.sort_order = so
                     preloaded.setdefault(target_col, []).append(card)
+
+                    # Отслеживаем overflow для отчёта пользователю
+                    dd_parsed = card.due_date_parsed
+                    dl_date   = dd_parsed.date() if dd_parsed else None
+                    risky = (
+                        card.importance == "критическое"
+                        and dl_date is not None
+                        and dl_date in (from_date, from_date + timedelta(days=1))
+                    )
+                    target_name = self._logic.column_name_by_id.get(
+                        target_col, str(target_col)
+                    )
+                    self.last_overflow.append({
+                        "title":  card.title,
+                        "target": f"{target_name} / {section}",
+                        "risky":  risky,
+                    })
+
                     logger.info(
-                        "overflow → col={} sec={}: «{}» (id={})",
+                        "overflow → col={} sec={}: «{}» (id={}){}",
                         target_col, section, card.title, card.id,
+                        " [RISKY]" if risky else "",
                     )
                 else:
                     logger.error("overflow FAIL: id={} «{}»", card.id, card.title)
             except Exception as exc:
                 logger.error("overflow ERROR: id={} — {}", card.id, exc)
+
+    # ── Пересборка расписания в течение дня ──────────────────────────────────
+
+    async def replan(self, now: datetime) -> list[Card]:
+        """Пересобирает расписание от текущего момента.
+
+        Не трогает прошедшие/идущие задачи и жёсткие встречи (тег «жёсткое событие»),
+        только «мягкие» авторазмещённые карточки.
+        Сбрасывает и заполняет self.last_segments, self.last_overflow.
+        Возвращает обновлённые карточки сегодняшней колонки.
+        """
+        today = now.date()
+        today_col_id = self._logic.column_ids[WEEKDAY_COLUMNS[today.weekday()]]
+
+        self.last_segments = {}
+        self.last_overflow = []
+
+        try:
+            cards = await self._client.get_cards(today_col_id)
+        except Exception as exc:
+            logger.error("replan: не удалось загрузить колонку — {}", exc)
+            return []
+
+        sorted_cards = _sorted_by_order(cards)
+        preloaded = {today_col_id: cards}
+
+        # Разбиваем карточки на группы:
+        #   control       — секция «На контроле» (не трогаем)
+        #   past_or_running — прошедшие/идущие задачи (event_time <= now)
+        #   hard_future   — будущие жёсткие встречи (тег «жёсткое событие», event_time > now)
+        #   candidates    — остальные: мягкие задачи без прошедшего времени
+        control: list[Card]        = []
+        past_or_running: list[Card] = []
+        hard_future: list[Card]    = []
+        candidates: list[Card]     = []
+
+        for card in sorted_cards:
+            if card.blocked or card.archived:
+                continue
+            section = _get_card_section(sorted_cards, card)
+            if section == "На контроле":
+                control.append(card)
+                continue
+
+            et = card.event_time
+            et_local = (
+                et.astimezone(_TZ_MSK) if (et and et.tzinfo)
+                else (et.replace(tzinfo=_TZ_MSK) if et else None)
+            )
+            tag_names = {t.name for t in card.tags}
+            is_hard = "жёсткое событие" in tag_names
+
+            if et_local is not None and et_local <= now:
+                past_or_running.append(card)
+            elif et_local is not None and et_local > now and is_hard:
+                hard_future.append(card)
+            else:
+                candidates.append(card)
+
+        logger.info(
+            "replan: control={} past={} hard_future={} candidates={}",
+            len(control), len(past_or_running), len(hard_future), len(candidates),
+        )
+
+        # Курсор — текущий момент, округлённый вверх до 5 минут, не раньше начала блока
+        minutes_now = now.hour * 60 + now.minute
+        cursor = ((minutes_now + 4) // 5) * 5
+        work_start = max(cursor, _WORK_START)
+
+        work_sched = (
+            _BlockScheduler(work_start, _WORK_END)
+            if work_start < _WORK_END
+            else None
+        )
+        evening_start = max(cursor, _EVENING_START)
+        evening_sched = (
+            _BlockScheduler(evening_start, _EVENING_END)
+            if evening_start < _EVENING_END
+            else None
+        )
+
+        # Резервируем слоты жёстких будущих карточек (чтобы мягкие их огибали)
+        for card in hard_future:
+            et = card.event_time
+            et_local = (
+                et.astimezone(_TZ_MSK) if et.tzinfo
+                else et.replace(tzinfo=_TZ_MSK)
+            )
+            start_min = et_local.hour * 60 + et_local.minute
+            size_h    = card.size if (card.size and card.size != 999) else _DEFAULT_HOURS
+            end_min   = start_min + round(size_h * 60)
+            target_sched = work_sched if et_local.hour < 19 else evening_sched
+            if target_sched is not None:
+                target_sched.reserve(start_min, end_min)
+
+        if work_sched is None and evening_sched is None:
+            # Уже позже 22:00 — все кандидаты сразу в overflow
+            logger.info("replan: время блоков истекло, все кандидаты в overflow")
+            await self._handle_overflow(candidates, today, preloaded)
+            try:
+                return await self._client.get_cards(today_col_id)
+            except Exception as exc:
+                logger.error("replan: не удалось загрузить итог — {}", exc)
+                return []
+
+        groups, work_999 = self._classify_groups(candidates, today)
+
+        group_sched_section: list[tuple[_BlockScheduler | None, str]] = [
+            (work_sched,    "Утро"),   # 0
+            (work_sched,    "Утро"),   # 1
+            (work_sched,    "День"),   # 2
+            (work_sched,    "День"),   # 3
+            (work_sched,    "День"),   # 4
+            (work_sched,    "День"),   # 5
+            (evening_sched, "Вечер"),  # 6
+            (evening_sched, "Вечер"),  # 7
+            (evening_sched, "Вечер"),  # 8
+        ]
+
+        processing_order: list[tuple[list[Card], _BlockScheduler, str]] = []
+        for i in range(9):
+            sched, section = group_sched_section[i]
+            if sched is None:
+                # Блок недоступен — сразу overflow
+                if groups[i]:
+                    await self._handle_overflow(groups[i], today, preloaded)
+                continue
+            processing_order.append((groups[i], sched, section))
+
+        if work_sched is not None:
+            processing_order.append((work_999, work_sched, "День"))
+        elif work_999:
+            await self._handle_overflow(work_999, today, preloaded)
+
+        overflow = await self._place_groups(
+            processing_order, today, today_col_id, preloaded
+        )
+        if overflow:
+            await self._handle_overflow(overflow, today, preloaded)
+
+        try:
+            return await self._client.get_cards(today_col_id)
+        except Exception as exc:
+            logger.error("replan: не удалось загрузить итог — {}", exc)
+            return []
 
     # ── Обычный день (вт–вс) ─────────────────────────────────────────────────
 

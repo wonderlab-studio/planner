@@ -96,6 +96,7 @@ class Card:
     archived: bool = False
     state: int = 1
     updated_at: str | None = None
+    last_moved_at: str | None = None
 
     # ── Computed properties ───────────────────────────────────────────────────
 
@@ -147,6 +148,19 @@ class Card:
             return None
 
     @property
+    def last_moved_at_parsed(self) -> datetime | None:
+        """Парсит last_moved_at (дата перемещения между колонками) → datetime (aware, UTC+3).
+        Fallback на updated_at, если last_moved_at отсутствует в ответе API."""
+        raw = self.last_moved_at or self.updated_at
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return dt.astimezone(TZ_MSK)
+        except (ValueError, TypeError):
+            return None
+
+    @property
     def due_date_parsed(self) -> datetime | None:
         """Парсит поле due_date → datetime (aware, UTC+3) или None."""
         if not self.due_date:
@@ -172,8 +186,35 @@ def _parse_tag(data: dict) -> Tag:
     return Tag(id=data["id"], name=data.get("name", ""))
 
 
-def _parse_card(data: dict) -> Card:
+def _parse_card(data: dict, field_ids: dict[str, str] | None = None) -> Card:
+    """Парсит сырой dict карточки из Kaiten API в объект Card.
+
+    Параметр field_ids — маппинг канонических ключей ("event", "importance", "weekday")
+    на реальные ключи свойств в Kaiten-аккаунте (напр. "id_590358").
+    Если реальный ключ отличается от канонического — значение копируется под канонический
+    ключ в properties, чтобы Card.event_time / .importance / .weekday продолжали работать
+    независимо от реальных ID полей в конкретном Kaiten-аккаунте.
+    """
     tags_raw = data.get("tags") or []
+
+    # Нормализуем properties под канонические ключи, если field_ids нестандартные
+    props = data.get("properties") or {}
+    if field_ids:
+        _canonical = {
+            "event":      "id_590358",
+            "importance": "id_590382",
+            "weekday":    "id_590359",
+        }
+        needs_remap = any(
+            field_ids.get(k, v) != v for k, v in _canonical.items()
+        )
+        if needs_remap:
+            props = dict(props)
+            for key, canonical in _canonical.items():
+                actual = field_ids.get(key, canonical)
+                if actual != canonical and actual in props:
+                    props[canonical] = props[actual]
+
     return Card(
         id=data["id"],
         title=data.get("title", ""),
@@ -186,10 +227,11 @@ def _parse_card(data: dict) -> Card:
         due_date=data.get("due_date"),
         tag_ids=data.get("tag_ids") or [],
         tags=[_parse_tag(t) for t in tags_raw if isinstance(t, dict)],
-        properties=data.get("properties") or {},
+        properties=props,
         archived=bool(data.get("archived", False)),
         state=data.get("state", 1),
         updated_at=data.get("updated_at"),
+        last_moved_at=data.get("last_moved_at"),
     )
 
 
@@ -204,6 +246,10 @@ class KaitenClient:
         lane_id: int,
         token: str | None = None,
         base_url: str | None = None,
+        tag_ids: dict[str, int] | None = None,
+        importance_options: dict[str, int] | None = None,
+        weekday_options: dict[str, int] | None = None,
+        field_ids: dict[str, str] | None = None,
     ) -> None:
         self._board_id = board_id
         self._lane_id = lane_id
@@ -215,6 +261,17 @@ class KaitenClient:
         if not self._base_url:
             logger.error("KaitenClient: KAITEN_BASE_URL не задан для board_id={}", board_id)
             raise RuntimeError("KAITEN_BASE_URL не задан")
+        # Параметризованные маппинги (поддержка мульти-аккаунта)
+        self._tag_ids = tag_ids or dict(TAG_IDS)
+        self._importance_options = importance_options or dict(IMPORTANCE_OPTIONS)
+        self._importance_by_id = {v: k for k, v in self._importance_options.items()}
+        self._weekday_options = weekday_options or dict(WEEKDAY_OPTIONS)
+        self._weekday_by_id = {v: k for k, v in self._weekday_options.items()}
+        self._field_ids = field_ids or {
+            "event":      "id_590358",
+            "importance": "id_590382",
+            "weekday":    "id_590359",
+        }
         self._client = httpx.AsyncClient(
             base_url=self._base_url,
             headers={
@@ -233,7 +290,7 @@ class KaitenClient:
     async def __aexit__(self, *_: Any) -> None:
         await self.close()
 
-    # ── Внутренний хелпер ─────────────────────────────────────────────────────
+    # ── Внутренние хелперы ────────────────────────────────────────────────────
 
     async def _request(
         self,
@@ -262,7 +319,38 @@ class KaitenClient:
             logger.exception("Kaiten API unexpected error: {} {} | {}", method, url, e)
             return None
 
+    def _to_card(self, data: dict) -> Card:
+        """Парсит dict карточки в Card, применяя field_ids этого инстанса."""
+        return _parse_card(data, self._field_ids)
+
     # ── Публичные методы ──────────────────────────────────────────────────────
+
+    def tag_id(self, name: str) -> int | None:
+        """Возвращает ID тега по имени для этого Kaiten-аккаунта или None."""
+        return self._tag_ids.get(name)
+
+    def event_time_property(self, dt: datetime) -> dict:
+        """Возвращает {field_key: {...}} готовое для update_card(properties=...).
+
+        dt — aware datetime (например, datetime.now(TZ_MSK)).
+        Использует реальный ключ поля из self._field_ids["event"].
+        """
+        return {self._field_ids["event"]: {
+            "date": dt.strftime("%Y-%m-%d"),
+            "time": dt.strftime("%H:%M:%S"),
+            "tzOffset": 180,
+        }}
+
+    def importance_property(self, name: str) -> dict | None:
+        """Возвращает {field_key: [option_id]} для записи поля важности.
+
+        name — 'среднее' | 'важное' | 'критическое'.
+        Возвращает None если имя не найдено в importance_options.
+        """
+        opt_id = self._importance_options.get(name)
+        if opt_id is None:
+            return None
+        return {self._field_ids["importance"]: [opt_id]}
 
     async def get_columns(self) -> list[Column]:
         """GET /boards/{board_id}/columns → список колонок доски."""
@@ -294,7 +382,7 @@ class KaitenClient:
                     "get_cards: неожиданный ответ для col_id={}: {}", column_id, data
                 )
                 break
-            all_cards.extend(_parse_card(c) for c in data)
+            all_cards.extend(self._to_card(c) for c in data)
             if len(data) < limit:
                 break
             offset += limit
@@ -307,7 +395,7 @@ class KaitenClient:
         if not data or not isinstance(data, dict):
             logger.warning("get_card: карточка id={} не найдена", card_id)
             return None
-        return _parse_card(data)
+        return self._to_card(data)
 
     async def create_card(
         self,
@@ -345,7 +433,7 @@ class KaitenClient:
         if not data or not isinstance(data, dict):
             logger.error("create_card: не удалось создать карточку «{}»", title)
             return None
-        card = _parse_card(data)
+        card = self._to_card(data)
         logger.info("create_card: создана «{}» id={}", title, card.id)
         return card
 
@@ -362,7 +450,7 @@ class KaitenClient:
             )
             return None
         logger.debug("move_card: id={} → col={} so={:.4f}", card_id, column_id, sort_order)
-        return _parse_card(data)
+        return self._to_card(data)
 
     async def update_card(self, card_id: int, **fields) -> Card | None:
         """PATCH /cards/{card_id} → обновляет произвольные поля карточки."""
@@ -371,7 +459,7 @@ class KaitenClient:
             logger.error("update_card: не удалось обновить id={} fields={}", card_id, fields)
             return None
         logger.debug("update_card: id={} fields={}", card_id, list(fields.keys()))
-        return _parse_card(data)
+        return self._to_card(data)
 
     async def archive_card(
         self, card_id: int, archive_column_id: int, comment: str | None = None

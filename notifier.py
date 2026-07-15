@@ -12,11 +12,15 @@ chat_id передаётся явно при создании экземпляр
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from typing import Any
 
 import httpx
 from dotenv import load_dotenv
 from loguru import logger
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+from kaiten_client import TZ_MSK
 
 load_dotenv()
 
@@ -69,10 +73,10 @@ class Notifier:
         self._token = _TELEGRAM_TOKEN
         self._api_url = f"{_TELEGRAM_API_BASE}/bot{self._token}/sendMessage"
 
-    # ── Внутренний хелпер ─────────────────────────────────────────────────────
+    # ── Внутренние хелперы ────────────────────────────────────────────────────
 
-    async def _post(self, text: str, parse_mode: str | None = "Markdown") -> bool:
-        """Отправляет одно сообщение. Возвращает True при успехе.
+    async def _post(self, text: str, parse_mode: str | None = "Markdown") -> int | None:
+        """Отправляет одно сообщение. Возвращает message_id при успехе, None при ошибке.
 
         При ошибке парсинга Markdown автоматически повторяет без форматирования.
         """
@@ -88,7 +92,7 @@ class Notifier:
                 resp = await client.post(self._api_url, json=payload)
 
                 if resp.status_code == 200:
-                    return True
+                    return resp.json()["result"]["message_id"]
 
                 # Telegram вернул ошибку — логируем детали
                 body = resp.json() if resp.content else {}
@@ -107,14 +111,47 @@ class Notifier:
                     "Notifier._post: Telegram API error {} — {}",
                     error_code, description,
                 )
-                return False
+                return None
 
         except httpx.TimeoutException:
             logger.error("Notifier._post: таймаут при отправке сообщения")
-            return False
+            return None
         except Exception as exc:
             logger.exception("Notifier._post: неожиданная ошибка — {}", exc)
-            return False
+            return None
+
+    async def _pin(self, message_id: int) -> None:
+        """Закрепляет сообщение в чате (без уведомления)."""
+        url = f"{_TELEGRAM_API_BASE}/bot{self._token}/pinChatMessage"
+        payload = {
+            "chat_id": self._chat_id,
+            "message_id": message_id,
+            "disable_notification": True,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=_SEND_MESSAGE_TIMEOUT) as client:
+                resp = await client.post(url, json=payload)
+                if resp.status_code != 200:
+                    logger.warning(
+                        "Notifier._pin: HTTP {} — {}", resp.status_code, resp.text[:200]
+                    )
+        except Exception as exc:
+            logger.warning("Notifier._pin: ошибка — {}", exc)
+
+    async def _unpin_all(self) -> None:
+        """Откепляет все закреплённые сообщения в чате."""
+        url = f"{_TELEGRAM_API_BASE}/bot{self._token}/unpinAllChatMessages"
+        payload = {"chat_id": self._chat_id}
+        try:
+            async with httpx.AsyncClient(timeout=_SEND_MESSAGE_TIMEOUT) as client:
+                resp = await client.post(url, json=payload)
+                if resp.status_code != 200:
+                    logger.warning(
+                        "Notifier._unpin_all: HTTP {} — {}",
+                        resp.status_code, resp.text[:200],
+                    )
+        except Exception as exc:
+            logger.warning("Notifier._unpin_all: ошибка — {}", exc)
 
     # ── Публичные методы ──────────────────────────────────────────────────────
 
@@ -126,8 +163,8 @@ class Notifier:
 
         parts = _split_text(text)
         for i, part in enumerate(parts, start=1):
-            ok = await self._post(part)
-            if ok:
+            message_id = await self._post(part)
+            if message_id:
                 logger.info(
                     "Notifier.send: часть {}/{} отправлена ({} символов)",
                     i, len(parts), len(part),
@@ -136,6 +173,82 @@ class Notifier:
                 logger.error(
                     "Notifier.send: не удалось отправить часть {}/{}", i, len(parts)
                 )
+
+    async def send_and_pin(self, text: str) -> None:
+        """Отправляет текст (с разбивкой если >4096 символов), затем откепляет все
+        ранее закреплённые сообщения и закрепляет последнее отправленное.
+
+        Ошибки pin/unpin не критичны — не бросает исключения.
+        """
+        if not text:
+            logger.warning("Notifier.send_and_pin: передан пустой текст, пропускаем")
+            return
+        parts = _split_text(text)
+        last_message_id: int | None = None
+        for i, part in enumerate(parts, start=1):
+            message_id = await self._post(part)
+            if message_id is not None:
+                last_message_id = message_id
+                logger.info(
+                    "Notifier.send_and_pin: часть {}/{} отправлена (id={})",
+                    i, len(parts), message_id,
+                )
+            else:
+                logger.error(
+                    "Notifier.send_and_pin: не удалось отправить часть {}/{}", i, len(parts)
+                )
+        if last_message_id is not None:
+            await self._unpin_all()
+            await self._pin(last_message_id)
+
+    async def send_card_buttons(self, cards: list) -> None:
+        """Отправляет сообщение с InlineKeyboard из карточек (первая страница, до 20 кнопок).
+
+        Карточки сортируются по event_time: с временем впереди по возрастанию, без времени — в конец.
+        cards — list[Card] из kaiten_client.
+        """
+        task_cards = [c for c in cards if not c.blocked and not c.archived]
+        if not task_cards:
+            return
+        task_cards.sort(
+            key=lambda c: (
+                c.event_time is None,
+                c.event_time or datetime.min.replace(tzinfo=TZ_MSK),
+            )
+        )
+        max_buttons = 20
+        btn_title_len = 40
+        shown = task_cards[:max_buttons]
+        keyboard = [
+            [InlineKeyboardButton(
+                text=c.title[:btn_title_len] + ("…" if len(c.title) > btn_title_len else ""),
+                callback_data=f"card:{c.id}",
+            )]
+            for c in shown
+        ]
+        markup = InlineKeyboardMarkup(keyboard)
+        suffix = (
+            f" (первые {max_buttons} из {len(task_cards)}, напиши «утро» для остальных)"
+            if len(task_cards) > max_buttons else ""
+        )
+        text = f"📋 *Карточки на сегодня*{suffix}:"
+        url = f"{_TELEGRAM_API_BASE}/bot{self._token}/sendMessage"
+        payload = {
+            "chat_id": self._chat_id,
+            "text": text,
+            "parse_mode": "Markdown",
+            "reply_markup": markup.to_dict(),
+        }
+        try:
+            async with httpx.AsyncClient(timeout=_SEND_MESSAGE_TIMEOUT) as client:
+                resp = await client.post(url, json=payload)
+                if resp.status_code != 200:
+                    logger.error(
+                        "Notifier.send_card_buttons: HTTP {} — {}",
+                        resp.status_code, resp.text[:200],
+                    )
+        except Exception as exc:
+            logger.exception("Notifier.send_card_buttons: ошибка — {}", exc)
 
     async def send_morning_plan(self, plan_text: str) -> None:
         """Отправляет утренний план дня.
