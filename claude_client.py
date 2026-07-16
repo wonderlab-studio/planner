@@ -76,7 +76,7 @@ def _format_card(card: dict) -> str:
 
     if card.get("due_date"):
         parts.append(f"  дедлайн: {card['due_date']}")
-    if card.get("size"):
+    if card.get("size") and card["size"] != 999:
         parts.append(f"  ~{card['size']} ч")
     if card.get("description"):
         desc = card["description"][:120]

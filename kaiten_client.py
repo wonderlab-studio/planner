@@ -524,6 +524,7 @@ class KaitenClient:
             body["description"] = description
         if size is not None:
             body["size"] = size
+            body["size_text"] = str(size)
         if due_date is not None:
             body["due_date"] = due_date
         if sort_order is not None:
@@ -557,7 +558,14 @@ class KaitenClient:
         return self._to_card(data)
 
     async def update_card(self, card_id: int, **fields) -> Card | None:
-        """PATCH /cards/{card_id} → обновляет произвольные поля карточки."""
+        """PATCH /cards/{card_id} → обновляет произвольные поля карточки.
+
+        Если среди полей передан `size` без явного `size_text` — автоматически
+        добавляет `size_text` (строковое представление), т.к. Kaiten хранит/отображает
+        размер через size_text, а не только через числовое size.
+        """
+        if "size" in fields and "size_text" not in fields:
+            fields = {**fields, "size_text": str(fields["size"])}
         data = await self._request("PATCH", f"/cards/{card_id}", json=fields)
         if not data or not isinstance(data, dict):
             logger.error("update_card: не удалось обновить id={} fields={}", card_id, fields)

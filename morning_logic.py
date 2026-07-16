@@ -750,9 +750,6 @@ class MorningLogic:
         today = now.date()
         today_col_id = self._logic.column_ids[WEEKDAY_COLUMNS[today.weekday()]]
 
-        self.last_segments = {}
-        self.last_overflow = []
-
         try:
             cards = await self._client.get_cards(today_col_id)
         except Exception as exc:
@@ -800,6 +797,19 @@ class MorningLogic:
             len(control), len(past_or_running), len(hard_future), len(candidates),
         )
 
+        # Сохраняем сегменты только для карточек, которые пересборка НЕ трогает —
+        # для них event_time/size не меняются, но исходная (возможно сегментированная)
+        # раскладка времени из утреннего прогона должна остаться видна в отчёте.
+        _keep_ids = (
+            {c.id for c in control}
+            | {c.id for c in past_or_running}
+            | {c.id for c in hard_future}
+        )
+        self.last_segments = {
+            cid: segs for cid, segs in self.last_segments.items() if cid in _keep_ids
+        }
+        self.last_overflow = []
+
         # Курсор — текущий момент, округлённый вверх до 5 минут, не раньше начала блока
         minutes_now = now.hour * 60 + now.minute
         cursor = ((minutes_now + 4) // 5) * 5
@@ -829,6 +839,31 @@ class MorningLogic:
             end_min   = start_min + round(size_h * 60)
             target_sched = work_sched if et_local.hour < 19 else evening_sched
             if target_sched is not None:
+                target_sched.reserve(start_min, end_min)
+
+        # Резервируем слоты уже идущих/прошедших задач (чтобы мягкие не накладывались).
+        # Используем сохранённые сегменты из утреннего прогона (если были фрагментированы),
+        # иначе — весь блок event_time..event_time+size как единый интервал.
+        for card in past_or_running:
+            et = card.event_time
+            et_local = (
+                et.astimezone(_TZ_MSK) if et.tzinfo
+                else et.replace(tzinfo=_TZ_MSK)
+            )
+            target_sched = work_sched if et_local.hour < 19 else evening_sched
+            if target_sched is None:
+                continue
+            saved_segs = self.last_segments.get(card.id)
+            if saved_segs:
+                # Используем реальные (возможно фрагментированные) интервалы из утреннего прогона
+                for start_str, end_str in saved_segs:
+                    sh, sm = int(start_str[:2]), int(start_str[3:5])
+                    eh, em = int(end_str[:2]), int(end_str[3:5])
+                    target_sched.reserve(sh * 60 + sm, eh * 60 + em)
+            else:
+                start_min = et_local.hour * 60 + et_local.minute
+                size_h = card.size if (card.size and card.size != 999) else _DEFAULT_HOURS
+                end_min = start_min + round(size_h * 60)
                 target_sched.reserve(start_min, end_min)
 
         if work_sched is None and evening_sched is None:

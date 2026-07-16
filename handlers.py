@@ -44,7 +44,8 @@ AWAITING_HOURS       = 2  # ждём число часов для «Продол
 AWAITING_MOVE_TARGET = 3  # ждём куда перенести
 AWAITING_QUESTION    = 4  # ждём вопрос для кнопки «Совет»
 AWAITING_REMINDER_TIME = 5  # ждём дату/время для кнопки «Напоминалка»
-CONFIRM_RISKY_MOVE   = 6  # ждём подтверждения переноса критической задачи с близким дедлайном
+# CONFIRM_RISKY_MOVE = 6 — не используется как состояние диалога;
+# confirm_move_cb/confirm_cancel_cb зарегистрированы как top-level хендлеры
 
 # ── Фильтр «известные команды» — чтобы они не попадали в состояния диалога ────
 
@@ -196,6 +197,18 @@ def _strip_command_prefix(text: str, *prefixes: str) -> str:
     return text.strip()
 
 
+def _is_control_section(sorted_cards: list[Card], target: Card) -> bool:
+    """Определяет, находится ли target в секции «На контроле» — по позиции
+    относительно разделителей (blocked=True) в списке, отсортированном по sort_order."""
+    current: str | None = None
+    for card in sorted_cards:
+        if card.blocked:
+            current = card.block_reason
+        elif card.id == target.id:
+            return current == "На контроле"
+    return False
+
+
 async def _load_active_cards(user_ctx: UserHandlerCtx) -> list[dict]:
     """Загружает карточки из всех активных колонок (дни недели + спец-колонки).
 
@@ -238,19 +251,22 @@ async def send_card_buttons(
 ) -> None:
     """Отправляет страницу InlineKeyboard из карточек сегодняшнего дня.
 
-    Карточки сортируются по event_time: сначала задачи с временем (по возрастанию),
-    затем задачи без времени. Пагинация: MAX_CARD_BUTTONS кнопок на страницу.
+    Карточки сортируются: «На контроле» — всегда в конец, затем по event_time.
+    Пагинация: MAX_CARD_BUTTONS кнопок на страницу.
     callback_data = "card:{card.id}"
     Навигация: "← Назад" (page:{page-1}), "Ещё →" (page:{page+1}).
     """
+    # Сортируем ПОЛНЫЙ список по sort_order — нужно для определения секции «На контроле»
+    full_sorted = sorted(cards, key=lambda c: c.sort_order)
     task_cards = [c for c in cards if not c.blocked and not c.archived]
     if not task_cards:
         logger.debug("send_card_buttons: нет карточек для отображения")
         return
 
-    # Сортировка по event_time: с временем — впереди по возрастанию, без — в конец
+    # Сортировка: «На контроле» всегда в конец, затем по event_time
     task_cards.sort(
         key=lambda c: (
+            _is_control_section(full_sorted, c),
             c.event_time is None,
             c.event_time or datetime.min.replace(tzinfo=TZ_MSK),
         )
@@ -486,7 +502,7 @@ async def _handle_done(
 
     Для регулярных задач (ежедневно/по будням/по выходным/еженедельно) вместо архивации
     переносит на следующий подходящий день по тегу — чтобы не ломать ротацию.
-    Для обычных задач — архивирует с пометкой даты выполнения.
+    Для обычных задач — архивирует.
     """
     assert update.message is not None
     logger.info("handle_done: raw_text={!r}", raw_text)
@@ -509,19 +525,14 @@ async def _handle_done(
         await _reply(update, f"❓ Не нашёл карточку по запросу «{raw_text}».")
         return
 
-    done_comment = f"Выполнено {datetime.now(TZ_MSK).date().isoformat()}"
     try:
         card = await user_ctx.kaiten.get_card(matched["id"])
         if card and user_ctx.logic.is_regular_task(card):
-            # Регулярная задача: добавляем отметку выполнения и переносим на следующий цикл
-            try:
-                await user_ctx.kaiten.add_comment(matched["id"], done_comment)
-            except Exception as exc:
-                logger.warning("handle_done: не удалось добавить комментарий — {}", exc)
+            # Регулярная задача: переносим на следующий цикл
             ok, msg = await _postpone_card(user_ctx, card, hours=None)
             await _reply(update, msg)
         else:
-            ok = await user_ctx.logic.archive_card(matched["id"], comment=done_comment)
+            ok = await user_ctx.logic.archive_card(matched["id"])
             if ok:
                 await _reply(update, f"✅ Готово! Карточка «{matched['title']}» перемещена в архив.")
             else:
@@ -538,6 +549,7 @@ async def _handle_move(
     cfg: HandlersConfig,
     raw_text: str,
     user_ctx: UserHandlerCtx,
+    context: ContextTypes.DEFAULT_TYPE | None = None,
 ) -> None:
     """Ищет карточку и перемещает её в нужную колонку/секцию."""
     assert update.message is not None
@@ -597,6 +609,40 @@ async def _handle_move(
             tomorrow_wd        = (datetime.now(TZ_MSK).date() + timedelta(days=1)).weekday()
             target_column_name = WEEKDAY_COLUMNS[tomorrow_wd]
             target_column_id   = user_ctx.logic.column_ids[target_column_name]
+
+    # Мягкое сопротивление: критическая задача с дедлайном сегодня/завтра
+    try:
+        card_obj = await user_ctx.kaiten.get_card(matched["id"])
+    except Exception:
+        card_obj = None
+    today = datetime.now(TZ_MSK).date()
+    tomorrow = today + timedelta(days=1)
+    due_dt = card_obj.due_date_parsed if card_obj else None
+    due_date = due_dt.date() if due_dt else None
+    risky = bool(card_obj) and card_obj.importance == "критическое" and due_date in (today, tomorrow)
+
+    if risky and context is not None:
+        context.user_data["pending_move"] = {
+            "kind": "move",
+            "card_id": matched["id"],
+            "title": matched["title"],
+            "target_col_id": target_column_id,
+            "target_col_name": target_column_name,
+            "section": section,
+        }
+        await _reply(
+            update,
+            f"⚠️ «{matched['title']}» — критическая задача с дедлайном {due_date.isoformat()}.\n"
+            f"Точно перенести на {target_column_name}?",
+        )
+        await update.message.reply_text(
+            "Подтверди:",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Да, перенести", callback_data="confirm:move"),
+                InlineKeyboardButton("Отмена", callback_data="confirm:cancel"),
+            ]]),
+        )
+        return
 
     try:
         sort_order = await user_ctx.logic.get_section_sort_order(target_column_id, section)
@@ -819,8 +865,10 @@ def build_handlers(cfg: HandlersConfig) -> Application:
         1. ConversationHandler — group=0, первым: перехватывает card:* коллбэки
            и ведёт диалог выбора действия над карточкой.
         2. page_nav_cb — сразу за ConvHandler: перехватывает page:* коллбэки.
-        3. CommandHandlers — group=0.
-        4. MessageHandler (text_handler) — group=0, последним: роутер текста.
+        3. confirm_move_cb / confirm_cancel_cb — top-level, работают вне диалога
+           (обслуживают risky-подтверждение из текстовой команды «перенести»).
+        4. CommandHandlers — group=0.
+        5. MessageHandler (text_handler) — group=0, последним: роутер текста.
 
     ConversationHandler не мешает text_handler когда пользователь НЕ в диалоге:
         entry_points реагируют только на callback card:*, обычный текст
@@ -908,7 +956,8 @@ def build_handlers(cfg: HandlersConfig) -> Application:
         card_id = context.user_data.get("selected_card_id")
         card = await user_ctx.kaiten.get_card(card_id) if (user_ctx and card_id) else None
 
-        if card and card.size is not None and card.size <= 0.25 and card.size != 999:
+        # FIX 1: size=None трактуется как 15 мин (DEFAULT_HOURS=0.25) → тоже короткая задача
+        if card and card.size != 999 and (card.size is None or card.size <= 0.25):
             ok, msg = await _postpone_card(user_ctx, card, hours=None)
             await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN)
             if update.effective_chat:
@@ -1129,7 +1178,8 @@ def build_handlers(cfg: HandlersConfig) -> Application:
                         InlineKeyboardButton("Отмена", callback_data="confirm:cancel"),
                     ]]),
                 )
-                return CONFIRM_RISKY_MOVE
+                # Диалог завершается; confirm_move_cb/confirm_cancel_cb — top-level хендлеры
+                return ConversationHandler.END
 
             ok, msg = await _postpone_card(user_ctx, card_obj, hours)
             await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
@@ -1226,7 +1276,8 @@ def build_handlers(cfg: HandlersConfig) -> Application:
                     InlineKeyboardButton("Отмена", callback_data="confirm:cancel"),
                 ]]),
             )
-            return CONFIRM_RISKY_MOVE
+            # Диалог завершается; confirm_move_cb/confirm_cancel_cb — top-level хендлеры
+            return ConversationHandler.END
 
         try:
             sort_order = await user_ctx.logic.get_section_sort_order(target_col_id, section)
@@ -1259,6 +1310,8 @@ def build_handlers(cfg: HandlersConfig) -> Application:
         return ConversationHandler.END
 
     # ── Подтверждение переноса критической задачи ─────────────────────────────
+    # Зарегистрированы как top-level хендлеры (не в states ConversationHandler),
+    # чтобы работать и из текстовой команды «перенести», и из диалога кнопок.
 
     async def confirm_move_cb(
         update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1553,6 +1606,7 @@ def build_handlers(cfg: HandlersConfig) -> Application:
                 update, cfg,
                 _strip_command_prefix(text, "перенести", "перенеси", "переместить"),
                 user_ctx,
+                context,
             )
         elif re.match(r"^(заметка|комментарий|добавь заметку)\b", lower):
             await _handle_note(
@@ -1630,10 +1684,6 @@ def build_handlers(cfg: HandlersConfig) -> Application:
             AWAITING_REMINDER_TIME: [
                 MessageHandler(_text_not_cmd, received_reminder_time_cb),
             ],
-            CONFIRM_RISKY_MOVE: [
-                CallbackQueryHandler(confirm_move_cb,   pattern=r"^confirm:move$"),
-                CallbackQueryHandler(confirm_cancel_cb, pattern=r"^confirm:cancel$"),
-            ],
         },
         fallbacks=[
             # Известные текстовые команды — выходим из диалога и обрабатываем
@@ -1702,6 +1752,7 @@ def build_handlers(cfg: HandlersConfig) -> Application:
                 update, cfg,
                 _strip_command_prefix(text, "перенести", "перенеси", "переместить"),
                 user_ctx,
+                context,
             )
             return
 
@@ -1743,7 +1794,7 @@ def build_handlers(cfg: HandlersConfig) -> Application:
         if user_ctx is None:
             logger.warning("cmd_move: unauthorized chat_id={}", chat_id)
             return
-        await _handle_move(update, cfg, " ".join(context.args or []), user_ctx)
+        await _handle_move(update, cfg, " ".join(context.args or []), user_ctx, context)
 
     async def cmd_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """/note <название> // <заметка> — добавить комментарий."""
@@ -1771,12 +1822,16 @@ def build_handlers(cfg: HandlersConfig) -> Application:
     #
     # ConversationHandler — первым, чтобы перехватывать card:* коллбэки.
     # page_nav_cb — сразу за ним: перехватывает page:* коллбэки (вне диалога).
+    # confirm_move_cb / confirm_cancel_cb — top-level хендлеры для risky-подтверждения;
+    #   работают как из текстовой команды «перенести», так и после кнопки «Перенести».
     # Когда пользователь НЕ в диалоге, conv_handler не трогает текстовые
     # сообщения (его entry_points реагируют только на card:* коллбэки),
     # и update проваливается к text_handler ниже.
 
     app.add_handler(conv_handler)                                                      # ConvHandler
     app.add_handler(CallbackQueryHandler(page_nav_cb, pattern=r"^page:\d+$"))          # пагинация
+    app.add_handler(CallbackQueryHandler(confirm_move_cb,   pattern=r"^confirm:move$"))   # risky ОК
+    app.add_handler(CallbackQueryHandler(confirm_cancel_cb, pattern=r"^confirm:cancel$")) # risky отмена
 
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("help",   cmd_help))

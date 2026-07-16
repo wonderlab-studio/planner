@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 from loguru import logger
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from kaiten_client import TZ_MSK
+from kaiten_client import Card, TZ_MSK
 
 load_dotenv()
 
@@ -58,6 +58,18 @@ def _split_text(text: str, max_len: int = _MAX_MESSAGE_LEN) -> list[str]:
         text = text[cut:].lstrip("\n")
 
     return parts
+
+
+def _is_control_section(sorted_cards: list[Card], target: Card) -> bool:
+    """Определяет, находится ли target в секции «На контроле» — по позиции
+    относительно разделителей (blocked=True) в списке, отсортированном по sort_order."""
+    current: str | None = None
+    for card in sorted_cards:
+        if card.blocked:
+            current = card.block_reason
+        elif card.id == target.id:
+            return current == "На контроле"
+    return False
 
 
 # ── Notifier ──────────────────────────────────────────────────────────────────
@@ -204,14 +216,17 @@ class Notifier:
     async def send_card_buttons(self, cards: list) -> None:
         """Отправляет сообщение с InlineKeyboard из карточек (первая страница, до 20 кнопок).
 
-        Карточки сортируются по event_time: с временем впереди по возрастанию, без времени — в конец.
+        Карточки сортируются: «На контроле» — всегда в конец, затем по event_time.
         cards — list[Card] из kaiten_client.
         """
+        # Сортируем ПОЛНЫЙ список по sort_order — нужно для определения секции «На контроле»
+        full_sorted = sorted(cards, key=lambda c: c.sort_order)
         task_cards = [c for c in cards if not c.blocked and not c.archived]
         if not task_cards:
             return
         task_cards.sort(
             key=lambda c: (
+                _is_control_section(full_sorted, c),
                 c.event_time is None,
                 c.event_time or datetime.min.replace(tzinfo=TZ_MSK),
             )
