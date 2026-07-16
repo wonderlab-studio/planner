@@ -316,6 +316,7 @@ class KaitenClient:
         weekday_options: dict[str, int] | None = None,
         field_ids: dict[str, str] | None = None,
         time_of_day_options: dict[str, int] | None = None,
+        space_id: int | None = None,
     ) -> None:
         self._board_id = board_id
         self._lane_id = lane_id
@@ -341,6 +342,8 @@ class KaitenClient:
             "weekday":     "id_590359",
             "time_of_day": "id_time_of_day",
         }
+        # Per-user space ID — fallback на модульную константу для обратной совместимости
+        self._space_id = space_id or KAITEN_SPACE_ID
         self._client = httpx.AsyncClient(
             base_url=self._base_url,
             headers={
@@ -478,7 +481,7 @@ class KaitenClient:
         while True:
             data = await self._request(
                 "GET",
-                f"/spaces/{KAITEN_SPACE_ID}/cards",
+                f"/spaces/{self._space_id}/cards",
                 params={"column_id": column_id, "limit": limit, "offset": offset},
             )
             if not isinstance(data, list):

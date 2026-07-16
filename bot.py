@@ -104,6 +104,7 @@ async def main() -> None:
             weekday_options=_merged(user.weekday_options, "weekday_options"),
             field_ids=merged_field_ids,
             time_of_day_options=saved_config.get("time_of_day_options"),
+            space_id=user.kaiten_space_id,
         )
         kaiten_clients.append(client)
 
