@@ -29,15 +29,23 @@ _NAME_ALIASES: dict[str, str] = {
 }
 
 
-async def setup_board(client: KaitenClient, user: UserConfig) -> dict[str, int]:
+async def setup_board(
+    client: KaitenClient, user: UserConfig
+) -> tuple[dict[str, int], dict | None]:
     """
     Настраивает доску пользователя:
     - Создаёт недостающие колонки
     - Удаляет лишние пустые колонки
     - В дневных колонках создаёт разделители (если их нет)
     - Определяет lane_id (если user.kaiten_lane_id == 0)
+    - Если доска новая (ни одной стандартной колонки не было) — автоматически создаёт
+      кастомные поля и теги в Kaiten-аккаунте и вызывает client.configure_custom_fields().
 
-    Возвращает column_ids: dict[str, int] — маппинг имя → id.
+    Возвращает (column_ids, discovered_config):
+        column_ids      — dict[str, int]: маппинг имя → id
+        discovered_config — dict с ключами field_ids / importance_options / weekday_options /
+                           time_of_day_options / tag_ids если была создана новая доска,
+                           иначе None.
     Обновляет user.kaiten_lane_id и user.column_ids на месте.
     """
     logger.info("board_setup: начало для user={}, board={}", user.user_id, user.kaiten_board_id)
@@ -66,6 +74,10 @@ async def setup_board(client: KaitenClient, user: UserConfig) -> dict[str, int]:
             # Стандартное имя — добавляем только если alias ещё не занял место
             if col.title not in existing_by_name:
                 existing_by_name[col.title] = col.id
+
+    # Фиксируем флаг новой доски ДО создания колонок:
+    # доска считается новой если ни одна из стандартных колонок ещё не существует.
+    is_new_board = len(existing_by_name) == 0
 
     # 2.5 Удалить пустые стандартно-названные колонки, если их место уже занято alias-маппингом
     for col in existing:
@@ -130,8 +142,110 @@ async def setup_board(client: KaitenClient, user: UserConfig) -> dict[str, int]:
                 )
                 logger.info("board_setup: создан разделитель «{}» в колонке «{}»", section, col_name)
 
-    # 6. Сформировать итоговый column_ids
+    # 6. Автосоздание кастомных полей и тегов для новой доски
+    discovered_config: dict | None = None
+
+    if is_new_board:
+        try:
+            # Событие (date)
+            event_prop = await client.create_custom_property("Событие", "date")
+            event_id = event_prop.get("id") if event_prop else None
+
+            # Важность (select, одиночный)
+            importance_prop = await client.create_custom_property(
+                "Важность", "select", multi_select=False
+            )
+            importance_id = importance_prop.get("id") if importance_prop else None
+            importance_options: dict[str, int] = {}
+            if importance_id is not None:
+                for name in ("среднее", "важное", "критическое"):
+                    val = await client.create_select_value(importance_id, name)
+                    if val and val.get("id") is not None:
+                        importance_options[name] = val["id"]
+
+            # День недели (select, одиночный)
+            weekday_prop = await client.create_custom_property(
+                "День недели", "select", multi_select=False
+            )
+            weekday_id = weekday_prop.get("id") if weekday_prop else None
+            weekday_options: dict[str, int] = {}
+            if weekday_id is not None:
+                for name in ("ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС"):
+                    val = await client.create_select_value(weekday_id, name)
+                    if val and val.get("id") is not None:
+                        weekday_options[name] = val["id"]
+
+            # Время дня (select, одиночный) — задел на будущее, не используется в логике планирования
+            tod_prop = await client.create_custom_property(
+                "Время дня", "select", multi_select=False
+            )
+            tod_id = tod_prop.get("id") if tod_prop else None
+            time_of_day_options: dict[str, int] = {}
+            if tod_id is not None:
+                for name in ("Утро", "День", "Вечер"):
+                    val = await client.create_select_value(tod_id, name)
+                    if val and val.get("id") is not None:
+                        time_of_day_options[name] = val["id"]
+
+            field_ids: dict[str, str] = {}
+            if event_id is not None:
+                field_ids["event"] = f"id_{event_id}"
+            if importance_id is not None:
+                field_ids["importance"] = f"id_{importance_id}"
+            if weekday_id is not None:
+                field_ids["weekday"] = f"id_{weekday_id}"
+            if tod_id is not None:
+                field_ids["time_of_day"] = f"id_{tod_id}"
+
+            # Теги: создаём через временную карточку в «Долгий ящик»,
+            # затем получаем итоговые ID через GET /company/tags
+            tag_ids: dict[str, int] = {}
+            temp_card_id: int | None = None
+            try:
+                long_box_col = existing_by_name.get("Долгий ящик")
+                if long_box_col:
+                    temp = await client.create_card(
+                        column_id=long_box_col, title="_setup_tags_tmp"
+                    )
+                    if temp:
+                        temp_card_id = temp.id
+                        tag_names = [
+                            "ежедневно", "по будням", "по выходным", "еженедельно",
+                            "напомнить", "вечерняя", "жёсткое событие", "не дробить", "рабочая",
+                        ]
+                        for tag_name in tag_names:
+                            await client.add_tag_by_name(temp_card_id, tag_name)
+                        all_tags = await client.get_tags()
+                        tag_names_set = set(tag_names)
+                        for t in all_tags:
+                            if t.get("name") in tag_names_set and t.get("id") is not None:
+                                tag_ids[t["name"]] = t["id"]
+            finally:
+                if temp_card_id is not None:
+                    await client.delete_card(temp_card_id)
+
+            discovered_config = {
+                "field_ids":           field_ids,
+                "importance_options":  importance_options,
+                "weekday_options":     weekday_options,
+                "time_of_day_options": time_of_day_options,
+                "tag_ids":             tag_ids,
+            }
+            client.configure_custom_fields(**discovered_config)
+            logger.info(
+                "board_setup: автосоздание кастомных полей/тегов завершено для user={}: {}",
+                user.user_id,
+                {k: len(v) for k, v in discovered_config.items()},
+            )
+        except Exception as exc:
+            logger.error(
+                "board_setup: ошибка автосоздания кастомных полей/тегов user={} — {}",
+                user.user_id, exc,
+            )
+            discovered_config = None
+
+    # 7. Сформировать итоговый column_ids
     column_ids = {name: existing_by_name[name] for name in REQUIRED_COLUMN_NAMES if name in existing_by_name}
     user.column_ids = column_ids
     logger.info("board_setup: завершено для user={}, column_ids={}", user.user_id, list(column_ids.keys()))
-    return column_ids
+    return column_ids, discovered_config

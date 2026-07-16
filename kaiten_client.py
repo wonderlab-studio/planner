@@ -54,6 +54,13 @@ WEEKDAY_OPTIONS: dict[str, int] = {
 }
 WEEKDAY_BY_ID: dict[int, str] = {v: k for k, v in WEEKDAY_OPTIONS.items()}
 
+# Канонические плейсхолдеры для поля «Время дня» (4-е кастомное поле, задел на будущее).
+# На основном аккаунте это поле не создано — значения 1/2/3 используются ТОЛЬКО как
+# внутренние канонические ID при нормализации properties нового аккаунта.
+# Канонический ключ properties: "id_time_of_day" (синтетический).
+TIME_OF_DAY_OPTIONS: dict[str, int] = {"Утро": 1, "День": 2, "Вечер": 3}
+TIME_OF_DAY_BY_ID: dict[int, str] = {v: k for k, v in TIME_OF_DAY_OPTIONS.items()}
+
 # Теги
 TAG_IDS: dict[str, int] = {
     "еженедельно": 407071,
@@ -136,6 +143,18 @@ class Card:
         return WEEKDAY_BY_ID.get(raw[0])
 
     @property
+    def time_of_day(self) -> str | None:
+        """Парсит properties.id_time_of_day → 'Утро'/'День'/'Вечер' или None.
+
+        Поле не настроено для основного аккаунта — None является штатным состоянием.
+        Заполняется только для аккаунтов, прошедших автонастройку через board_setup.
+        """
+        raw = self.properties.get("id_time_of_day")
+        if not raw or not isinstance(raw, list) or len(raw) == 0:
+            return None
+        return TIME_OF_DAY_BY_ID.get(raw[0])
+
+    @property
     def updated_at_parsed(self) -> datetime | None:
         """Парсит поле updated_at → datetime (aware, UTC+3) или None."""
         if not self.updated_at:
@@ -186,14 +205,27 @@ def _parse_tag(data: dict) -> Tag:
     return Tag(id=data["id"], name=data.get("name", ""))
 
 
-def _parse_card(data: dict, field_ids: dict[str, str] | None = None) -> Card:
+def _parse_card(
+    data: dict,
+    field_ids: dict[str, str] | None = None,
+    importance_by_id: dict[int, str] | None = None,
+    weekday_by_id: dict[int, str] | None = None,
+    time_of_day_by_id: dict[int, str] | None = None,
+) -> Card:
     """Парсит сырой dict карточки из Kaiten API в объект Card.
 
-    Параметр field_ids — маппинг канонических ключей ("event", "importance", "weekday")
-    на реальные ключи свойств в Kaiten-аккаунте (напр. "id_590358").
+    Параметр field_ids — маппинг канонических ключей ("event", "importance", "weekday",
+    "time_of_day") на реальные ключи свойств в Kaiten-аккаунте (напр. "id_590358").
     Если реальный ключ отличается от канонического — значение копируется под канонический
-    ключ в properties, чтобы Card.event_time / .importance / .weekday продолжали работать
-    независимо от реальных ID полей в конкретном Kaiten-аккаунте.
+    ключ в properties, чтобы Card.event_time / .importance / .weekday / .time_of_day
+    продолжали работать независимо от реальных ID полей в конкретном Kaiten-аккаунте.
+
+    importance_by_id / weekday_by_id / time_of_day_by_id — реверс-маппинги реальных
+    option_id → имя для текущего аккаунта. Если переданы — option_id в properties
+    дополнительно транслируются в канонические ID (из IMPORTANCE_OPTIONS / WEEKDAY_OPTIONS /
+    TIME_OF_DAY_OPTIONS), чтобы Card.importance / .weekday / .time_of_day возвращали
+    корректный результат для аккаунта с нестандартными ID вариантов select.
+    Для основного аккаунта трансляция является no-op (canonical_id == исходный id).
     """
     tags_raw = data.get("tags") or []
 
@@ -201,9 +233,10 @@ def _parse_card(data: dict, field_ids: dict[str, str] | None = None) -> Card:
     props = data.get("properties") or {}
     if field_ids:
         _canonical = {
-            "event":      "id_590358",
-            "importance": "id_590382",
-            "weekday":    "id_590359",
+            "event":       "id_590358",
+            "importance":  "id_590382",
+            "weekday":     "id_590359",
+            "time_of_day": "id_time_of_day",
         }
         needs_remap = any(
             field_ids.get(k, v) != v for k, v in _canonical.items()
@@ -214,6 +247,38 @@ def _parse_card(data: dict, field_ids: dict[str, str] | None = None) -> Card:
                 actual = field_ids.get(key, canonical)
                 if actual != canonical and actual in props:
                     props[canonical] = props[actual]
+
+    # Транслируем ID вариантов select в канонические (поддержка мульти-аккаунта).
+    # Для основного аккаунта importance_by_id совпадает с IMPORTANCE_BY_ID,
+    # поэтому трансляция является no-op — canonical_id == исходный id.
+    _needs_val_remap = (
+        (importance_by_id is not None and "id_590382" in props)
+        or (weekday_by_id is not None and "id_590359" in props)
+        or (time_of_day_by_id is not None and "id_time_of_day" in props)
+    )
+    if _needs_val_remap:
+        props = dict(props)  # гарантируем изменяемую копию
+        if importance_by_id and "id_590382" in props:
+            raw_list = props["id_590382"]
+            if isinstance(raw_list, list) and raw_list:
+                name = importance_by_id.get(raw_list[0])
+                canonical_id = IMPORTANCE_OPTIONS.get(name) if name else None
+                if canonical_id is not None:
+                    props["id_590382"] = [canonical_id]
+        if weekday_by_id and "id_590359" in props:
+            raw_list = props["id_590359"]
+            if isinstance(raw_list, list) and raw_list:
+                name = weekday_by_id.get(raw_list[0])
+                canonical_id = WEEKDAY_OPTIONS.get(name) if name else None
+                if canonical_id is not None:
+                    props["id_590359"] = [canonical_id]
+        if time_of_day_by_id and "id_time_of_day" in props:
+            raw_list = props["id_time_of_day"]
+            if isinstance(raw_list, list) and raw_list:
+                name = time_of_day_by_id.get(raw_list[0])
+                canonical_id = TIME_OF_DAY_OPTIONS.get(name) if name else None
+                if canonical_id is not None:
+                    props["id_time_of_day"] = [canonical_id]
 
     return Card(
         id=data["id"],
@@ -250,6 +315,7 @@ class KaitenClient:
         importance_options: dict[str, int] | None = None,
         weekday_options: dict[str, int] | None = None,
         field_ids: dict[str, str] | None = None,
+        time_of_day_options: dict[str, int] | None = None,
     ) -> None:
         self._board_id = board_id
         self._lane_id = lane_id
@@ -267,10 +333,13 @@ class KaitenClient:
         self._importance_by_id = {v: k for k, v in self._importance_options.items()}
         self._weekday_options = weekday_options or dict(WEEKDAY_OPTIONS)
         self._weekday_by_id = {v: k for k, v in self._weekday_options.items()}
+        self._time_of_day_options: dict[str, int] = time_of_day_options or {}
+        self._time_of_day_by_id: dict[int, str] = {v: k for k, v in self._time_of_day_options.items()}
         self._field_ids = field_ids or {
-            "event":      "id_590358",
-            "importance": "id_590382",
-            "weekday":    "id_590359",
+            "event":       "id_590358",
+            "importance":  "id_590382",
+            "weekday":     "id_590359",
+            "time_of_day": "id_time_of_day",
         }
         self._client = httpx.AsyncClient(
             base_url=self._base_url,
@@ -320,8 +389,14 @@ class KaitenClient:
             return None
 
     def _to_card(self, data: dict) -> Card:
-        """Парсит dict карточки в Card, применяя field_ids этого инстанса."""
-        return _parse_card(data, self._field_ids)
+        """Парсит dict карточки в Card, применяя field_ids и реверс-мапы этого инстанса."""
+        return _parse_card(
+            data,
+            self._field_ids,
+            importance_by_id=self._importance_by_id,
+            weekday_by_id=self._weekday_by_id,
+            time_of_day_by_id=self._time_of_day_by_id if self._time_of_day_by_id else None,
+        )
 
     # ── Публичные методы ──────────────────────────────────────────────────────
 
@@ -351,6 +426,35 @@ class KaitenClient:
         if opt_id is None:
             return None
         return {self._field_ids["importance"]: [opt_id]}
+
+    def configure_custom_fields(
+        self,
+        *,
+        field_ids: dict[str, str] | None = None,
+        importance_options: dict[str, int] | None = None,
+        weekday_options: dict[str, int] | None = None,
+        tag_ids: dict[str, int] | None = None,
+        time_of_day_options: dict[str, int] | None = None,
+    ) -> None:
+        """Обновляет instance-конфигурацию клиента ПОСЛЕ __init__.
+
+        Используется когда реальные ID кастомных полей/тегов становятся известны
+        только во время выполнения — например, при автосоздании полей в board_setup.py
+        во время онбординга нового Kaiten-аккаунта.
+        """
+        if field_ids is not None:
+            self._field_ids.update(field_ids)
+        if importance_options is not None:
+            self._importance_options.update(importance_options)
+            self._importance_by_id = {v: k for k, v in self._importance_options.items()}
+        if weekday_options is not None:
+            self._weekday_options.update(weekday_options)
+            self._weekday_by_id = {v: k for k, v in self._weekday_options.items()}
+        if tag_ids is not None:
+            self._tag_ids.update(tag_ids)
+        if time_of_day_options is not None:
+            self._time_of_day_options = {**self._time_of_day_options, **time_of_day_options}
+            self._time_of_day_by_id = {v: k for k, v in self._time_of_day_options.items()}
 
     async def get_columns(self) -> list[Column]:
         """GET /boards/{board_id}/columns → список колонок доски."""
@@ -640,3 +744,43 @@ class KaitenClient:
                 "create_blocked_card: карточка создана (id={}) но не заблокирована", card_id
             )
         return data
+
+    async def create_custom_property(
+        self, name: str, prop_type: str, multi_select: bool | None = None
+    ) -> dict | None:
+        """POST /company/custom-properties — создаёт кастомное поле в аккаунте Kaiten.
+
+        name       — отображаемое имя поля (напр. "Важность")
+        prop_type  — тип поля: "date", "select", "text" и др.
+        multi_select — для типа "select": True = мультивыбор, False = одиночный выбор.
+                       Если None — параметр не передаётся.
+
+        Возвращает распарсенный JSON ответа (содержит "id" созданного поля) или None при ошибке.
+        """
+        body: dict = {"name": name, "type": prop_type}
+        if multi_select is not None:
+            body["multi_select"] = multi_select
+        return await self._request("POST", "/company/custom-properties", json=body)
+
+    async def create_select_value(self, property_id: int, value: str) -> dict | None:
+        """POST /company/custom-properties/{property_id}/select-values — добавляет вариант select.
+
+        property_id — ID поля типа "select" (из create_custom_property).
+        value       — отображаемое значение варианта (напр. "критическое").
+
+        Возвращает JSON ответа (содержит "id" созданного варианта) или None при ошибке.
+        """
+        return await self._request(
+            "POST",
+            f"/company/custom-properties/{property_id}/select-values",
+            json={"value": value},
+        )
+
+    async def get_tags(self) -> list[dict]:
+        """GET /company/tags — список всех тегов аккаунта Kaiten.
+
+        Возвращает список dict с полями "id", "name" и др.
+        При ошибке возвращает пустой список (не None) — вызывающий код итерирует напрямую.
+        """
+        data = await self._request("GET", "/company/tags")
+        return data if isinstance(data, list) else []

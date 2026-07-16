@@ -1,7 +1,8 @@
 """
 db.py — модуль состояния на SQLite.
 
-Хранит флаги выполнения утренней/вечерней логики по датам и пользователям.
+Хранит флаги выполнения утренней/вечерней логики по датам и пользователям,
+а также автообнаруженную конфигурацию Kaiten (ID полей/тегов/вариантов select).
 Синхронный — вызывать из asyncio через loop.run_in_executor(None, func, args).
 
 Конфиг из .env:
@@ -10,9 +11,10 @@ db.py — модуль состояния на SQLite.
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -37,8 +39,20 @@ def _get_connection() -> sqlite3.Connection:
     return conn
 
 
+def _init_kaiten_config_table(conn: sqlite3.Connection) -> None:
+    """Создаёт таблицу user_kaiten_config если её ещё нет."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_kaiten_config (
+            user_id     TEXT PRIMARY KEY,
+            config_json TEXT NOT NULL,
+            updated_at  TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+
+
 def _init_db() -> None:
-    """Создаёт таблицу daily_flags если её ещё нет, и применяет миграции."""
+    """Создаёт таблицы если их ещё нет, и применяет миграции."""
     db_file = Path(DB_PATH)
     if db_file.parent != Path(".") and not db_file.parent.exists():
         db_file.parent.mkdir(parents=True, exist_ok=True)
@@ -63,7 +77,9 @@ def _init_db() -> None:
             conn.commit()
             logger.info("db: migrated daily_flags — added user_id column")
 
-    logger.debug("db: таблица daily_flags готова (DB_PATH={})", DB_PATH)
+        _init_kaiten_config_table(conn)
+
+    logger.debug("db: таблицы готовы (DB_PATH={})", DB_PATH)
 
 
 # Инициализируем при импорте модуля
@@ -175,3 +191,41 @@ def reset_flags(d: date | str, user_id: str = "default") -> None:
         )
         conn.commit()
     logger.warning("reset_flags({}, {}): флаги сброшены", key, user_id)
+
+
+def save_user_kaiten_config(user_id: str, config: dict) -> None:
+    """Сохраняет автообнаруженную конфигурацию Kaiten для пользователя
+    (field_ids/importance_options/weekday_options/tag_ids/time_of_day_options —
+    произвольный dict, сериализуется в JSON одним блобом).
+    Перезаписывает существующую запись при повторном вызове."""
+    config_json = json.dumps(config, ensure_ascii=False)
+    now = datetime.now(timezone.utc).isoformat()
+    with _get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_kaiten_config (user_id, config_json, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET config_json = excluded.config_json,
+                                                updated_at = excluded.updated_at
+            """,
+            (user_id, config_json, now),
+        )
+        conn.commit()
+    logger.info("save_user_kaiten_config({}): сохранено, ключи={}", user_id, list(config.keys()))
+
+
+def load_user_kaiten_config(user_id: str) -> dict | None:
+    """Возвращает ранее сохранённую конфигурацию Kaiten для пользователя,
+    или None если для него ничего не сохранялось."""
+    with _get_connection() as conn:
+        row = conn.execute(
+            "SELECT config_json FROM user_kaiten_config WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        return json.loads(row["config_json"])
+    except (ValueError, TypeError) as exc:
+        logger.error("load_user_kaiten_config({}): не удалось распарсить JSON — {}", user_id, exc)
+        return None

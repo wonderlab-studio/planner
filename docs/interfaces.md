@@ -36,6 +36,9 @@ ANTHROPIC_API_KEY=...
 | Получить комментарии | GET | `/cards/{card_id}/comments` |
 | Добавить тег | POST | `/cards/{card_id}/tags` — body: `{"name": "tagname"}` |
 | Заблокировать карточку | POST | `/cards/{card_id}/blockers` — body: `{"reason": "Утро"}` |
+| Создать кастомное поле | POST | `/company/custom-properties` — body: `{"name": str, "type": str, ["multi_select": bool]}` |
+| Добавить вариант select | POST | `/company/custom-properties/{property_id}/select-values` — body: `{"value": str}` |
+| Список тегов аккаунта | GET | `/company/tags` |
 
 > Авторизация: заголовок `Authorization: Bearer {KAITEN_TOKEN}`
 > API возвращает максимум 100 карточек за запрос — необходима пагинация
@@ -99,6 +102,7 @@ ANTHROPIC_API_KEY=...
 | `id_590358` | `{"date": str, "time": str, "tzOffset": int}` | **event_time** | `{"date": "2026-05-16", "time": "10:00:37", "tzOffset": 180}` |
 | `id_590359` | `[int]` | **weekday** (день недели, select) | `[17244350]` = ПТ |
 | `id_590382` | `[int]` | **importance** (важность, select) | `[17244397]` = важное |
+| `id_time_of_day` | `[int]` | **time_of_day** (время дня, select) | синтетический ключ — используется только у аккаунтов с автосозданными полями |
 
 ```python
 IMPORTANCE_OPTIONS = {
@@ -116,6 +120,9 @@ WEEKDAY_OPTIONS = {
     "СБ": 17244351,
     "ВС": 17244352,
 }
+
+# Канонические плейсхолдеры (реальных ID на основном аккаунте нет)
+TIME_OF_DAY_OPTIONS = {"Утро": 1, "День": 2, "Вечер": 3}
 ```
 
 ---
@@ -222,6 +229,28 @@ sort_order ≈ 3.30   │ [РАЗДЕЛИТЕЛЬ] block_reason="На контр
 }
 ```
 
+### Пример создания кастомного поля (POST /company/custom-properties)
+
+```json
+{
+  "name": "Важность",
+  "type": "select",
+  "multi_select": false
+}
+```
+
+Ответ содержит `"id"` — используется для добавления вариантов:
+
+### Пример добавления варианта select (POST /company/custom-properties/{id}/select-values)
+
+```json
+{
+  "value": "критическое"
+}
+```
+
+Ответ содержит `"id"` варианта — это и есть option_id, записываемый в `properties`.
+
 ---
 
 ## 2. KaitenClient — публичные методы
@@ -238,15 +267,16 @@ class KaitenClient:
         lane_id: int,
         token: str | None = None,             # fallback → KAITEN_TOKEN из env
         base_url: str | None = None,          # fallback → KAITEN_BASE_URL из env
-        tag_ids: dict[str, int] | None = None,            # fallback → глобальный TAG_IDS
-        importance_options: dict[str, int] | None = None, # fallback → глобальный IMPORTANCE_OPTIONS
-        weekday_options: dict[str, int] | None = None,    # fallback → глобальный WEEKDAY_OPTIONS
-        field_ids: dict[str, str] | None = None,          # fallback → {"event": "id_590358", ...}
+        tag_ids: dict[str, int] | None = None,              # fallback → глобальный TAG_IDS
+        importance_options: dict[str, int] | None = None,   # fallback → глобальный IMPORTANCE_OPTIONS
+        weekday_options: dict[str, int] | None = None,      # fallback → глобальный WEEKDAY_OPTIONS
+        field_ids: dict[str, str] | None = None,            # fallback → {"event": "id_590358", ...}
+        time_of_day_options: dict[str, int] | None = None,  # fallback → {} (на основном аккаунте поля нет)
     ): ...
-    # field_ids canonical keys: "event", "importance", "weekday"
+    # field_ids canonical keys: "event", "importance", "weekday", "time_of_day"
     # Все параметры опциональны — обратная совместимость полная.
 
-    # ── Методы-билдеры для мульти-аккаунта ──────────────────────────────────
+    # ── Методы-билдеры и конфигурации ────────────────────────────────────────
 
     def tag_id(self, name: str) -> int | None:
         """Возвращает ID тега по имени для данного Kaiten-аккаунта или None."""
@@ -258,6 +288,19 @@ class KaitenClient:
     def importance_property(self, name: str) -> dict | None:
         """name — 'среднее'|'важное'|'критическое'.
         Возвращает {field_key: [option_id]} или None если имя не найдено."""
+
+    def configure_custom_fields(
+        self,
+        *,
+        field_ids: dict[str, str] | None = None,
+        importance_options: dict[str, int] | None = None,
+        weekday_options: dict[str, int] | None = None,
+        tag_ids: dict[str, int] | None = None,
+        time_of_day_options: dict[str, int] | None = None,
+    ) -> None:
+        """Обновляет instance-конфигурацию клиента ПОСЛЕ __init__.
+        Все параметры — keyword-only, все опциональны (None = не трогать соответствующий маппинг).
+        Вызывается из board_setup.py после автосоздания полей/тегов для нового аккаунта."""
 
     # ── Основные методы ──────────────────────────────────────────────────────
 
@@ -345,6 +388,24 @@ class KaitenClient:
         POST /cards → получить id → POST /cards/{id}/blockers с reason=block_reason.
         (Kaiten игнорирует blocked/block_reason при POST и при PATCH — нужен /blockers.)
         Возвращает итоговый dict карточки или None при ошибке."""
+
+    async def create_custom_property(
+        self, name: str, prop_type: str, multi_select: bool | None = None
+    ) -> dict | None:
+        """POST /company/custom-properties — создаёт кастомное поле в аккаунте Kaiten.
+        prop_type: "date", "select", "text" и др.
+        multi_select: для "select" — True/False/None (не передавать).
+        Возвращает JSON ответа (содержит "id") или None при ошибке."""
+
+    async def create_select_value(self, property_id: int, value: str) -> dict | None:
+        """POST /company/custom-properties/{property_id}/select-values
+        Добавляет вариант select к кастомному полю.
+        Возвращает JSON ответа (содержит "id" варианта) или None при ошибке."""
+
+    async def get_tags(self) -> list[dict]:
+        """GET /company/tags — список всех тегов аккаунта.
+        Возвращает list[dict] с полями "id", "name" и др.
+        При ошибке возвращает [] (не None) — вызывающий код итерирует напрямую."""
 ```
 
 ---
@@ -421,7 +482,35 @@ class BoardLogic:
 
 ---
 
-## 4. Dataclasses (типы)
+## 4. board_setup.py — публичный интерфейс
+
+```python
+async def setup_board(
+    client: KaitenClient,
+    user: UserConfig,
+) -> tuple[dict[str, int], dict | None]:
+    """
+    Настраивает доску пользователя.
+
+    Возвращает (column_ids, discovered_config):
+        column_ids       — dict[str, int]: маппинг имя → id всех стандартных колонок
+        discovered_config — dict с ключами field_ids / importance_options / weekday_options /
+                            time_of_day_options / tag_ids если доска была новой (is_new_board),
+                            иначе None.
+
+    Побочные эффекты:
+        - user.kaiten_lane_id обновляется если был 0
+        - user.column_ids обновляется на месте
+        - client.configure_custom_fields() вызывается если discovered_config не None
+
+    Сигнатура изменена в июле 2026 (ранее возвращала только dict[str, int]).
+    Вызывающий код (bot.py) должен распаковывать: column_ids, cfg = await setup_board(...)
+    """
+```
+
+---
+
+## 5. Dataclasses (типы)
 
 ```python
 from dataclasses import dataclass, field
@@ -465,11 +554,20 @@ class Card:
 
     @property
     def importance(self) -> str | None:
-        """Парсит properties.id_590382 → 'среднее'/'важное'/'критическое'"""
+        """Парсит properties.id_590382 → 'среднее'/'важное'/'критическое'
+        После нормализации _parse_card значение всегда каноническое — даже для
+        аккаунтов с другими option_id."""
 
     @property
     def weekday(self) -> str | None:
-        """Парсит properties.id_590359 → 'ПН'/'ВТ'/...'ВС'"""
+        """Парсит properties.id_590359 → 'ПН'/'ВТ'/...'ВС'
+        После нормализации _parse_card значение всегда каноническое."""
+
+    @property
+    def time_of_day(self) -> str | None:
+        """Парсит properties.id_time_of_day → 'Утро'/'День'/'Вечер' или None.
+        Поле не существует на основном аккаунте — None является штатным состоянием.
+        Заполняется только для аккаунтов, прошедших автонастройку в board_setup."""
 
     @property
     def updated_at_parsed(self) -> datetime | None:
@@ -487,7 +585,7 @@ class Card:
 
 ---
 
-## 5. Открытые вопросы (TODO)
+## 6. Открытые вопросы (TODO)
 
 | # | Вопрос | Статус | Как решить |
 |---|---|---|---|
@@ -501,49 +599,58 @@ class Card:
 
 ---
 
-## 6. Мультиаккаунт Kaiten: онбординг нового пользователя
+## 7. Мультиаккаунт Kaiten: онбординг нового пользователя
 
-> Механизм параметризации реализован в задаче C (июль 2026).
+> Wave 1 (параметризация KaitenClient) — реализована, июль 2026.
+> Wave 1.5 (автосоздание полей/тегов через board_setup) — реализована, июль 2026.
 > Wave 2 (проводка из users.json в bot.py + переход handlers/scheduler на builder-методы) — отдельная задача, ещё не выполнена.
 
-### Шаг 1 — Создать кастомные поля вручную в Kaiten UI
+### Автоматическое создание полей и тегов (новая доска)
 
-Kaiten API не поддерживает создание custom fields через API. Для каждого нового Kaiten-аккаунта нужно создать три поля вручную через интерфейс Kaiten (настройки пространства или доски):
+При первом запуске для нового Kaiten-аккаунта `setup_board` автоматически обнаруживает,
+что ни одной стандартной колонки не существует (`is_new_board = len(existing_by_name) == 0`
+**до** шага создания колонок), и выполняет полную настройку:
 
-| Поле | Тип | Варианты select (важен порядок!) |
+**Создаваемые кастомные поля** (через `POST /company/custom-properties`):
+
+| Поле | Тип | Варианты |
 |---|---|---|
-| «Событие» | Дата + время | — |
-| «Важность» | Select (одиночный) | среднее, важное, критическое |
-| «День недели» | Select (одиночный) | ПН, ВТ, СР, ЧТ, ПТ, СБ, ВС |
+| «Событие» | `date` | — |
+| «Важность» | `select` (одиночный) | среднее, важное, критическое |
+| «День недели» | `select` (одиночный) | ПН, ВТ, СР, ЧТ, ПТ, СБ, ВС |
+| «Время дня» | `select` (одиночный) | Утро, День, Вечер |
 
-Порядок вариантов select определяет их ID — первый вариант получит наименьший ID. Если создать варианты в другом порядке — ID будут другими и их нужно указать явно в конфиге пользователя.
+Варианты select создаются через `POST /company/custom-properties/{id}/select-values`.
+Порядок создания вариантов определяет их ID — сервис не предполагает фиксированный порядок,
+а получает реальные ID из ответа API.
 
-### Шаг 2 — Узнать ID полей и вариантов
+**Получение ID тегов** — через временную карточку:
+1. Создать карточку-заглушку в колонке «Долгий ящик».
+2. Добавить к ней все нужные теги через `POST /cards/{id}/tags` (по имени).
+3. Получить все теги аккаунта через `GET /company/tags`.
+4. Сопоставить имена → ID.
+5. Удалить карточку-заглушку (`DELETE /cards/{id}`).
 
-После создания полей нужно получить их реальные ключи и option ID:
+Создаваемые теги: `ежедневно`, `по будням`, `по выходным`, `еженедельно`, `напомнить`,
+`вечерняя`, `жёсткое событие`, `не дробить`, `рабочая`.
 
-```bash
-# Создать тестовую карточку, заполнить все три поля, затем:
-GET /cards/{card_id}
-# В ответе найти объект properties — ключи вида "id_XXXXXX" и значения
-```
+**Результат**: `setup_board` вызывает `client.configure_custom_fields(...)` с реальными ID,
+обновляя инстанс клиента на месте, и возвращает `discovered_config` (dict) вторым элементом
+кортежа — вызывающий код (bot.py) должен сохранить его в `users.json` для следующих запусков.
 
-Пример ответа:
-```json
-{
-  "properties": {
-    "id_590358": {"date": "2026-07-15", "time": "10:00:00", "tzOffset": 180},
-    "id_590382": [17244397],
-    "id_590359": [17244347]
-  }
-}
-```
+### Известное ограничение v1: отсутствие восстановления после частичного сбоя
 
-Из этого определяем `field_ids` и значения `importance_options` / `weekday_options`.
+`is_new_board` определяется по наличию стандартных колонок. Если автосоздание полей/тегов
+упадёт **после** того как колонки уже были созданы (сетевая ошибка в середине блока),
+то при следующем перезапуске `is_new_board` окажется `False` (колонки существуют),
+и повторной автоматической попытки создания полей НЕ будет.
 
-### Шаг 3 — Добавить конфиг пользователя в users.json
+В этом случае необходима ручная донастройка — вписать реальные ID вручную в `users.json`
+(см. формат ниже в разделе «Ручная настройка»).
 
-Новые опциональные ключи (если не заданы — используются дефолтные значения основного аккаунта):
+### Ручная настройка (если автосоздание не сработало)
+
+Новые опциональные ключи в `users.json` (если не заданы — используются дефолтные значения основного аккаунта):
 
 ```json
 {
@@ -576,24 +683,35 @@ GET /cards/{card_id}
     "ВС": 20000026
   },
   "field_ids": {
-    "event":      "id_600000",
-    "importance": "id_600001",
-    "weekday":    "id_600002"
+    "event":       "id_600000",
+    "importance":  "id_600001",
+    "weekday":     "id_600002",
+    "time_of_day": "id_600003"
+  },
+  "time_of_day_options": {
+    "Утро":  30000001,
+    "День":  30000002,
+    "Вечер": 30000003
   }
 }
 ```
 
-Если все четыре ключа отсутствуют — `KaitenClient` и `BoardLogic` используют глобальные дефолты из `kaiten_client.py` (значения основного аккаунта).
+Если все ключи отсутствуют — `KaitenClient` и `BoardLogic` используют глобальные дефолты
+из `kaiten_client.py` (значения основного аккаунта).
 
-### Шаг 4 — Статус реализации
+### Статус реализации
 
-**Уже реализовано (Wave 1):**
-- `KaitenClient.__init__` принимает `tag_ids`, `importance_options`, `weekday_options`, `field_ids`
-- `_parse_card` нормализует properties под канонические ключи при нестандартных `field_ids`
+**Уже реализовано (Wave 1 + 1.5):**
+- `KaitenClient.__init__` принимает `tag_ids`, `importance_options`, `weekday_options`, `field_ids`, `time_of_day_options`
+- `KaitenClient.configure_custom_fields()` — обновление конфигурации после `__init__`
+- `_parse_card` нормализует ключи properties И транслирует option_id в канонические значения
 - `BoardLogic._regular_tag_ids` строится через `client.tag_id()` — per-user множество
 - Builder-методы: `client.tag_id()`, `client.event_time_property()`, `client.importance_property()`
+- `client.create_custom_property()`, `client.create_select_value()`, `client.get_tags()`
+- `board_setup.setup_board()` — автосоздание полей/тегов для новой доски
+- `Card.time_of_day` — свойство для 4-го кастомного поля
 
 **Ещё не сделано (Wave 2):**
-- `user_config.py`: чтение `tag_ids`, `importance_options`, `weekday_options`, `field_ids` из users.json в `UserConfig`
-- `bot.py`: передача этих значений в `KaitenClient(...)` при создании per-user клиента
+- `user_config.py`: чтение `tag_ids`, `importance_options`, `weekday_options`, `field_ids`, `time_of_day_options` из users.json в `UserConfig`
+- `bot.py`: передача этих значений в `KaitenClient(...)` при создании per-user клиента; распаковка `(column_ids, cfg) = await setup_board(...)` и сохранение `cfg` в users.json
 - `morning_logic.py` / `handlers.py`: переход с хардкода на `client.event_time_property()` и `client.importance_property()`

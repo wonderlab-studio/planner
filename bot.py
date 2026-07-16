@@ -68,6 +68,8 @@ async def main() -> None:
     _setup_logging()
     logger.info("bot: ── ЗАПУСК СИСТЕМЫ ──────────────────────────────────────")
 
+    loop = asyncio.get_event_loop()
+
     users = load_users()
     claude = ClaudeClient()
 
@@ -76,20 +78,32 @@ async def main() -> None:
     kaiten_clients: list[KaitenClient] = []  # для закрытия в finally
 
     for user in users:
-        # 1. Создать KaitenClient (с per-user параметрами тегов/полей если заданы)
+        # 1. Подгрузить сохранённую конфигурацию из SQLite и смёржить
+        #    с explicit-оверрайдами из users.json
+        #    (приоритет: явно заданное в users.json > SQLite > дефолты KaitenClient)
+        saved_config = await loop.run_in_executor(
+            None, db.load_user_kaiten_config, user.user_id
+        )
+        saved_config = saved_config or {}
+
+        def _merged(explicit, key):
+            return explicit if explicit is not None else saved_config.get(key)
+
+        # 2. Создать KaitenClient (с per-user параметрами тегов/полей если заданы)
         client = KaitenClient(
             board_id=user.kaiten_board_id,
             lane_id=user.kaiten_lane_id,
             token=user.kaiten_token,
             base_url=user.kaiten_base_url,
-            tag_ids=user.tag_ids,
-            importance_options=user.importance_options,
-            weekday_options=user.weekday_options,
-            field_ids=user.field_ids,
+            tag_ids=_merged(user.tag_ids, "tag_ids"),
+            importance_options=_merged(user.importance_options, "importance_options"),
+            weekday_options=_merged(user.weekday_options, "weekday_options"),
+            field_ids=_merged(user.field_ids, "field_ids"),
+            time_of_day_options=saved_config.get("time_of_day_options"),
         )
         kaiten_clients.append(client)
 
-        # 2. Настроить доску (если column_ids не заданы явно в конфиге)
+        # 3. Настроить доску (если column_ids не заданы явно в конфиге)
         if user.column_ids:
             column_ids = user.column_ids
             if user.kaiten_lane_id == 0:
@@ -100,17 +114,25 @@ async def main() -> None:
             logger.info("bot: column_ids для user={} взяты из конфига, board_setup пропущен", user.user_id)
         else:
             try:
-                column_ids = await setup_board(client, user)
+                column_ids, discovered_config = await setup_board(client, user)
+                if discovered_config:
+                    await loop.run_in_executor(
+                        None, db.save_user_kaiten_config, user.user_id, discovered_config
+                    )
+                    logger.info(
+                        "bot: автообнаруженная конфигурация Kaiten сохранена для user={}",
+                        user.user_id,
+                    )
             except Exception as exc:
                 logger.error("setup_board failed for user={}: {}", user.user_id, exc)
                 raise
 
-        # 3. Создать зависимости
+        # 4. Создать зависимости
         logic = BoardLogic(client, column_ids)
         morning = MorningLogic(client, logic)
         notifier = Notifier(chat_id=user.telegram_chat_id)
 
-        # 4. Собрать контексты
+        # 5. Собрать контексты
         sched_ctx = UserSchedulerCtx(
             user_cfg=user,
             morning=morning,
@@ -120,10 +142,10 @@ async def main() -> None:
         )
         user_sched_ctxs.append(sched_ctx)
 
-    # 5. Создать Scheduler (до UserHandlerCtx — нужен для коллбэков)
+    # 6. Создать Scheduler (до UserHandlerCtx — нужен для коллбэков)
     scheduler = Scheduler(users=user_sched_ctxs, claude=claude)
 
-    # 6. Создать handler-контексты с коллбэками утра/вечера/пересобрать
+    # 7. Создать handler-контексты с коллбэками утра/вечера/пересобрать
     for sched_ctx in user_sched_ctxs:
         user = sched_ctx.user_cfg
 
@@ -148,11 +170,11 @@ async def main() -> None:
             replan_routine=replan_routine,
         )
 
-    # 7. Telegram Application
+    # 8. Telegram Application
     cfg = HandlersConfig(users=users_handler, claude=claude)
     app = build_handlers(cfg)
 
-    # 8. Запуск
+    # 9. Запуск
     stop_event = asyncio.Event()
 
     # Обработчик SIGTERM (для Railway / Docker graceful shutdown)
