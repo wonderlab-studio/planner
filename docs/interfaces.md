@@ -39,6 +39,7 @@ ANTHROPIC_API_KEY=...
 | Создать кастомное поле | POST | `/company/custom-properties` — body: `{"name": str, "type": str, ["multi_select": bool]}` |
 | Добавить вариант select | POST | `/company/custom-properties/{property_id}/select-values` — body: `{"value": str}` |
 | Список тегов аккаунта | GET | `/company/tags` |
+| Список кастомных полей | GET | `/company/custom-properties` — не подтверждён эмпирически; при ошибке возвращает [] |
 
 > Авторизация: заголовок `Authorization: Bearer {KAITEN_TOKEN}`
 > API возвращает максимум 100 карточек за запрос — необходима пагинация
@@ -406,6 +407,13 @@ class KaitenClient:
         """GET /company/tags — список всех тегов аккаунта.
         Возвращает list[dict] с полями "id", "name" и др.
         При ошибке возвращает [] (не None) — вызывающий код итерирует напрямую."""
+
+    async def get_custom_properties(self) -> list[dict]:
+        """GET /company/custom-properties — список существующих кастомных полей аккаунта.
+        Возвращает list[dict] с полями "id", "name", "type" и др.
+        При ошибке (в т.ч. 404 если эндпоинт не поддерживается) возвращает [] — защита
+        от дублей в board_setup отключается, не ломая логику создания полей.
+        Эндпоинт не подтверждён эмпирически — по аналогии с GET /company/tags."""
 ```
 
 ---
@@ -488,23 +496,38 @@ class BoardLogic:
 async def setup_board(
     client: KaitenClient,
     user: UserConfig,
+    *,
+    needs_custom_fields: bool = True,
 ) -> tuple[dict[str, int], dict | None]:
     """
     Настраивает доску пользователя.
 
+    Параметр needs_custom_fields определяется вызывающим кодом (bot.py) на основе
+    того, есть ли уже сохранённая конфигурация полей для пользователя (field_ids в
+    SQLite или users.json). True = создать кастомные поля и теги. False = пропустить
+    (поля уже настроены). Это делает механизм устойчивым к частичным сбоям: даже
+    если колонки уже существуют (созданы при предыдущем неполном запуске), поля
+    будут созданы при следующем перезапуске, пока field_ids не сохранены.
+
     Возвращает (column_ids, discovered_config):
         column_ids       — dict[str, int]: маппинг имя → id всех стандартных колонок
         discovered_config — dict с ключами field_ids / importance_options / weekday_options /
-                            time_of_day_options / tag_ids если доска была новой (is_new_board),
-                            иначе None.
+                            time_of_day_options / tag_ids если needs_custom_fields=True
+                            и создание завершилось успешно, иначе None.
 
     Побочные эффекты:
         - user.kaiten_lane_id обновляется если был 0
         - user.column_ids обновляется на месте
         - client.configure_custom_fields() вызывается если discovered_config не None
 
-    Сигнатура изменена в июле 2026 (ранее возвращала только dict[str, int]).
-    Вызывающий код (bot.py) должен распаковывать: column_ids, cfg = await setup_board(...)
+    Сигнатура изменена в июле 2026:
+    - (июль 2026 v1) возвращала только dict[str, int]
+    - (июль 2026 v2) добавлен второй элемент кортежа discovered_config
+    - (июль 2026 v3) добавлен параметр needs_custom_fields; убран is_new_board
+      (триггер перенесён из состояния колонок в отсутствие сохранённой конфигурации)
+
+    Вызывающий код (bot.py) должен:
+        column_ids, cfg = await setup_board(client, user, needs_custom_fields=not has_field_config)
     """
 ```
 
@@ -596,6 +619,7 @@ class Card:
 | 5 | Разделители в других колонках | Открыт | sort_order получать динамически, не хардкодить |
 | 6 | Блокировка карточки через API | Решено | POST /cards/{id}/blockers с {"reason": "..."} (PATCH игнорируется) |
 | 7 | Поле last_moved_at в ответе API | Открыт | Добавлено в Card и _parse_card, нужно проверить реально ли Kaiten возвращает это поле. Если нет — last_moved_at_parsed автоматически использует updated_at как fallback. |
+| 8 | GET /company/custom-properties | Открыт | Эндпоинт добавлен в get_custom_properties() по аналогии с /company/tags, но не проверен эмпирически. При 404 метод вернёт [] и защита от дублей отключится (безопасный fallback). |
 
 ---
 
@@ -603,13 +627,15 @@ class Card:
 
 > Wave 1 (параметризация KaitenClient) — реализована, июль 2026.
 > Wave 1.5 (автосоздание полей/тегов через board_setup) — реализована, июль 2026.
+> Wave 1.6 (needs_custom_fields + защита от дублей) — реализована, июль 2026.
 > Wave 2 (проводка из users.json в bot.py + переход handlers/scheduler на builder-методы) — отдельная задача, ещё не выполнена.
 
 ### Автоматическое создание полей и тегов (новая доска)
 
-При первом запуске для нового Kaiten-аккаунта `setup_board` автоматически обнаруживает,
-что ни одной стандартной колонки не существует (`is_new_board = len(existing_by_name) == 0`
-**до** шага создания колонок), и выполняет полную настройку:
+При первом запуске для нового Kaiten-аккаунта `setup_board` получает `needs_custom_fields=True`
+(вызывающий код bot.py определяет это по отсутствию сохранённого field_ids для пользователя)
+и выполняет полную настройку. Этот триггер не зависит от состояния колонок, что делает
+механизм устойчивым к частичным сбоям.
 
 **Создаваемые кастомные поля** (через `POST /company/custom-properties`):
 
@@ -624,6 +650,13 @@ class Card:
 Порядок создания вариантов определяет их ID — сервис не предполагает фиксированный порядок,
 а получает реальные ID из ответа API.
 
+**Защита от дублей при повторной попытке** (если предыдущая попытка прервалась на середине):
+Перед созданием каждого поля `board_setup` вызывает `client.get_custom_properties()` и
+проверяет, не существует ли поле с таким именем уже. Если существует — переиспользует ID
+вместо повторного создания. Варианты select (среднее/важное/...) не проверяются на дубли —
+осознанный компромисс ради простоты. Если `get_custom_properties()` вернёт `[]` (эндпоинт
+не поддерживается) — защита отключается, поля создаются без проверки.
+
 **Получение ID тегов** — через временную карточку:
 1. Создать карточку-заглушку в колонке «Долгий ящик».
 2. Добавить к ней все нужные теги через `POST /cards/{id}/tags` (по имени).
@@ -634,19 +667,12 @@ class Card:
 Создаваемые теги: `ежедневно`, `по будням`, `по выходным`, `еженедельно`, `напомнить`,
 `вечерняя`, `жёсткое событие`, `не дробить`, `рабочая`.
 
+Теги идемпотентны на стороне Kaiten (POST по имени переиспользует существующий тег),
+поэтому для тегов защита от дублей не нужна.
+
 **Результат**: `setup_board` вызывает `client.configure_custom_fields(...)` с реальными ID,
 обновляя инстанс клиента на месте, и возвращает `discovered_config` (dict) вторым элементом
 кортежа — вызывающий код (bot.py) должен сохранить его в `users.json` для следующих запусков.
-
-### Известное ограничение v1: отсутствие восстановления после частичного сбоя
-
-`is_new_board` определяется по наличию стандартных колонок. Если автосоздание полей/тегов
-упадёт **после** того как колонки уже были созданы (сетевая ошибка в середине блока),
-то при следующем перезапуске `is_new_board` окажется `False` (колонки существуют),
-и повторной автоматической попытки создания полей НЕ будет.
-
-В этом случае необходима ручная донастройка — вписать реальные ID вручную в `users.json`
-(см. формат ниже в разделе «Ручная настройка»).
 
 ### Ручная настройка (если автосоздание не сработало)
 
@@ -701,19 +727,21 @@ class Card:
 
 ### Статус реализации
 
-**Уже реализовано (Wave 1 + 1.5):**
+**Уже реализовано (Wave 1 + 1.5 + 1.6):**
 - `KaitenClient.__init__` принимает `tag_ids`, `importance_options`, `weekday_options`, `field_ids`, `time_of_day_options`
 - `KaitenClient.configure_custom_fields()` — обновление конфигурации после `__init__`
+- `KaitenClient.get_custom_properties()` — список существующих полей (best-effort, защита от дублей)
 - `_parse_card` нормализует ключи properties И транслирует option_id в канонические значения
 - `BoardLogic._regular_tag_ids` строится через `client.tag_id()` — per-user множество
 - Builder-методы: `client.tag_id()`, `client.event_time_property()`, `client.importance_property()`
 - `client.create_custom_property()`, `client.create_select_value()`, `client.get_tags()`
-- `board_setup.setup_board()` — автосоздание полей/тегов для новой доски
+- `board_setup.setup_board(needs_custom_fields=...)` — триггер по отсутствию конфигурации,
+  не зависит от состояния колонок; защита от дублей при повторной попытке
 - `Card.time_of_day` — свойство для 4-го кастомного поля
 
 **Ещё не сделано (Wave 2):**
 - `user_config.py`: чтение `tag_ids`, `importance_options`, `weekday_options`, `field_ids`, `time_of_day_options` из users.json в `UserConfig`
-- `bot.py`: передача этих значений в `KaitenClient(...)` при создании per-user клиента; распаковка `(column_ids, cfg) = await setup_board(...)` и сохранение `cfg` в users.json
+- `bot.py`: передача этих значений в `KaitenClient(...)` при создании per-user клиента; распаковка `(column_ids, cfg) = await setup_board(client, user, needs_custom_fields=not has_field_config)` и сохранение `cfg` в users.json
 - `morning_logic.py` / `handlers.py`: переход с хардкода на `client.event_time_property()` и `client.importance_property()`
 
 ---

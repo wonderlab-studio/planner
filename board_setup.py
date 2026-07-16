@@ -30,7 +30,10 @@ _NAME_ALIASES: dict[str, str] = {
 
 
 async def setup_board(
-    client: KaitenClient, user: UserConfig
+    client: KaitenClient,
+    user: UserConfig,
+    *,
+    needs_custom_fields: bool = True,
 ) -> tuple[dict[str, int], dict | None]:
     """
     Настраивает доску пользователя:
@@ -38,14 +41,22 @@ async def setup_board(
     - Удаляет лишние пустые колонки
     - В дневных колонках создаёт разделители (если их нет)
     - Определяет lane_id (если user.kaiten_lane_id == 0)
-    - Если доска новая (ни одной стандартной колонки не было) — автоматически создаёт
-      кастомные поля и теги в Kaiten-аккаунте и вызывает client.configure_custom_fields().
+    - Если needs_custom_fields=True — автоматически создаёт кастомные поля и теги
+      в Kaiten-аккаунте и вызывает client.configure_custom_fields().
+
+    Параметр needs_custom_fields определяется вызывающим кодом (bot.py) на основе
+    того, есть ли уже сохранённая конфигурация поле для пользователя (field_ids в
+    SQLite или users.json). Если конфигурация уже сохранена — False, поля не
+    создаются повторно. Если конфигурация отсутствует — True (в том числе при
+    частичном сбое предыдущей попытки, когда колонки уже существуют, но поля ещё
+    нет). Это делает механизм устойчивым к частичным сбоям и не зависит от состояния
+    колонок доски.
 
     Возвращает (column_ids, discovered_config):
         column_ids      — dict[str, int]: маппинг имя → id
         discovered_config — dict с ключами field_ids / importance_options / weekday_options /
-                           time_of_day_options / tag_ids если была создана новая доска,
-                           иначе None.
+                           time_of_day_options / tag_ids если needs_custom_fields=True
+                           и создание завершилось успешно, иначе None.
     Обновляет user.kaiten_lane_id и user.column_ids на месте.
     """
     logger.info("board_setup: начало для user={}, board={}", user.user_id, user.kaiten_board_id)
@@ -74,10 +85,6 @@ async def setup_board(
             # Стандартное имя — добавляем только если alias ещё не занял место
             if col.title not in existing_by_name:
                 existing_by_name[col.title] = col.id
-
-    # Фиксируем флаг новой доски ДО создания колонок:
-    # доска считается новой если ни одна из стандартных колонок ещё не существует.
-    is_new_board = len(existing_by_name) == 0
 
     # 2.5 Удалить пустые стандартно-названные колонки, если их место уже занято alias-маппингом
     for col in existing:
@@ -142,20 +149,43 @@ async def setup_board(
                 )
                 logger.info("board_setup: создан разделитель «{}» в колонке «{}»", section, col_name)
 
-    # 6. Автосоздание кастомных полей и тегов для новой доски
+    # 6. Автосоздание кастомных полей и тегов (если запрошено вызывающим кодом)
     discovered_config: dict | None = None
 
-    if is_new_board:
+    if needs_custom_fields:
         try:
+            # Получаем список уже существующих кастомных полей (best-effort защита от дублей).
+            # Если эндпоинт не поддерживается — get_custom_properties() вернёт [],
+            # и защита от дублей просто не сработает (поля будут создаваться заново).
+            existing_props = await client.get_custom_properties()
+            existing_props_by_name = {
+                p.get("name"): p.get("id")
+                for p in existing_props
+                if p.get("name") and p.get("id") is not None
+            }
+            if existing_props_by_name:
+                logger.info(
+                    "board_setup: найдено {} существующих кастомных полей: {}",
+                    len(existing_props_by_name), list(existing_props_by_name.keys()),
+                )
+
             # Событие (date)
-            event_prop = await client.create_custom_property("Событие", "date")
-            event_id = event_prop.get("id") if event_prop else None
+            if "Событие" in existing_props_by_name:
+                event_id = existing_props_by_name["Событие"]
+                logger.info("board_setup: поле «Событие» уже существует, id={}", event_id)
+            else:
+                event_prop = await client.create_custom_property("Событие", "date")
+                event_id = event_prop.get("id") if event_prop else None
 
             # Важность (select, одиночный)
-            importance_prop = await client.create_custom_property(
-                "Важность", "select", multi_select=False
-            )
-            importance_id = importance_prop.get("id") if importance_prop else None
+            if "Важность" in existing_props_by_name:
+                importance_id = existing_props_by_name["Важность"]
+                logger.info("board_setup: поле «Важность» уже существует, id={}", importance_id)
+            else:
+                importance_prop = await client.create_custom_property(
+                    "Важность", "select", multi_select=False
+                )
+                importance_id = importance_prop.get("id") if importance_prop else None
             importance_options: dict[str, int] = {}
             if importance_id is not None:
                 for name in ("среднее", "важное", "критическое"):
@@ -164,10 +194,14 @@ async def setup_board(
                         importance_options[name] = val["id"]
 
             # День недели (select, одиночный)
-            weekday_prop = await client.create_custom_property(
-                "День недели", "select", multi_select=False
-            )
-            weekday_id = weekday_prop.get("id") if weekday_prop else None
+            if "День недели" in existing_props_by_name:
+                weekday_id = existing_props_by_name["День недели"]
+                logger.info("board_setup: поле «День недели» уже существует, id={}", weekday_id)
+            else:
+                weekday_prop = await client.create_custom_property(
+                    "День недели", "select", multi_select=False
+                )
+                weekday_id = weekday_prop.get("id") if weekday_prop else None
             weekday_options: dict[str, int] = {}
             if weekday_id is not None:
                 for name in ("ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС"):
@@ -176,10 +210,14 @@ async def setup_board(
                         weekday_options[name] = val["id"]
 
             # Время дня (select, одиночный) — задел на будущее, не используется в логике планирования
-            tod_prop = await client.create_custom_property(
-                "Время дня", "select", multi_select=False
-            )
-            tod_id = tod_prop.get("id") if tod_prop else None
+            if "Время дня" in existing_props_by_name:
+                tod_id = existing_props_by_name["Время дня"]
+                logger.info("board_setup: поле «Время дня» уже существует, id={}", tod_id)
+            else:
+                tod_prop = await client.create_custom_property(
+                    "Время дня", "select", multi_select=False
+                )
+                tod_id = tod_prop.get("id") if tod_prop else None
             time_of_day_options: dict[str, int] = {}
             if tod_id is not None:
                 for name in ("Утро", "День", "Вечер"):

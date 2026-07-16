@@ -89,7 +89,11 @@ async def main() -> None:
         def _merged(explicit, key):
             return explicit if explicit is not None else saved_config.get(key)
 
-        # 2. Создать KaitenClient (с per-user параметрами тегов/полей если заданы)
+        # 2. Вычислить смёрженные field_ids заранее — нужны и для KaitenClient,
+        #    и для решения нужно ли создавать кастомные поля в setup_board
+        merged_field_ids = _merged(user.field_ids, "field_ids")
+
+        # 3. Создать KaitenClient (с per-user параметрами тегов/полей если заданы)
         client = KaitenClient(
             board_id=user.kaiten_board_id,
             lane_id=user.kaiten_lane_id,
@@ -98,12 +102,12 @@ async def main() -> None:
             tag_ids=_merged(user.tag_ids, "tag_ids"),
             importance_options=_merged(user.importance_options, "importance_options"),
             weekday_options=_merged(user.weekday_options, "weekday_options"),
-            field_ids=_merged(user.field_ids, "field_ids"),
+            field_ids=merged_field_ids,
             time_of_day_options=saved_config.get("time_of_day_options"),
         )
         kaiten_clients.append(client)
 
-        # 3. Настроить доску (если column_ids не заданы явно в конфиге)
+        # 4. Настроить доску (если column_ids не заданы явно в конфиге)
         if user.column_ids:
             column_ids = user.column_ids
             if user.kaiten_lane_id == 0:
@@ -114,7 +118,9 @@ async def main() -> None:
             logger.info("bot: column_ids для user={} взяты из конфига, board_setup пропущен", user.user_id)
         else:
             try:
-                column_ids, discovered_config = await setup_board(client, user)
+                column_ids, discovered_config = await setup_board(
+                    client, user, needs_custom_fields=not merged_field_ids,
+                )
                 if discovered_config:
                     await loop.run_in_executor(
                         None, db.save_user_kaiten_config, user.user_id, discovered_config
@@ -127,12 +133,12 @@ async def main() -> None:
                 logger.error("setup_board failed for user={}: {}", user.user_id, exc)
                 raise
 
-        # 4. Создать зависимости
+        # 5. Создать зависимости
         logic = BoardLogic(client, column_ids)
         morning = MorningLogic(client, logic)
         notifier = Notifier(chat_id=user.telegram_chat_id)
 
-        # 5. Собрать контексты
+        # 6. Собрать контексты
         sched_ctx = UserSchedulerCtx(
             user_cfg=user,
             morning=morning,
@@ -142,10 +148,10 @@ async def main() -> None:
         )
         user_sched_ctxs.append(sched_ctx)
 
-    # 6. Создать Scheduler (до UserHandlerCtx — нужен для коллбэков)
+    # 7. Создать Scheduler (до UserHandlerCtx — нужен для коллбэков)
     scheduler = Scheduler(users=user_sched_ctxs, claude=claude)
 
-    # 7. Создать handler-контексты с коллбэками утра/вечера/пересобрать
+    # 8. Создать handler-контексты с коллбэками утра/вечера/пересобрать
     for sched_ctx in user_sched_ctxs:
         user = sched_ctx.user_cfg
 
@@ -170,11 +176,11 @@ async def main() -> None:
             replan_routine=replan_routine,
         )
 
-    # 8. Telegram Application
+    # 9. Telegram Application
     cfg = HandlersConfig(users=users_handler, claude=claude)
     app = build_handlers(cfg)
 
-    # 9. Запуск
+    # 10. Запуск
     stop_event = asyncio.Event()
 
     # Обработчик SIGTERM (для Railway / Docker graceful shutdown)

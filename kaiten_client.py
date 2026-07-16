@@ -792,3 +792,18 @@ class KaitenClient:
         """
         data = await self._request("GET", "/company/tags")
         return data if isinstance(data, list) else []
+
+    async def get_custom_properties(self) -> list[dict]:
+        """GET /company/custom-properties — список существующих кастомных полей аккаунта.
+
+        Возвращает список dict с полями "id", "name", "type" и др., или пустой список
+        при ошибке / если эндпоинт не поддерживается данным инстансом Kaiten.
+
+        Используется в board_setup.py для защиты от дублей при повторной попытке
+        автосоздания кастомных полей (если предыдущая попытка прервалась на середине).
+        Если эндпоинт вернёт 404 или любую ошибку — _request вернёт None,
+        isinstance(None, list) = False, метод корректно вернёт [] и защита от дублей
+        отключится, не ломая логику создания полей.
+        """
+        data = await self._request("GET", "/company/custom-properties")
+        return data if isinstance(data, list) else []
