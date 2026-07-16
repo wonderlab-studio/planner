@@ -715,3 +715,31 @@ class Card:
 - `user_config.py`: чтение `tag_ids`, `importance_options`, `weekday_options`, `field_ids`, `time_of_day_options` из users.json в `UserConfig`
 - `bot.py`: передача этих значений в `KaitenClient(...)` при создании per-user клиента; распаковка `(column_ids, cfg) = await setup_board(...)` и сохранение `cfg` в users.json
 - `morning_logic.py` / `handlers.py`: переход с хардкода на `client.event_time_property()` и `client.importance_property()`
+
+---
+
+## 8. Недокументированные особенности Kaiten API (обнаруженные эмпирически)
+
+Эти особенности нельзя найти чтением кода сервиса — они свойства самого Kaiten API,
+обнаруженные через анализ сырых HTTP-ответов. При отладке необъяснимых расхождений
+(поле записывается, но не читается / значение сохраняется не так, как ожидается) —
+сравнивать сырые GET-ответы до и после PATCH, а не полагаться только на статус HTTP.
+
+### Поля size / size_text / size_unit
+
+Kaiten хранит размер карточки как триаду полей в сыром ответе `GET /cards/{id}`:
+
+```json
+{
+  "size": 2,
+  "size_text": "2",
+  "size_unit": "hours"
+}
+```
+
+- `size` — целое число; единственное поле, которое нужно читать и устанавливать через PATCH
+- `size_text` — строковое представление; Kaiten вычисляет сам, только для чтения
+- `size_unit` — единица измерения, по умолчанию `"hours"`; только для чтения
+
+При установке: `PATCH /cards/{card_id}` с `{"size": 2}` — достаточно только `size`.
+В `_parse_card` читается только `size` — это корректно, `size_text` и `size_unit` игнорировать.
