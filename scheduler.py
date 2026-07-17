@@ -321,6 +321,15 @@ class Scheduler:
             segments_map=segments_map,
         )
 
+        # Фильтруем карточки с прошедшим временем: в отчёте «пересобрать» показываем
+        # только слоты начиная с текущего момента. Карточки без event_time (например,
+        # секция «На контроле») показываются всегда.
+        now_hhmm = now.strftime("%H:%M")
+        cards_dicts = [
+            d for d in cards_dicts
+            if d.get("event_time") is None or d["event_time"] > now_hhmm
+        ]
+
         date_str = _format_date_ru(now.date())
         try:
             plan_text = await self._claude.generate_morning_plan(cards_dicts, date_str)

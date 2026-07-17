@@ -202,6 +202,17 @@ class _BlockScheduler:
                 return [(seg_s, end)]
         return None
 
+    def reset_cursor_to_start(self) -> None:
+        """Возвращает курсор к началу блока.
+
+        Вызывается между группами приоритета, чтобы более поздние (менее
+        приоритетные) группы могли заполнить окна, пропущенные атомарными
+        («не дробить») или сегментированными задачами более ранних групп.
+        Occupied-список не сбрасывается — наложение на уже размещённые задачи
+        по-прежнему исключено.
+        """
+        self._cursor = self._start
+
 
 # ── MorningLogic ──────────────────────────────────────────────────────────────
 
@@ -400,6 +411,11 @@ class MorningLogic:
         Принимает processing_order — список (group_cards, sched, section).
         Возвращает список overflow-карточек (не вошедших в блок).
 
+        Перед началом обработки каждой группы курсор блока сбрасывается к началу
+        (reset_cursor_to_start), чтобы более поздние (менее приоритетные) группы
+        могли заполнить окна, пропущенные атомарными или сегментированными задачами
+        более ранних групп. Occupied-список при этом не сбрасывается.
+
         Карточки с тегом «не дробить» размещаются атомарно (try_place_atomic);
         остальные — сегментированно (try_place_segmented).
         """
@@ -421,6 +437,11 @@ class MorningLogic:
             return count
 
         for step_idx, (group_cards, sched, section) in enumerate(processing_order):
+            # Сбрасываем курсор к началу блока перед каждой группой — это даёт
+            # менее приоритетным группам возможность заполнить окна, пропущенные
+            # атомарными («не дробить») задачами более ранних групп.
+            # Occupied-список не сбрасывается: наложение на размещённые задачи исключено.
+            sched.reset_cursor_to_start()
             for card_idx, card in enumerate(group_cards):
                 # Вычисляем нужную длительность
                 if card.size == 999:
@@ -507,6 +528,8 @@ class MorningLogic:
         # ── Фаза 0: резервируем слоты для карточек уже в сегодняшней колонке ──
         # Карточки уже в today_col_id не перемещаются (они на месте), но их временной
         # слот нужно зарезервировать чтобы фазы 1–3 не ставили задачи поверх них.
+        # Тег «жёсткое событие» ставится так же как в Фазе 1, чтобы replan() мог
+        # распознать их как жёсткие встречи (is_hard определяется по этому тегу).
         for card in preloaded.get(today_col_id, []):
             if card.blocked or card.archived:
                 continue
@@ -530,6 +553,15 @@ class MorningLogic:
                 "phase0 reserve: «{}» (id={}) {}–{}",
                 card.title, card.id, _fmt_min(start_min), _fmt_min(end_min),
             )
+            # Ставим тег «жёсткое событие» — идемпотентно (Kaiten не создаёт дубли).
+            # Необходимо чтобы replan() распознал карточку как жёсткую встречу.
+            try:
+                await self._client.add_tag_by_name(card.id, "жёсткое событие")
+            except Exception as exc:
+                logger.warning(
+                    "phase0: не удалось добавить тег «жёсткое событие» id={} — {}",
+                    card.id, exc,
+                )
 
         # ── Фаза 1: фиксированные события ─────────────────────────────────────
         # Попадают: event_time.date() == today
@@ -717,6 +749,15 @@ class MorningLogic:
                         card.importance == "критическое"
                         and dl_date is not None
                         and dl_date in (from_date, from_date + timedelta(days=1))
+                    )
+                    # Диагностическое логирование для отладки бага с пропущенным ⚠️.
+                    # Позволяет в логах Railway увидеть точные значения всех полей
+                    # при следующем воспроизведении.
+                    logger.info(
+                        "overflow risky-check: «{}» (id={}) importance={} "
+                        "due_date_raw={} dl_date={} from_date={} risky={}",
+                        card.title, card.id, card.importance,
+                        card.due_date, dl_date, from_date, risky,
                     )
                     target_name = self._logic.column_name_by_id.get(
                         target_col, str(target_col)

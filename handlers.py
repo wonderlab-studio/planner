@@ -958,6 +958,32 @@ def build_handlers(cfg: HandlersConfig) -> Application:
 
         # FIX 1: size=None трактуется как 15 мин (DEFAULT_HOURS=0.25) → тоже короткая задача
         if card and card.size != 999 and (card.size is None or card.size <= 0.25):
+            # Мягкое сопротивление: критическая задача с дедлайном сегодня/завтра —
+            # тот же risky-чек, что в received_hours_cb, иначе короткие задачи без
+            # размера проскакивали перенос без подтверждения (баг).
+            today_t = datetime.now(TZ_MSK).date()
+            tomorrow_t = today_t + timedelta(days=1)
+            due_dt_t = card.due_date_parsed
+            due_date_t = due_dt_t.date() if due_dt_t else None
+            risky = card.importance == "критическое" and due_date_t in (today_t, tomorrow_t)
+
+            if risky:
+                title_t = context.user_data.get("selected_card_title", f"#{card_id}")
+                context.user_data["pending_move"] = {
+                    "kind": "postpone",
+                    "card_id": card_id,
+                    "hours": None,
+                }
+                await query.edit_message_text(
+                    f"⚠️ «{title_t}» — критическая задача с дедлайном {due_date_t}.\n"
+                    f"Точно перенести?",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("Да, перенести", callback_data="confirm:move"),
+                        InlineKeyboardButton("Отмена", callback_data="confirm:cancel"),
+                    ]]),
+                )
+                return ConversationHandler.END
+
             ok, msg = await _postpone_card(user_ctx, card, hours=None)
             await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN)
             if update.effective_chat:
