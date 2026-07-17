@@ -169,7 +169,7 @@ async def setup_board(
                     len(existing_props_by_name), list(existing_props_by_name.keys()),
                 )
 
-            # Событие (date)
+            # Событие (date) — не select-поле, варианты не создаются
             if "Событие" in existing_props_by_name:
                 event_id = existing_props_by_name["Событие"]
                 logger.info("board_setup: поле «Событие» уже существует, id={}", event_id)
@@ -178,7 +178,8 @@ async def setup_board(
                 event_id = event_prop.get("id") if event_prop else None
 
             # Важность (select, одиночный)
-            if "Важность" in existing_props_by_name:
+            importance_was_existing = "Важность" in existing_props_by_name
+            if importance_was_existing:
                 importance_id = existing_props_by_name["Важность"]
                 logger.info("board_setup: поле «Важность» уже существует, id={}", importance_id)
             else:
@@ -186,15 +187,17 @@ async def setup_board(
                     "Важность", "select", multi_select=False
                 )
                 importance_id = importance_prop.get("id") if importance_prop else None
+            # Создаём варианты ТОЛЬКО если поле было создано заново в этом запуске
             importance_options: dict[str, int] = {}
-            if importance_id is not None:
+            if importance_id is not None and not importance_was_existing:
                 for name in ("среднее", "важное", "критическое"):
                     val = await client.create_select_value(importance_id, name)
                     if val and val.get("id") is not None:
                         importance_options[name] = val["id"]
 
             # День недели (select, одиночный)
-            if "День недели" in existing_props_by_name:
+            weekday_was_existing = "День недели" in existing_props_by_name
+            if weekday_was_existing:
                 weekday_id = existing_props_by_name["День недели"]
                 logger.info("board_setup: поле «День недели» уже существует, id={}", weekday_id)
             else:
@@ -202,15 +205,17 @@ async def setup_board(
                     "День недели", "select", multi_select=False
                 )
                 weekday_id = weekday_prop.get("id") if weekday_prop else None
+            # Создаём варианты ТОЛЬКО если поле было создано заново в этом запуске
             weekday_options: dict[str, int] = {}
-            if weekday_id is not None:
+            if weekday_id is not None and not weekday_was_existing:
                 for name in ("ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС"):
                     val = await client.create_select_value(weekday_id, name)
                     if val and val.get("id") is not None:
                         weekday_options[name] = val["id"]
 
             # Время дня (select, одиночный) — задел на будущее, не используется в логике планирования
-            if "Время дня" in existing_props_by_name:
+            tod_was_existing = "Время дня" in existing_props_by_name
+            if tod_was_existing:
                 tod_id = existing_props_by_name["Время дня"]
                 logger.info("board_setup: поле «Время дня» уже существует, id={}", tod_id)
             else:
@@ -218,8 +223,9 @@ async def setup_board(
                     "Время дня", "select", multi_select=False
                 )
                 tod_id = tod_prop.get("id") if tod_prop else None
+            # Создаём варианты ТОЛЬКО если поле было создано заново в этом запуске
             time_of_day_options: dict[str, int] = {}
-            if tod_id is not None:
+            if tod_id is not None and not tod_was_existing:
                 for name in ("Утро", "День", "Вечер"):
                     val = await client.create_select_value(tod_id, name)
                     if val and val.get("id") is not None:
@@ -235,32 +241,54 @@ async def setup_board(
             if tod_id is not None:
                 field_ids["time_of_day"] = f"id_{tod_id}"
 
-            # Теги: создаём через временную карточку в «Долгий ящик»,
-            # затем получаем итоговые ID через GET /company/tags
+            # Теги: сначала проверяем что уже есть через GET /company/tags.
+            # Временную карточку создаём ТОЛЬКО если каких-то тегов не хватает.
+            tag_names = [
+                "ежедневно", "по будням", "по выходным", "еженедельно",
+                "напомнить", "вечерняя", "жёсткое событие", "не дробить", "рабочая",
+            ]
             tag_ids: dict[str, int] = {}
-            temp_card_id: int | None = None
             try:
-                long_box_col = existing_by_name.get("Долгий ящик")
-                if long_box_col:
-                    temp = await client.create_card(
-                        column_id=long_box_col, title="_setup_tags_tmp"
+                all_tags_before = await client.get_tags()
+                tag_names_set = set(tag_names)
+                for t in all_tags_before:
+                    if t.get("name") in tag_names_set and t.get("id") is not None:
+                        tag_ids[t["name"]] = t["id"]
+
+                missing_tags = tag_names_set - set(tag_ids.keys())
+                if missing_tags:
+                    logger.info(
+                        "board_setup: теги отсутствуют, создаём через временную карточку: {}",
+                        sorted(missing_tags),
                     )
-                    if temp:
-                        temp_card_id = temp.id
-                        tag_names = [
-                            "ежедневно", "по будням", "по выходным", "еженедельно",
-                            "напомнить", "вечерняя", "жёсткое событие", "не дробить", "рабочая",
-                        ]
-                        for tag_name in tag_names:
-                            await client.add_tag_by_name(temp_card_id, tag_name)
-                        all_tags = await client.get_tags()
-                        tag_names_set = set(tag_names)
-                        for t in all_tags:
-                            if t.get("name") in tag_names_set and t.get("id") is not None:
-                                tag_ids[t["name"]] = t["id"]
-            finally:
-                if temp_card_id is not None:
-                    await client.delete_card(temp_card_id)
+                    temp_card_id: int | None = None
+                    try:
+                        long_box_col = existing_by_name.get("Долгий ящик")
+                        if long_box_col:
+                            temp = await client.create_card(
+                                column_id=long_box_col, title="_setup_tags_tmp"
+                            )
+                            if temp:
+                                temp_card_id = temp.id
+                                for tag_name in missing_tags:
+                                    await client.add_tag_by_name(temp_card_id, tag_name)
+                                all_tags_after = await client.get_tags()
+                                for t in all_tags_after:
+                                    if t.get("name") in missing_tags and t.get("id") is not None:
+                                        tag_ids[t["name"]] = t["id"]
+                    finally:
+                        if temp_card_id is not None:
+                            await client.delete_card(temp_card_id)
+                else:
+                    logger.info(
+                        "board_setup: все {} тегов уже существуют — временная карточка не нужна",
+                        len(tag_names),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "board_setup: ошибка при определении/создании тегов user={} — {}",
+                    user.user_id, exc,
+                )
 
             discovered_config = {
                 "field_ids":           field_ids,
