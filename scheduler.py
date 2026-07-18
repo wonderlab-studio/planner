@@ -29,7 +29,7 @@ from kaiten_client import Card, KaitenClient, TAG_IDS
 from board_logic import BoardLogic
 from claude_client import ClaudeClient
 from notifier import Notifier
-from morning_logic import MorningLogic
+from morning_logic import MorningLogic, _DEFAULT_HOURS
 from user_config import UserConfig
 
 
@@ -138,6 +138,31 @@ def _extract_section_cards(
 def _now_msk() -> datetime:
     """Текущее время в UTC+3."""
     return datetime.now(tz=_TZ_MSK)
+
+
+def _compute_end_hhmm(d: dict) -> str | None:
+    """Вычисляет строку HH:MM конца задачи по сегментам или event_time+size.
+
+    Приоритеты:
+      1. Непустые segments — берёт конец последнего сегмента.
+      2. size задан и != 999 — event_time + size часов.
+      3. size is None — event_time + _DEFAULT_HOURS (0.25 ч = 15 мин).
+      4. size == 999 без segments — конец неизвестен, возвращает None.
+
+    Вызывать только когда d["event_time"] гарантированно не None.
+    """
+    segments = d.get("segments") or []
+    if segments:
+        return segments[-1][1]
+    size = d.get("size")
+    if size == 999:
+        return None
+    et = d["event_time"]
+    h, m = int(et[:2]), int(et[3:5])
+    duration_h = size if size is not None else _DEFAULT_HOURS
+    total = h * 60 + m + round(duration_h * 60)
+    end_h, end_m = divmod(total, 60)
+    return f"{end_h:02d}:{end_m:02d}"
 
 
 # ── Ключ дедупликации напоминаний ─────────────────────────────────────────────
@@ -324,11 +349,33 @@ class Scheduler:
         # Фильтруем карточки с прошедшим временем: в отчёте «пересобрать» показываем
         # только слоты начиная с текущего момента. Карточки без event_time (например,
         # секция «На контроле») показываются всегда.
+        # Задача, которая идёт СЕЙЧАС (начало в прошлом, конец в будущем), не удаляется —
+        # её начало заменяется на текущий момент, чтобы показать оставшуюся часть.
         now_hhmm = now.strftime("%H:%M")
-        cards_dicts = [
-            d for d in cards_dicts
-            if d.get("event_time") is None or d["event_time"] > now_hhmm
-        ]
+        filtered: list[dict] = []
+        for d in cards_dicts:
+            et = d.get("event_time")
+            if et is None:
+                # Нет времени (напр. «На контроле») — показываем всегда
+                filtered.append(d)
+                continue
+            end_hhmm = _compute_end_hhmm(d)
+            if end_hhmm is None:
+                # size==999 без сегментов — конец неизвестен, старое поведение
+                if et > now_hhmm:
+                    filtered.append(d)
+                continue
+            if end_hhmm <= now_hhmm:
+                # Задача полностью завершилась — пропускаем
+                continue
+            if et <= now_hhmm < end_hhmm:
+                # Задача идёт сейчас: показываем оставшийся отрезок
+                d["segments"] = [(now_hhmm, end_hhmm)]
+                filtered.append(d)
+            else:
+                # et > now_hhmm — будущая задача, оставляем как есть
+                filtered.append(d)
+        cards_dicts = filtered
 
         date_str = _format_date_ru(now.date())
         try:

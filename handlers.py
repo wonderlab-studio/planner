@@ -936,11 +936,16 @@ def build_handlers(cfg: HandlersConfig) -> Application:
         assert query is not None
         await query.answer()
         context.user_data["pending_action"] = "done"
-        await query.edit_message_text(
-            "💬 Добавь комментарий к выполненной задаче\n"
-            "_(или напиши «.» чтобы обойтись без комментария)_",
+        # Убираем клавиатуру у старого сообщения
+        await query.edit_message_text("✅ Готово", reply_markup=None)
+        # Новое сообщение — пользователь получит push-уведомление
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=(
+                "💬 Добавь комментарий к выполненной задаче\n"
+                "_(или напиши «.» чтобы обойтись без комментария)_"
+            ),
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=None,
         )
         return AWAITING_COMMENT
 
@@ -990,10 +995,13 @@ def build_handlers(cfg: HandlersConfig) -> Application:
                 await _resend_card_buttons(user_ctx, context, update.effective_chat.id)
             return ConversationHandler.END
 
-        await query.edit_message_text(
-            "⏱ Сколько часов реально нужно ещё? Перенесу на следующий подходящий день. _(введи целое число)_",
+        # Убираем клавиатуру у старого сообщения
+        await query.edit_message_text("⏭ Продолжить в другой день", reply_markup=None)
+        # Новое сообщение — пользователь получит push-уведомление
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="⏱ Сколько часов реально нужно ещё? Перенесу на следующий подходящий день. _(введи целое число)_",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=None,
         )
         return AWAITING_HOURS
 
@@ -1005,9 +1013,12 @@ def build_handlers(cfg: HandlersConfig) -> Application:
         assert query is not None
         await query.answer()
         context.user_data["pending_action"] = "comment"
-        await query.edit_message_text(
-            "💬 Введи текст комментария:",
-            reply_markup=None,
+        # Убираем клавиатуру у старого сообщения
+        await query.edit_message_text("💬 Комментарий", reply_markup=None)
+        # Новое сообщение — пользователь получит push-уведомление
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="💬 Введи текст комментария:",
         )
         return AWAITING_COMMENT
 
@@ -1018,11 +1029,16 @@ def build_handlers(cfg: HandlersConfig) -> Application:
         query = update.callback_query
         assert query is not None
         await query.answer()
-        await query.edit_message_text(
-            "📅 Куда перенести?\n"
-            "_Например: «завтра», «пятница вечер», «следующая неделя»_",
+        # Убираем клавиатуру у старого сообщения
+        await query.edit_message_text("📅 Перенести", reply_markup=None)
+        # Новое сообщение — пользователь получит push-уведомление
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=(
+                "📅 Куда перенести?\n"
+                "_Например: «завтра», «пятница вечер», «следующая неделя»_"
+            ),
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=None,
         )
         return AWAITING_MOVE_TARGET
 
@@ -1337,7 +1353,7 @@ def build_handlers(cfg: HandlersConfig) -> Application:
 
     # ── Подтверждение переноса критической задачи ─────────────────────────────
     # Зарегистрированы как top-level хендлеры (не в states ConversationHandler),
-    # чтобы работать и из текстовой команды «перенести», и из диалога кнопок.
+    # чтобы работать и из текстовой команды «перенести», и после кнопки «Перенести».
 
     async def confirm_move_cb(
         update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1426,11 +1442,16 @@ def build_handlers(cfg: HandlersConfig) -> Application:
         query = update.callback_query
         assert query is not None
         await query.answer()
-        await query.edit_message_text(
-            "🤖 Какой вопрос по этой задаче?\n"
-            "_Например: «с чего начать», «какие риски», «что учесть»_",
+        # Убираем клавиатуру у старого сообщения
+        await query.edit_message_text("🤖 Совет", reply_markup=None)
+        # Новое сообщение — пользователь получит push-уведомление
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=(
+                "🤖 Какой вопрос по этой задаче?\n"
+                "_Например: «с чего начать», «какие риски», «что учесть»_"
+            ),
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=None,
         )
         return AWAITING_QUESTION
 
@@ -1503,11 +1524,16 @@ def build_handlers(cfg: HandlersConfig) -> Application:
         query = update.callback_query
         assert query is not None
         await query.answer()
-        await query.edit_message_text(
-            "🔔 Когда напомнить?\n"
-            "_Например: «завтра в 14:00», «пятница 09:30», «20 июня 10:00»_",
+        # Убираем клавиатуру у старого сообщения
+        await query.edit_message_text("🔔 Напоминалка", reply_markup=None)
+        # Новое сообщение — пользователь получит push-уведомление
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=(
+                "🔔 Когда напомнить?\n"
+                "_Например: «завтра в 14:00», «пятница 09:30», «20 июня 10:00»_"
+            ),
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=None,
         )
         return AWAITING_REMINDER_TIME
 
@@ -1696,7 +1722,7 @@ def build_handlers(cfg: HandlersConfig) -> Application:
                 CallbackQueryHandler(action_back_cb,     pattern=r"^action:back$"),
             ],
             AWAITING_COMMENT: [
-                MessageHandler(_text_not_cmd, received_comment_cb),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, received_comment_cb),
             ],
             AWAITING_HOURS: [
                 MessageHandler(_text_not_cmd, received_hours_cb),
@@ -1705,7 +1731,7 @@ def build_handlers(cfg: HandlersConfig) -> Application:
                 MessageHandler(_text_not_cmd, received_move_target_cb),
             ],
             AWAITING_QUESTION: [
-                MessageHandler(_text_not_cmd, received_question_cb),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, received_question_cb),
             ],
             AWAITING_REMINDER_TIME: [
                 MessageHandler(_text_not_cmd, received_reminder_time_cb),
@@ -1727,13 +1753,9 @@ def build_handlers(cfg: HandlersConfig) -> Application:
 
     # ══════════════════════════════════════════════════════════════════════════
     # Основной text_handler (роутер)
-    # ══════════════════════════════════════════════════════════════════════════
 
     async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Главный роутер текстовых сообщений."""
-        if update.message is None or update.message.text is None:
-            return
-
+        """Роутер текстовых сообщений вне диалога."""
         chat_id = update.effective_chat.id if update.effective_chat else None
         user_ctx = cfg.users.get(chat_id) if chat_id else None
         if user_ctx is None:
