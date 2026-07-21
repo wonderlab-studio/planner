@@ -115,10 +115,28 @@ def _format_cards_by_section(cards: list[dict]) -> str:
 
 
 def _format_card_simple(card: dict) -> str:
-    """Упрощённый формат для вечернего итога."""
+    """Упрощённый формат для вечернего итога (done / added)."""
     title = card.get("title", "(без названия)")
     imp = card.get("importance", "")
     suffix = f" [{imp}]" if imp else ""
+    return f"• {title}{suffix}"
+
+
+def _format_card_undone(card: dict) -> str:
+    """Формат для невыполненных задач вечернего итога.
+
+    Добавляет пометку [На контроле] если section == 'На контроле',
+    чтобы модель могла оценить их отдельно от личных задач.
+    """
+    title = card.get("title", "(без названия)")
+    imp = card.get("importance", "")
+    section = card.get("section", "")
+    suffix_parts = []
+    if imp:
+        suffix_parts.append(imp)
+    if section == "На контроле":
+        suffix_parts.append("На контроле")
+    suffix = f" [{', '.join(suffix_parts)}]" if suffix_parts else ""
     return f"• {title}{suffix}"
 
 
@@ -206,36 +224,57 @@ class ClaudeClient:
         self,
         done: list[dict],
         undone: list[dict],
+        moved: list[dict],
+        added: list[dict],
     ) -> str:
         """Генерирует вечерний итог дня для Telegram.
 
         Параметры:
-            done   — выполненные карточки: [{title, importance, ...}, ...]
-            undone — невыполненные карточки
+            done   — выполненные карточки: [{title, importance, size}, ...]
+            undone — карточки, оставшиеся открытыми: [{title, importance, size,
+                      section}, ...]; section может быть "На контроле"
+            moved  — перенесённые карточки: [{title, detail}, ...],
+                      где detail — свободный текст куда/когда перенесено
+            added  — новые карточки, созданные за день: [{title, importance, size}, ...]
 
         Возвращает:
             Текст итога в Markdown для отправки в Telegram.
 
         Пример промпта (user):
-            "Сделано (3):
+            "Сделано (2):
             • Позвонить заказчику [критическое]
             • Написать отчёт [важное]
-            • Купить продукты
 
-            Не сделано (2):
-            • Разобрать почту [важное]
-            • Спортзал"
+            Не сделано (1):
+            • Разобрать почту [среднее, На контроле]
+
+            Перенесено (1):
+            — Спортзал → на завтра утром
+
+            Добавлено (1):
+            • Купить продукты"
         """
         done_lines = "\n".join(_format_card_simple(c) for c in done) or "ничего"
-        undone_lines = "\n".join(_format_card_simple(c) for c in undone) or "ничего"
+        undone_lines = "\n".join(_format_card_undone(c) for c in undone) or "ничего"
+        moved_lines = (
+            "\n".join(
+                f"— {c.get('title', '(без названия)')} → {c.get('detail', '')}"
+                for c in moved
+            )
+            or "не переносилось"
+        )
+        added_lines = "\n".join(_format_card_simple(c) for c in added) or "ничего"
 
         user_message = (
             f"Сделано ({len(done)}):\n{done_lines}\n\n"
-            f"Не сделано ({len(undone)}):\n{undone_lines}"
+            f"Не сделано ({len(undone)}):\n{undone_lines}\n\n"
+            f"Перенесено ({len(moved)}):\n{moved_lines}\n\n"
+            f"Добавлено ({len(added)}):\n{added_lines}"
         )
 
         logger.debug(
-            "generate_evening_summary: done={} undone={}", len(done), len(undone)
+            "generate_evening_summary: done={} undone={} moved={} added={}",
+            len(done), len(undone), len(moved), len(added),
         )
 
         try:

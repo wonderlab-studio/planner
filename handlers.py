@@ -9,11 +9,13 @@ handlers.py — хендлеры команд Telegram-бота.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Callable, Awaitable
 
+import db
 from loguru import logger
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ParseMode
@@ -44,7 +46,13 @@ AWAITING_HOURS       = 2  # ждём число часов для «Продол
 AWAITING_MOVE_TARGET = 3  # ждём куда перенести
 AWAITING_QUESTION    = 4  # ждём вопрос для кнопки «Совет»
 AWAITING_REMINDER_TIME = 5  # ждём дату/время для кнопки «Напоминалка»
-# CONFIRM_RISKY_MOVE = 6 — не используется как состояние диалога;
+CREATE_AWAITING_TITLE         = 6   # ждём название новой задачи
+CREATE_MENU                   = 7   # показан конструктор, ждём нажатие кнопки-параметра
+CREATE_AWAITING_SIZE_TEXT     = 8   # ждём свой размер в часах текстом (реализация в след. задаче)
+CREATE_AWAITING_EVENT_TEXT    = 9   # ждём дату/время события текстом (реализация в след. задаче)
+CREATE_AWAITING_DEADLINE_TEXT = 10  # ждём дату дедлайна текстом (реализация в след. задаче)
+CREATE_AWAITING_EDIT_TITLE    = 11  # ждём новое название при редактировании карточки
+# CONFIRM_RISKY_MOVE — не используется как состояние диалога;
 # confirm_move_cb/confirm_cancel_cb зарегистрированы как top-level хендлеры
 
 # ── Фильтр «известные команды» — чтобы они не попадали в состояния диалога ────
@@ -69,11 +77,13 @@ HELP_TEXT = """\
 • `утро` — план на день + кнопки карточек
 • `вечер` — итог дня
 • `пересобрать` / `перепланируй` — пересобрать план с текущего момента
+• `/replan` — то же самое, что «пересобрать»
 
 *Задачи:*
 • `создать <описание>` — создать карточку _(можно добавить «размер - 2» или «размер 0.5» для явного размера в часах)_
 • `создай <описание>` — то же самое
 • `/add <описание>` — создать карточку
+• `/newtask` — создать задачу через пошаговый конструктор (размер, событие, дедлайн, регулярность, важность, напоминалка)
 
 *Управление:*
 • `готово <описание>` — завершить задачу; для регулярных (ежедневно/по будням/по выходным/еженедельно) переносит на следующий цикл вместо архивации
@@ -83,15 +93,25 @@ HELP_TEXT = """\
 • `заметка <название> // <текст>` — добавить комментарий к карточке
 • `/note <название> // <текст>` — добавить комментарий
 
+*Просмотр других колонок:*
+• `/other` — посмотреть задачи не только сегодняшнего дня (другие дни недели, следующая неделя, далёкие времена)
+
 *Кнопки над карточкой:*
 • ✅ *Готово* — завершить (регулярные → следующий цикл)
 • ⏭ *Продолжить в другой день* — перенести остаток на следующий подходящий день
 • 💬 *Комментарий* — добавить заметку к карточке
 • 📅 *Перенести* — переместить в другой день/колонку
+• ✏️ *Редактировать* — изменить размер/событие/дедлайн/регулярность/важность/напоминалку через тот же конструктор, что и при создании
 • 🤖 *Совет* — получить совет от AI по задаче
 • 🔔 *Напоминалка* — установить время события (event_time)
 • ← *Назад* — вернуться к списку карточек
 _Пагинация:_ кнопки «← Назад» / «Ещё →» при длинном списке карточек
+
+*Меню (кнопка ☰ слева от поля ввода):*
+• Создать задачу — то же, что `/newtask`
+• Задачи другой колонки — то же, что `/other`
+• Пересобрать — то же, что «пересобрать»
+• Помощь — этот текст
 
 *Отмена:*
 • `/cancel` — отмена текущего диалога
@@ -153,35 +173,47 @@ def _split_text(text: str, max_len: int = _MAX_TG_LEN) -> list[str]:
 
 
 async def _reply_and_return(
-    update: Update, text: str, parse_mode: str = ParseMode.MARKDOWN
+    update: Update,
+    text: str,
+    parse_mode: str = ParseMode.MARKDOWN,
+    silent: bool = False,
 ) -> list[Message]:
     """Отправляет ответ пользователю, возвращает список отправленных Message-объектов.
 
     Длинные тексты (> 4096 символов) автоматически разбиваются на части.
     При ошибке Markdown повторяет без форматирования.
+    silent=True — отправить без звука.
     """
     assert update.message is not None
     sent: list[Message] = []
     for part in _split_text(text):
         try:
-            msg = await update.message.reply_text(part, parse_mode=parse_mode)
+            msg = await update.message.reply_text(
+                part, parse_mode=parse_mode, disable_notification=silent
+            )
             sent.append(msg)
         except Exception:
             try:
-                msg = await update.message.reply_text(part)
+                msg = await update.message.reply_text(part, disable_notification=silent)
                 sent.append(msg)
             except Exception as exc:
                 logger.error("_reply_and_return: не удалось отправить часть сообщения — {}", exc)
     return sent
 
 
-async def _reply(update: Update, text: str, parse_mode: str = ParseMode.MARKDOWN) -> None:
+async def _reply(
+    update: Update,
+    text: str,
+    parse_mode: str = ParseMode.MARKDOWN,
+    silent: bool = False,
+) -> None:
     """Отправляет ответ пользователю.
 
     Длинные тексты (> 4096 символов) автоматически разбиваются на части.
     При ошибке Markdown повторяет без форматирования.
+    silent=True — отправить без звука.
     """
-    await _reply_and_return(update, text, parse_mode)
+    await _reply_and_return(update, text, parse_mode, silent)
 
 
 def _strip_command_prefix(text: str, *prefixes: str) -> str:
@@ -248,6 +280,7 @@ async def send_card_buttons(
     bot: Bot,
     chat_id: int | str,
     page: int = 0,
+    silent: bool = False,
 ) -> None:
     """Отправляет страницу InlineKeyboard из карточек сегодняшнего дня.
 
@@ -255,6 +288,8 @@ async def send_card_buttons(
     Пагинация: MAX_CARD_BUTTONS кнопок на страницу.
     callback_data = "card:{card.id}"
     Навигация: "← Назад" (page:{page-1}), "Ещё →" (page:{page+1}).
+    silent=True — отправить без звука.
+    Кнопки с event_time на сегодня отображают префикс времени «ЧЧ:ММ».
     """
     # Сортируем ПОЛНЫЙ список по sort_order — нужно для определения секции «На контроле»
     full_sorted = sorted(cards, key=lambda c: c.sort_order)
@@ -274,9 +309,19 @@ async def send_card_buttons(
 
     start = page * MAX_CARD_BUTTONS
     shown = task_cards[start : start + MAX_CARD_BUTTONS]
+    today_msk = datetime.now(TZ_MSK).date()
+
+    def _button_text(c: Card) -> str:
+        prefix = ""
+        if c.event_time and c.event_time.date() == today_msk:
+            prefix = f"{c.event_time:%H:%M} "
+        available = _BTN_TITLE_LEN - len(prefix)
+        title = c.title[:available] + ("…" if len(c.title) > available else "")
+        return prefix + title
+
     keyboard = [
         [InlineKeyboardButton(
-            text=c.title[:_BTN_TITLE_LEN] + ("…" if len(c.title) > _BTN_TITLE_LEN else ""),
+            text=_button_text(c),
             callback_data=f"card:{c.id}",
         )]
         for c in shown
@@ -300,6 +345,7 @@ async def send_card_buttons(
             text=text,
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=markup,
+            disable_notification=silent,
         )
         logger.debug("send_card_buttons: отправлено {} кнопок, стр={}", len(shown), page)
     except Exception as exc:
@@ -318,7 +364,7 @@ async def _handle_morning(
     Если routine возвращает непустую строку — отвечает ею прямо в чат, затем
     откепляет все ранее закреплённые сообщения и закрепляет последнее сообщение плана.
     Если пустую — значит scheduler уже отправил через Notifier, дубль не нужен.
-    После плана всегда отправляет кнопки карточек сегодняшнего дня.
+    После плана всегда отправляет кнопки карточек сегодняшнего дня беззвучно.
     """
     assert update.message is not None
     logger.info("handle_morning: запрос от пользователя")
@@ -327,7 +373,7 @@ async def _handle_morning(
     try:
         plan_text = await user_ctx.morning_routine()
         if plan_text:
-            sent_messages = await _reply_and_return(update, plan_text)
+            sent_messages = await _reply_and_return(update, plan_text, silent=True)
             if sent_messages and update.effective_chat:
                 try:
                     await update.effective_chat.unpin_all_messages()
@@ -348,7 +394,9 @@ async def _handle_morning(
             today_col_id = user_ctx.logic.get_today_column_id()
             today_cards = await user_ctx.kaiten.get_cards(today_col_id)
             if today_cards:
-                await send_card_buttons(today_cards, context.bot, update.effective_chat.id, page=0)
+                await send_card_buttons(
+                    today_cards, context.bot, update.effective_chat.id, page=0, silent=True
+                )
         except Exception as exc:
             logger.warning("handle_morning: не удалось отправить кнопки карточек — {}", exc)
 
@@ -388,7 +436,7 @@ async def _handle_replan(
         await _reply(update, "⚠️ Не удалось пересобрать план. Попробуй позже.")
         return
     if plan_text:
-        sent_messages = await _reply_and_return(update, plan_text)
+        sent_messages = await _reply_and_return(update, plan_text, silent=True)
         if sent_messages and update.effective_chat:
             try:
                 await update.effective_chat.unpin_all_messages()
@@ -403,7 +451,9 @@ async def _handle_replan(
             today_col_id = user_ctx.logic.get_today_column_id()
             today_cards = await user_ctx.kaiten.get_cards(today_col_id)
             if today_cards:
-                await send_card_buttons(today_cards, context.bot, update.effective_chat.id, page=0)
+                await send_card_buttons(
+                    today_cards, context.bot, update.effective_chat.id, page=0, silent=True
+                )
         except Exception as exc:
             logger.warning("handle_replan: не удалось отправить кнопки карточек — {}", exc)
 
@@ -480,6 +530,9 @@ async def _handle_create(
         await _reply(update, "⚠️ Kaiten не вернул карточку. Возможно, создание не удалось.")
         return
 
+    # B.9: логируем создание карточки
+    await _log_event(user_ctx, "created", card.title, detail=f"{column_name} / {section}")
+
     parts = [f"✅ Карточка создана: *{card.title}*", f"📅 Колонка: {column_name} / {section}"]
     if deadline:
         parts.append(f"⏰ Дедлайн: {deadline}")
@@ -525,15 +578,17 @@ async def _handle_done(
         await _reply(update, f"❓ Не нашёл карточку по запросу «{raw_text}».")
         return
 
+    # B.4: для регулярной задачи override event_type="done", для архива — log после archive_card
     try:
         card = await user_ctx.kaiten.get_card(matched["id"])
         if card and user_ctx.logic.is_regular_task(card):
-            # Регулярная задача: переносим на следующий цикл
-            ok, msg = await _postpone_card(user_ctx, card, hours=None)
+            # Регулярная задача: переносим на следующий цикл — это ЗАВЕРШЕНИЕ, не перенос
+            ok, msg = await _postpone_card(user_ctx, card, hours=None, event_type="done")
             await _reply(update, msg)
         else:
             ok = await user_ctx.logic.archive_card(matched["id"])
             if ok:
+                await _log_event(user_ctx, "done", matched["title"])
                 await _reply(update, f"✅ Готово! Карточка «{matched['title']}» перемещена в архив.")
             else:
                 await _reply(update, f"⚠️ Не удалось архивировать «{matched['title']}».")
@@ -657,7 +712,11 @@ async def _handle_move(
         await _reply(update, "⚠️ Не удалось переместить карточку.")
         return
 
+    # B.8: логируем перенос (путь без risky-подтверждения)
     if card:
+        await _log_event(
+            user_ctx, "moved", matched["title"], detail=f"{target_column_name} / {section}"
+        )
         await _reply(
             update,
             f"📦 «{matched['title']}» перенесена → *{target_column_name} / {section}*",
@@ -760,8 +819,395 @@ def _action_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📅 Перенести",                callback_data="action:move")],
         [InlineKeyboardButton("🤖 Совет",                    callback_data="action:advice")],
         [InlineKeyboardButton("🔔 Напоминалка",              callback_data="action:reminder")],
+        [InlineKeyboardButton("✏️ Редактировать",            callback_data="action:edit")],
         [InlineKeyboardButton("← Назад",                     callback_data="action:back")],
     ])
+
+
+def _render_task_constructor(data: dict) -> tuple[str, InlineKeyboardMarkup]:
+    """Строит текст и клавиатуру карточки-конструктора из context.user_data['new_task'].
+
+    Переиспользуется и для создания, и (в будущем) для редактирования задачи.
+    """
+    size = data.get("size")
+    if size is None:
+        size_label = "не указан (15 мин по умолчанию)"
+    elif size == 999:
+        size_label = "от 1 часа (сколько влезет)"
+    else:
+        size_label = f"{size} ч"
+
+    if data.get("event_date") and data.get("event_time"):
+        event_label = f"{data['event_date']} в {data['event_time'][:5]}"
+    else:
+        event_label = "не указано"
+
+    deadline_label = data.get("deadline") or "не указан"
+
+    reg = data.get("regularity")
+    if reg == "еженедельно" and data.get("weekday"):
+        reg_label = f"еженедельно ({data['weekday']})"
+    else:
+        reg_label = reg or "разовая"
+
+    importance_label = data.get("importance") or "обычная"
+    reminder_label = "вкл" if data.get("reminder") else "выкл"
+
+    title = data.get("title") or ""
+    if data.get("_edit_card_id"):
+        header = f"✏️ Редактирование: «{title}»"
+    else:
+        header = f"🆕 Новая задача: «{title}»"
+
+    text = (
+        f"{header}\n\n"
+        f"📏 Размер: {size_label}\n"
+        f"📅 Событие: {event_label}\n"
+        f"⏰ Дедлайн: {deadline_label}\n"
+        f"🔁 Регулярность: {reg_label}\n"
+        f"🔥 Важность: {importance_label}\n"
+        f"🔔 Напоминалка: {reminder_label}"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("📏 Размер", callback_data="nt:size"),
+         InlineKeyboardButton("📅 Событие", callback_data="nt:event")],
+        [InlineKeyboardButton("⏰ Дедлайн", callback_data="nt:deadline"),
+         InlineKeyboardButton("🔁 Регулярность", callback_data="nt:regularity")],
+        [InlineKeyboardButton("🔥 Важность", callback_data="nt:importance"),
+         InlineKeyboardButton("🔔 Напоминалка", callback_data="nt:reminder")],
+    ]
+    if data.get("_edit_card_id"):
+        keyboard.append([InlineKeyboardButton("📝 Название", callback_data="nt:title")])
+    keyboard.append([InlineKeyboardButton("✅ Готово", callback_data="nt:done"),
+                     InlineKeyboardButton("❌ Отмена", callback_data="nt:cancel")])
+    return text, InlineKeyboardMarkup(keyboard)
+
+
+async def _finalize_new_task(
+    query, context: ContextTypes.DEFAULT_TYPE, user_ctx: "UserHandlerCtx", data: dict,
+) -> int:
+    """Создаёт карточку в Kaiten по данным конструктора (context.user_data['new_task'])."""
+    title = data.get("title") or "Без названия"
+
+    if data.get("event_date"):
+        target_date = date.fromisoformat(data["event_date"])
+        column_id = user_ctx.logic.resolve_column_for_date(target_date)
+        hour = int(data["event_time"][:2]) if data.get("event_time") else 9
+        section = "Утро" if hour < 12 else ("День" if hour < 19 else "Вечер")
+    elif data.get("deadline"):
+        target_date = date.fromisoformat(data["deadline"])
+        column_id = user_ctx.logic.resolve_column_for_date(target_date)
+        section = "Утро"
+    else:
+        column_id = user_ctx.logic.get_today_column_id()
+        section = "Утро"
+    column_name = user_ctx.logic.column_name_by_id.get(column_id, str(column_id))
+
+    try:
+        sort_order = await user_ctx.logic.get_section_sort_order(column_id, section)
+    except Exception as exc:
+        logger.warning("_finalize_new_task: get_section_sort_order — {}, используем 1.0", exc)
+        sort_order = 1.0
+
+    properties: dict = {}
+    if data.get("event_date") and data.get("event_time"):
+        try:
+            event_dt = datetime.fromisoformat(
+                f"{data['event_date']}T{data['event_time']}"
+            ).replace(tzinfo=TZ_MSK)
+            properties.update(user_ctx.kaiten.event_time_property(event_dt))
+        except Exception as exc:
+            logger.warning("_finalize_new_task: event_time_property — {}", exc)
+    if data.get("importance"):
+        imp_props = user_ctx.kaiten.importance_property(data["importance"])
+        if imp_props:
+            properties.update(imp_props)
+    if data.get("regularity") == "еженедельно" and data.get("weekday"):
+        wd_props = user_ctx.kaiten.weekday_property(data["weekday"])
+        if wd_props:
+            properties.update(wd_props)
+
+    due_date_iso = f"{data['deadline']}T00:00:00.000Z" if data.get("deadline") else None
+
+    try:
+        card = await user_ctx.kaiten.create_card(
+            column_id=column_id,
+            title=title,
+            due_date=due_date_iso,
+            sort_order=sort_order,
+            properties=properties or None,
+            size=data.get("size"),
+        )
+    except Exception as exc:
+        logger.exception("_finalize_new_task: create_card error — {}", exc)
+        await query.edit_message_text("⚠️ Не удалось создать карточку. Попробуй позже.")
+        context.user_data.pop("new_task", None)
+        return ConversationHandler.END
+
+    if card is None:
+        await query.edit_message_text("⚠️ Kaiten не вернул карточку. Возможно, создание не удалось.")
+        context.user_data.pop("new_task", None)
+        return ConversationHandler.END
+
+    tag_names: list[str] = []
+    if data.get("regularity"):
+        tag_names.append(data["regularity"])
+    if data.get("reminder"):
+        tag_names.append("напомнить")
+    today_iso = datetime.now(TZ_MSK).date().isoformat()
+    is_hard_event_today = data.get("event_date") == today_iso and data.get("event_time") is not None
+    if is_hard_event_today:
+        tag_names.append("жёсткое событие")
+    for tag_name in tag_names:
+        try:
+            await user_ctx.kaiten.add_tag_by_name(card.id, tag_name)
+        except Exception as exc:
+            logger.warning("_finalize_new_task: add_tag_by_name({}) — {}", tag_name, exc)
+
+    await _log_event(user_ctx, "created", card.title, detail=f"{column_name} / {section}")
+
+    parts = [f"✅ Карточка создана: *{card.title}*", f"📅 Колонка: {column_name} / {section}"]
+    if data.get("deadline"):
+        parts.append(f"⏰ Дедлайн: {data['deadline']}")
+    if data.get("importance"):
+        parts.append(f"🔥 Важность: {data['importance']}")
+    if data.get("size") is not None:
+        parts.append(f"⏱ Размер: {data['size']} ч")
+    if data.get("regularity"):
+        parts.append(f"🔁 Регулярность: {data['regularity']}")
+    if data.get("reminder"):
+        parts.append("🔔 Напоминалка включена")
+    await query.edit_message_text("\n".join(parts), parse_mode=ParseMode.MARKDOWN)
+
+    if is_hard_event_today:
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="⚠️ Задача на сегодня с конкретным временем. Если расписание уже составлено — напиши «пересобрать», чтобы её учесть.",
+        )
+
+    context.user_data.pop("new_task", None)
+    return ConversationHandler.END
+
+
+async def _finalize_edit_task(
+    query, context: ContextTypes.DEFAULT_TYPE, user_ctx: "UserHandlerCtx", data: dict,
+) -> int:
+    """Сохраняет изменения существующей карточки (режим редактирования конструктора).
+
+    Дедлайн меняется на месте (без переноса колонки). Событие при изменении даты
+    переносит карточку в колонку/секцию, соответствующую новой дате события.
+    """
+    card_id = data.get("_edit_card_id")
+    original = data.get("_original", {})
+    title = data.get("title") or "Без названия"
+
+    update_fields: dict = {"title": title, "size": data.get("size")}
+    update_fields["due_date"] = f"{data['deadline']}T00:00:00.000Z" if data.get("deadline") else None
+
+    properties: dict = {}
+    if data.get("event_date") and data.get("event_time"):
+        try:
+            event_dt = datetime.fromisoformat(
+                f"{data['event_date']}T{data['event_time']}"
+            ).replace(tzinfo=TZ_MSK)
+            properties.update(user_ctx.kaiten.event_time_property(event_dt))
+        except Exception as exc:
+            logger.warning("_finalize_edit_task: event_time_property — {}", exc)
+    if data.get("importance"):
+        imp_props = user_ctx.kaiten.importance_property(data["importance"])
+        if imp_props:
+            properties.update(imp_props)
+    if data.get("regularity") == "еженедельно" and data.get("weekday"):
+        wd_props = user_ctx.kaiten.weekday_property(data["weekday"])
+        if wd_props:
+            properties.update(wd_props)
+    if properties:
+        update_fields["properties"] = properties
+
+    try:
+        await user_ctx.kaiten.update_card(card_id, **update_fields)
+    except Exception as exc:
+        logger.exception("_finalize_edit_task: update_card error — {}", exc)
+        await query.edit_message_text("⚠️ Не удалось сохранить изменения. Попробуй позже.")
+        context.user_data.pop("new_task", None)
+        return ConversationHandler.END
+
+    # Регулярность: снять старый тег, поставить новый, если изменилась
+    old_reg = original.get("regularity")
+    new_reg = data.get("regularity")
+    if old_reg != new_reg:
+        if old_reg:
+            try:
+                await user_ctx.kaiten.remove_tag_by_name(card_id, old_reg)
+            except Exception as exc:
+                logger.warning("_finalize_edit_task: remove_tag_by_name({}) — {}", old_reg, exc)
+        if new_reg:
+            try:
+                await user_ctx.kaiten.add_tag_by_name(card_id, new_reg)
+            except Exception as exc:
+                logger.warning("_finalize_edit_task: add_tag_by_name({}) — {}", new_reg, exc)
+
+    # Напоминалка: тег «напомнить»
+    old_reminder = original.get("reminder", False)
+    new_reminder = data.get("reminder", False)
+    if old_reminder != new_reminder:
+        try:
+            if new_reminder:
+                await user_ctx.kaiten.add_tag_by_name(card_id, "напомнить")
+            else:
+                await user_ctx.kaiten.remove_tag_by_name(card_id, "напомнить")
+        except Exception as exc:
+            logger.warning("_finalize_edit_task: тег напомнить — {}", exc)
+
+    # Событие изменилось на другую дату → переносим карточку
+    moved_note = ""
+    old_event_date = original.get("event_date")
+    new_event_date = data.get("event_date")
+    if new_event_date and new_event_date != old_event_date:
+        try:
+            target_date = date.fromisoformat(new_event_date)
+            column_id = user_ctx.logic.resolve_column_for_date(target_date)
+            hour = int(data["event_time"][:2]) if data.get("event_time") else 9
+            section = "Утро" if hour < 12 else ("День" if hour < 19 else "Вечер")
+            sort_order = await user_ctx.logic.get_section_sort_order(column_id, section)
+            await user_ctx.kaiten.move_card(card_id, column_id, sort_order)
+            column_name = user_ctx.logic.column_name_by_id.get(column_id, str(column_id))
+            moved_note = f"\n📅 Перенесена → {column_name} / {section}"
+            await _log_event(user_ctx, "moved", title, detail=f"{column_name} / {section}")
+        except Exception as exc:
+            logger.warning("_finalize_edit_task: move_card — {}", exc)
+            moved_note = "\n⚠️ Не удалось перенести карточку в новую колонку."
+
+    await query.edit_message_text(
+        f"✅ Изменения сохранены: *{title}*{moved_note}", parse_mode=ParseMode.MARKDOWN
+    )
+    context.user_data.pop("new_task", None)
+    return ConversationHandler.END
+
+
+# ── Просмотр других колонок (/other) ─────────────────────────────────────────
+
+_WEEKDAY_SHORT: dict[str, str] = {
+    "Понедельник": "Пн", "Вторник": "Вт", "Среда": "Ср", "Четверг": "Чт",
+    "Пятница": "Пт", "Суббота": "Сб", "Воскресенье": "Вс",
+}
+
+_OC_SCOPE_LABELS: dict[str, str] = {
+    "today":    "Сегодня",
+    "otherdays": "Другие дни недели",
+    "nextweek": "Следующая неделя",
+    "faraway":  "Далёкие времена",
+}
+
+
+async def _collect_other_column_cards(
+    user_ctx: "UserHandlerCtx", scope: str,
+) -> list[tuple[Card, str | None, bool]]:
+    """Возвращает [(card, suffix_или_None, show_time), ...] для заданной области просмотра.
+
+    show_time=True только если event_time карточки приходится РОВНО на дату той колонки,
+    в которой карточка сейчас показана.
+    """
+    today = datetime.now(TZ_MSK).date()
+    result: list[tuple[Card, str | None, bool]] = []
+
+    if scope == "today":
+        col_id = user_ctx.logic.get_today_column_id()
+        cards = await user_ctx.kaiten.get_cards(col_id)
+        for c in cards:
+            if c.blocked or c.archived:
+                continue
+            show_time = bool(c.event_time and c.event_time.date() == today)
+            result.append((c, None, show_time))
+
+    elif scope == "otherdays":
+        today_name = WEEKDAY_COLUMNS[today.weekday()]
+        monday = today - timedelta(days=today.weekday())
+        for idx, name in enumerate(WEEKDAY_COLUMNS):
+            if name == today_name:
+                continue
+            col_id = user_ctx.logic.column_ids.get(name)
+            if col_id is None:
+                continue
+            col_date = monday + timedelta(days=idx)
+            try:
+                cards = await user_ctx.kaiten.get_cards(col_id)
+            except Exception as exc:
+                logger.warning("_collect_other_column_cards: колонка {} — {}", name, exc)
+                continue
+            short_name = _WEEKDAY_SHORT.get(name, name)
+            for c in cards:
+                if c.blocked or c.archived:
+                    continue
+                show_time = bool(c.event_time and c.event_time.date() == col_date)
+                result.append((c, short_name, show_time))
+
+    elif scope in ("nextweek", "faraway"):
+        col_name = "Следующая неделя" if scope == "nextweek" else "Далекие времена"
+        col_id = user_ctx.logic.column_ids.get(col_name)
+        cards = await user_ctx.kaiten.get_cards(col_id) if col_id else []
+        for c in cards:
+            if c.blocked or c.archived:
+                continue
+            result.append((c, None, False))
+
+    return result
+
+
+async def _render_other_columns_page(
+    user_ctx: "UserHandlerCtx", scope: str, page: int, bot, chat_id: int | str,
+) -> None:
+    """Рендерит страницу списка карточек для области просмотра scope."""
+    items = await _collect_other_column_cards(user_ctx, scope)
+    if not items:
+        await bot.send_message(chat_id=chat_id, text="Пусто — карточек не найдено.")
+        return
+
+    items.sort(
+        key=lambda t: (
+            t[0].event_time is None,
+            t[0].event_time or datetime.min.replace(tzinfo=TZ_MSK),
+        )
+    )
+
+    start = page * MAX_CARD_BUTTONS
+    shown = items[start : start + MAX_CARD_BUTTONS]
+
+    def _btn_text(card: Card, suffix: str | None, show_time: bool) -> str:
+        prefix = f"{card.event_time:%H:%M} " if (show_time and card.event_time) else ""
+        tail = f" ({suffix})" if suffix else ""
+        available = _BTN_TITLE_LEN - len(prefix) - len(tail)
+        available = max(available, 5)
+        title = card.title[:available] + ("…" if len(card.title) > available else "")
+        return prefix + title + tail
+
+    keyboard = [
+        [InlineKeyboardButton(_btn_text(c, s, t), callback_data=f"card:{c.id}")]
+        for c, s, t in shown
+    ]
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("← Назад", callback_data=f"oc:{scope}:{page - 1}"))
+    if start + MAX_CARD_BUTTONS < len(items):
+        nav_row.append(InlineKeyboardButton("Ещё →", callback_data=f"oc:{scope}:{page + 1}"))
+    if nav_row:
+        keyboard.append(nav_row)
+
+    label = _OC_SCOPE_LABELS.get(scope, scope)
+    total_pages = (len(items) - 1) // MAX_CARD_BUTTONS + 1
+    text = f"📋 *{label}* (стр. {page + 1}/{total_pages}):"
+
+    try:
+        await bot.send_message(
+            chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+    except Exception:
+        await bot.send_message(
+            chat_id=chat_id, text=text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
 
 
 async def _resend_card_buttons(
@@ -812,16 +1258,42 @@ def _next_col_for_regular(card: Card, today: date, column_ids: dict[str, int]) -
     return column_ids[WEEKDAY_COLUMNS[target_wd]]
 
 
+# B.2: helper для логирования событий дня (для вечернего итога)
+
+async def _log_event(
+    user_ctx: UserHandlerCtx, event_type: str, card_title: str, detail: str = ""
+) -> None:
+    """Best-effort запись события дня в SQLite (для вечернего итога).
+
+    Ошибка не критична — не должна прерывать основное действие пользователя.
+    event_type: "created" | "done" | "moved".
+    """
+    try:
+        loop = asyncio.get_event_loop()
+        today = datetime.now(TZ_MSK).date()
+        await loop.run_in_executor(
+            None, db.append_daily_event, user_ctx.user_id, today, event_type, card_title, detail
+        )
+    except Exception as exc:
+        logger.warning("_log_event: не удалось записать событие ({}) — {}", event_type, exc)
+
+
+# B.3: _postpone_card с параметром event_type и логированием успешного переноса
+
 async def _postpone_card(
     user_ctx: UserHandlerCtx,
     card: Card,
     hours: float | None,
+    *,
+    event_type: str = "moved",
 ) -> tuple[bool, str]:
     """Переносит карточку на следующий подходящий слот. Если hours задан — обновляет size.
 
     Возвращает (успех, текст_результата_для_пользователя).
     Для регулярных задач находит следующий день по тегу.
     Для обычных задач — берёт завтра.
+    event_type: "moved" (дефолт) для «Продолжить в другой день»,
+                "done" для завершения регулярной задачи через _handle_done / received_comment_cb.
     """
     card_id = card.id
     if hours is not None:
@@ -849,6 +1321,9 @@ async def _postpone_card(
         await user_ctx.kaiten.move_card(card_id, target_col_id, sort_order)
         target_col_name = user_ctx.logic.column_name_by_id.get(target_col_id, str(target_col_id))
         hours_part = f": размер {hours} ч" if hours is not None else ""
+        await _log_event(
+            user_ctx, event_type, card.title, detail=f"{target_col_name} / {target_section}"
+        )
         return True, f"✅ «{card.title}»{hours_part} → *{target_col_name} / {target_section}*"
     except Exception as exc:
         logger.exception("_postpone_card: move error — {}", exc)
@@ -1115,6 +1590,11 @@ def build_handlers(cfg: HandlersConfig) -> Application:
                         target_col_name = user_ctx.logic.column_name_by_id.get(
                             target_col_id, str(target_col_id)
                         )
+                        # B.5: логируем выполнение регулярной задачи
+                        await _log_event(
+                            user_ctx, "done", title,
+                            detail=f"регулярная задача → {target_col_name} / {target_section}",
+                        )
                         await update.message.reply_text(
                             f"✅ «{title}» выполнено (регулярная задача) → следующий раз: "
                             f"*{target_col_name} / {target_section}*",
@@ -1127,6 +1607,8 @@ def build_handlers(cfg: HandlersConfig) -> Application:
                 else:
                     ok = await user_ctx.logic.archive_card(card_id, comment=comment_text or None)
                     if ok:
+                        # B.5: логируем выполнение обычной задачи через архивацию
+                        await _log_event(user_ctx, "done", title)
                         await update.message.reply_text(
                             f"✅ «{title}» выполнено и перемещено в архив."
                         )
@@ -1325,6 +1807,8 @@ def build_handlers(cfg: HandlersConfig) -> Application:
             sort_order = await user_ctx.logic.get_section_sort_order(target_col_id, section)
             moved = await user_ctx.kaiten.move_card(card_id, target_col_id, sort_order)
             if moved:
+                # B.6: логируем перенос через кнопку «Перенести» (без risky-подтверждения)
+                await _log_event(user_ctx, "moved", title, detail=f"{target_col_name} / {section}")
                 await update.message.reply_text(
                     f"📦 «{title}» → *{target_col_name} / {section}*",
                     parse_mode=ParseMode.MARKDOWN,
@@ -1380,6 +1864,11 @@ def build_handlers(cfg: HandlersConfig) -> Application:
                     pending["card_id"], pending["target_col_id"], sort_order
                 )
                 if moved:
+                    # B.7: логируем перенос критической задачи после подтверждения (kind=="move")
+                    await _log_event(
+                        user_ctx, "moved", pending["title"],
+                        detail=f"{pending['target_col_name']} / {pending['section']}",
+                    )
                     await query.edit_message_text(
                         f"📦 «{pending['title']}» → *{pending['target_col_name']} / {pending['section']}*",
                         parse_mode=ParseMode.MARKDOWN,
@@ -1402,6 +1891,7 @@ def build_handlers(cfg: HandlersConfig) -> Application:
                 await query.edit_message_text("⚠️ Ошибка при перемещении карточки.")
 
         elif pending["kind"] == "postpone":
+            # Ветку postpone НЕ трогаем — _postpone_card уже логирует "moved" через B.3
             try:
                 card = await user_ctx.kaiten.get_card(pending["card_id"])
                 if card is None:
@@ -1620,6 +2110,73 @@ def build_handlers(cfg: HandlersConfig) -> Application:
 
         return ConversationHandler.END
 
+    # ── Кнопка «Редактировать» ───────────────────────────────────────────────
+
+    async def action_edit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """✏️ Редактировать → открываем конструктор, предзаполненный текущими значениями."""
+        query = update.callback_query
+        assert query is not None
+        await query.answer()
+
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        user_ctx = cfg.users.get(chat_id) if chat_id else None
+        if user_ctx is None:
+            return ConversationHandler.END
+
+        card_id = context.user_data.get("selected_card_id")
+        try:
+            card = await user_ctx.kaiten.get_card(card_id)
+        except Exception as exc:
+            logger.exception("action_edit_cb: get_card error — {}", exc)
+            card = None
+        if card is None:
+            await query.edit_message_text("⚠️ Карточка не найдена.")
+            return ConversationHandler.END
+
+        tag_names = {t.name for t in card.tags} if card.tags else set()
+        regularity = None
+        for reg_name in ("по будням", "по выходным", "ежедневно", "еженедельно"):
+            if reg_name in tag_names:
+                regularity = reg_name
+                break
+
+        et  = card.event_time
+        due = card.due_date_parsed
+
+        data = {
+            "title": card.title,
+            "size": card.size,
+            "event_date": et.date().isoformat() if et else None,
+            "event_time": et.strftime("%H:%M:%S") if et else None,
+            "deadline": due.date().isoformat() if due else None,
+            "regularity": regularity,
+            "weekday": card.weekday,
+            "importance": card.importance,
+            "reminder": "напомнить" in tag_names,
+            "_edit_card_id": card_id,
+        }
+        data["_original"] = dict(data)
+        context.user_data["new_task"] = data
+
+        text, markup = _render_task_constructor(data)
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+        return CREATE_MENU
+
+    async def received_edit_title_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Получено новое название карточки в режиме редактирования."""
+        assert update.message is not None
+        data = context.user_data.get("new_task")
+        if data is None:
+            return ConversationHandler.END
+        title = update.message.text.strip()
+        if not title:
+            await update.message.reply_text("❓ Название не может быть пустым. Попробуй ещё раз:")
+            return CREATE_AWAITING_EDIT_TITLE
+        data["title"] = title
+        text, markup = _render_task_constructor(data)
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+        return CREATE_MENU
+
     # ── Fallbacks диалога: известные команды прерывают диалог и выполняются ───
 
     async def conv_fallback_text_cb(
@@ -1702,6 +2259,362 @@ def build_handlers(cfg: HandlersConfig) -> Application:
             pass
         await send_card_buttons(today_cards, context.bot, chat_id, page=page)
 
+    # ── Просмотр других колонок ──────────────────────────────────────────────
+
+    async def cmd_other(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """/other — меню выбора области просмотра других колонок."""
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        user_ctx = cfg.users.get(chat_id) if chat_id else None
+        if user_ctx is None:
+            return
+        kb = [
+            [InlineKeyboardButton("Сегодня",              callback_data="oc:today:0")],
+            [InlineKeyboardButton("Другие дни недели",    callback_data="oc:otherdays:0")],
+            [InlineKeyboardButton("Следующая неделя",     callback_data="oc:nextweek:0")],
+            [InlineKeyboardButton("Далёкие времена",      callback_data="oc:faraway:0")],
+        ]
+        await update.message.reply_text(
+            "Какие задачи посмотреть?", reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+    async def oc_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Навигация по областям просмотра других колонок (callback_data 'oc:<scope>:<page>')."""
+        query = update.callback_query
+        assert query is not None
+        await query.answer()
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        user_ctx = cfg.users.get(chat_id) if chat_id else None
+        if user_ctx is None:
+            return
+        _, scope, page_str = query.data.split(":")
+        try:
+            page = int(page_str)
+        except ValueError:
+            page = 0
+        try:
+            await query.delete_message()
+        except Exception:
+            pass
+        await _render_other_columns_page(user_ctx, scope, page, context.bot, chat_id)
+
+    # ── Конструктор создания задачи ──────────────────────────────────────────
+
+    async def newtask_entry_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Точка входа в конструктор: /newtask или голое «создать»/«создай»."""
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        user_ctx = cfg.users.get(chat_id) if chat_id else None
+        if user_ctx is None:
+            logger.warning("newtask_entry_cb: unauthorized chat_id={}", chat_id)
+            return ConversationHandler.END
+
+        context.user_data["new_task"] = {
+            "title": None, "size": None,
+            "event_date": None, "event_time": None,
+            "deadline": None, "regularity": None, "weekday": None,
+            "importance": None, "reminder": False,
+        }
+        if update.message:
+            await update.message.reply_text("✏️ Название задачи?")
+        return CREATE_AWAITING_TITLE
+
+    async def received_title_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Получено название новой задачи — показываем конструктор."""
+        assert update.message is not None
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        user_ctx = cfg.users.get(chat_id) if chat_id else None
+        if user_ctx is None:
+            return ConversationHandler.END
+
+        title = update.message.text.strip()
+        if not title:
+            await update.message.reply_text("❓ Название не может быть пустым. Попробуй ещё раз:")
+            return CREATE_AWAITING_TITLE
+
+        context.user_data["new_task"]["title"] = title
+        text, markup = _render_task_constructor(context.user_data["new_task"])
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+        return CREATE_MENU
+
+    async def nt_router_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Роутер кнопок конструктора (namespace callback_data 'nt:').
+
+        ЗАГЛУШКА — полная логика подменю (размер/событие/дедлайн/регулярность/важность/
+        напоминалка/готово) будет добавлена следующей задачей через Edit в это же тело
+        функции. Пока обрабатывает только «отмена» и перерисовку по умолчанию — так весь
+        конструктор уже импортируется и синтаксически корректен, «Отмена» и вход в диалог
+        уже полностью рабочие для тестирования.
+        """
+        query = update.callback_query
+        assert query is not None
+        await query.answer()
+
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        user_ctx = cfg.users.get(chat_id) if chat_id else None
+        if user_ctx is None:
+            return ConversationHandler.END
+
+        data = context.user_data.get("new_task")
+        if data is None:
+            await query.edit_message_text("⚠️ Сессия устарела, начни заново командой /newtask.")
+            return ConversationHandler.END
+
+        parts  = query.data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        sub    = parts[2] if len(parts) > 2 else None
+
+        if action == "cancel":
+            await query.edit_message_text("❌ Отмена")
+            context.user_data.pop("new_task", None)
+            return ConversationHandler.END
+
+        async def _redraw() -> None:
+            text_r, markup_r = _render_task_constructor(data)
+            await query.edit_message_text(text_r, parse_mode=ParseMode.MARKDOWN, reply_markup=markup_r)
+
+        if action == "size" and sub is None:
+            kb = [
+                [InlineKeyboardButton("15 мин", callback_data="nt:size:15m"),
+                 InlineKeyboardButton("30 мин", callback_data="nt:size:30m")],
+                [InlineKeyboardButton("1 ч", callback_data="nt:size:1h"),
+                 InlineKeyboardButton("2 ч", callback_data="nt:size:2h")],
+                [InlineKeyboardButton("3 ч", callback_data="nt:size:3h"),
+                 InlineKeyboardButton("От 1ч, сколько влезет", callback_data="nt:size:flex")],
+                [InlineKeyboardButton("Своё значение", callback_data="nt:size:custom")],
+                [InlineKeyboardButton("← Назад", callback_data="nt:back")],
+            ]
+            await query.edit_message_text("Выбери размер:", reply_markup=InlineKeyboardMarkup(kb))
+            return CREATE_MENU
+        if action == "size" and sub is not None:
+            if sub == "custom":
+                await query.edit_message_text("Своё значение в часах (например 1.5):")
+                return CREATE_AWAITING_SIZE_TEXT
+            mapping = {"15m": None, "30m": 0.5, "1h": 1, "2h": 2, "3h": 3, "flex": 999}
+            if sub in mapping:
+                data["size"] = mapping[sub]
+            await _redraw()
+            return CREATE_MENU
+
+        if action == "event" and sub is None:
+            kb = [
+                [InlineKeyboardButton("Сегодня", callback_data="nt:event:today"),
+                 InlineKeyboardButton("Завтра", callback_data="nt:event:tomorrow")],
+                [InlineKeyboardButton("Своя дата", callback_data="nt:event:custom")],
+                [InlineKeyboardButton("Без события", callback_data="nt:event:clear")],
+                [InlineKeyboardButton("← Назад", callback_data="nt:back")],
+            ]
+            await query.edit_message_text("Когда событие?", reply_markup=InlineKeyboardMarkup(kb))
+            return CREATE_MENU
+        if action == "event" and sub is not None:
+            if sub == "clear":
+                data["event_date"] = None
+                data["event_time"] = None
+                data["reminder"] = False
+                await _redraw()
+                return CREATE_MENU
+            if sub == "today":
+                data["_event_pending_date"] = datetime.now(TZ_MSK).date().isoformat()
+                await query.edit_message_text("Во сколько? Например: 15:00")
+                return CREATE_AWAITING_EVENT_TEXT
+            if sub == "tomorrow":
+                data["_event_pending_date"] = (datetime.now(TZ_MSK).date() + timedelta(days=1)).isoformat()
+                await query.edit_message_text("Во сколько? Например: 15:00")
+                return CREATE_AWAITING_EVENT_TEXT
+            if sub == "custom":
+                data.pop("_event_pending_date", None)
+                await query.edit_message_text(
+                    "Когда событие? Например: «25 июля в 15:00», «пятница в 10:00»"
+                )
+                return CREATE_AWAITING_EVENT_TEXT
+
+        if action == "deadline" and sub is None:
+            kb = [
+                [InlineKeyboardButton("Сегодня", callback_data="nt:deadline:today"),
+                 InlineKeyboardButton("Завтра", callback_data="nt:deadline:tomorrow")],
+                [InlineKeyboardButton("Своя дата", callback_data="nt:deadline:custom")],
+                [InlineKeyboardButton("Без дедлайна", callback_data="nt:deadline:clear")],
+                [InlineKeyboardButton("← Назад", callback_data="nt:back")],
+            ]
+            await query.edit_message_text("Когда дедлайн?", reply_markup=InlineKeyboardMarkup(kb))
+            return CREATE_MENU
+        if action == "deadline" and sub is not None:
+            if sub == "clear":
+                data["deadline"] = None
+                await _redraw()
+                return CREATE_MENU
+            if sub == "today":
+                data["deadline"] = datetime.now(TZ_MSK).date().isoformat()
+                await _redraw()
+                return CREATE_MENU
+            if sub == "tomorrow":
+                data["deadline"] = (datetime.now(TZ_MSK).date() + timedelta(days=1)).isoformat()
+                await _redraw()
+                return CREATE_MENU
+            if sub == "custom":
+                await query.edit_message_text(
+                    "Когда дедлайн? Например: «25 июля», «пятница», «через 3 дня»"
+                )
+                return CREATE_AWAITING_DEADLINE_TEXT
+
+        if action == "regularity" and sub is None:
+            kb = [
+                [InlineKeyboardButton("Разовая", callback_data="nt:reg:none")],
+                [InlineKeyboardButton("По будням", callback_data="nt:reg:weekdays"),
+                 InlineKeyboardButton("По выходным", callback_data="nt:reg:weekends")],
+                [InlineKeyboardButton("Ежедневно", callback_data="nt:reg:daily"),
+                 InlineKeyboardButton("Еженедельно", callback_data="nt:reg:weekly")],
+                [InlineKeyboardButton("← Назад", callback_data="nt:back")],
+            ]
+            await query.edit_message_text("Регулярность:", reply_markup=InlineKeyboardMarkup(kb))
+            return CREATE_MENU
+        if action == "reg" and sub is not None:
+            reg_mapping = {
+                "none": None, "weekdays": "по будням", "weekends": "по выходным",
+                "daily": "ежедневно",
+            }
+            if sub == "weekly":
+                kb = [
+                    [InlineKeyboardButton(wd, callback_data=f"nt:wd:{wd}")]
+                    for wd in ["ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС"]
+                ]
+                kb.append([InlineKeyboardButton("← Назад", callback_data="nt:back")])
+                await query.edit_message_text("Какой день недели?", reply_markup=InlineKeyboardMarkup(kb))
+                return CREATE_MENU
+            if sub in reg_mapping:
+                data["regularity"] = reg_mapping[sub]
+                data["weekday"] = None
+                await _redraw()
+                return CREATE_MENU
+        if action == "wd" and sub is not None:
+            data["regularity"] = "еженедельно"
+            data["weekday"] = sub
+            await _redraw()
+            return CREATE_MENU
+
+        if action == "importance" and sub is None:
+            kb = [
+                [InlineKeyboardButton("Обычная", callback_data="nt:imp:normal")],
+                [InlineKeyboardButton("Важная", callback_data="nt:imp:high")],
+                [InlineKeyboardButton("Критическая", callback_data="nt:imp:critical")],
+                [InlineKeyboardButton("← Назад", callback_data="nt:back")],
+            ]
+            await query.edit_message_text("Важность:", reply_markup=InlineKeyboardMarkup(kb))
+            return CREATE_MENU
+        if action == "imp" and sub is not None:
+            imp_mapping = {"normal": None, "high": "важное", "critical": "критическое"}
+            if sub in imp_mapping:
+                data["importance"] = imp_mapping[sub]
+            await _redraw()
+            return CREATE_MENU
+
+        if action == "reminder":
+            if not data.get("event_date"):
+                await query.answer("Сначала укажи событие", show_alert=True)
+                return CREATE_MENU
+            data["reminder"] = not data.get("reminder", False)
+            await _redraw()
+            return CREATE_MENU
+
+        if action == "back":
+            await _redraw()
+            return CREATE_MENU
+
+        if action == "title":
+            await query.edit_message_text("Новое название:")
+            return CREATE_AWAITING_EDIT_TITLE
+
+        if action == "done":
+            if data.get("_edit_card_id"):
+                return await _finalize_edit_task(query, context, user_ctx, data)
+            return await _finalize_new_task(query, context, user_ctx, data)
+
+        text, markup = _render_task_constructor(data)
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+        return CREATE_MENU
+
+    async def received_size_text_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        assert update.message is not None
+        data = context.user_data.get("new_task")
+        if data is None:
+            return ConversationHandler.END
+        text = update.message.text.strip().replace(",", ".")
+        try:
+            hours = float(text)
+            if hours <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(
+                "❓ Нужно положительное число часов (например 1.5). Попробуй ещё раз:"
+            )
+            return CREATE_AWAITING_SIZE_TEXT
+        data["size"] = hours
+        text_out, markup = _render_task_constructor(data)
+        await update.message.reply_text(text_out, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+        return CREATE_MENU
+
+    async def received_event_text_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        assert update.message is not None
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        user_ctx = cfg.users.get(chat_id) if chat_id else None
+        data = context.user_data.get("new_task")
+        if user_ctx is None or data is None:
+            return ConversationHandler.END
+
+        text = update.message.text.strip()
+        pending_date = data.pop("_event_pending_date", None)
+
+        if pending_date:
+            m = re.search(r"\b(\d{1,2}):(\d{2})\b", text)
+            if not m:
+                await update.message.reply_text("❓ Не понял время. Например: 15:00. Попробуй ещё раз:")
+                data["_event_pending_date"] = pending_date
+                return CREATE_AWAITING_EVENT_TEXT
+            data["event_date"] = pending_date
+            data["event_time"] = f"{int(m.group(1)):02d}:{int(m.group(2)):02d}:00"
+        else:
+            try:
+                intent = await cfg.claude.parse_intent(f"создать задачу {text}")
+            except Exception as exc:
+                logger.exception("received_event_text_cb: parse_intent — {}", exc)
+                await update.message.reply_text("⚠️ Не удалось разобрать дату. Попробуй ещё раз:")
+                return CREATE_AWAITING_EVENT_TEXT
+            event_date = intent.get("deadline")
+            if not event_date:
+                await update.message.reply_text("❓ Не удалось определить дату. Попробуй точнее:")
+                return CREATE_AWAITING_EVENT_TEXT
+            m = re.search(r"\b(\d{1,2}):(\d{2})\b", text)
+            time_str = f"{int(m.group(1)):02d}:{int(m.group(2)):02d}:00" if m else "09:00:00"
+            data["event_date"] = event_date
+            data["event_time"] = time_str
+
+        text_out, markup = _render_task_constructor(data)
+        await update.message.reply_text(text_out, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+        return CREATE_MENU
+
+    async def received_deadline_text_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        assert update.message is not None
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        user_ctx = cfg.users.get(chat_id) if chat_id else None
+        data = context.user_data.get("new_task")
+        if user_ctx is None or data is None:
+            return ConversationHandler.END
+
+        text = update.message.text.strip()
+        try:
+            intent = await cfg.claude.parse_intent(f"создать задачу дедлайн {text}")
+        except Exception as exc:
+            logger.exception("received_deadline_text_cb: parse_intent — {}", exc)
+            await update.message.reply_text("⚠️ Не удалось разобрать дату. Попробуй ещё раз:")
+            return CREATE_AWAITING_DEADLINE_TEXT
+        deadline = intent.get("deadline")
+        if not deadline:
+            await update.message.reply_text("❓ Не удалось определить дату. Попробуй точнее:")
+            return CREATE_AWAITING_DEADLINE_TEXT
+        data["deadline"] = deadline
+
+        text_out, markup = _render_task_constructor(data)
+        await update.message.reply_text(text_out, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+        return CREATE_MENU
+
     # ── Сборка ConversationHandler ────────────────────────────────────────────
 
     # Текстовый фильтр для состояний ожидания: не реагирует на известные команды
@@ -1710,6 +2623,8 @@ def build_handlers(cfg: HandlersConfig) -> Application:
     conv_handler = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(card_selected_cb, pattern=r"^card:\d+$"),
+            CommandHandler("newtask", newtask_entry_cb),
+            MessageHandler(filters.Regex(r"(?i)^(создать|создай)\s*$"), newtask_entry_cb),
         ],
         states={
             CARD_ACTION: [
@@ -1719,6 +2634,7 @@ def build_handlers(cfg: HandlersConfig) -> Application:
                 CallbackQueryHandler(action_move_cb,     pattern=r"^action:move$"),
                 CallbackQueryHandler(action_advice_cb,   pattern=r"^action:advice$"),
                 CallbackQueryHandler(action_reminder_cb, pattern=r"^action:reminder$"),
+                CallbackQueryHandler(action_edit_cb,     pattern=r"^action:edit$"),
                 CallbackQueryHandler(action_back_cb,     pattern=r"^action:back$"),
             ],
             AWAITING_COMMENT: [
@@ -1735,6 +2651,24 @@ def build_handlers(cfg: HandlersConfig) -> Application:
             ],
             AWAITING_REMINDER_TIME: [
                 MessageHandler(_text_not_cmd, received_reminder_time_cb),
+            ],
+            CREATE_AWAITING_TITLE: [
+                MessageHandler(_text_not_cmd, received_title_cb),
+            ],
+            CREATE_MENU: [
+                CallbackQueryHandler(nt_router_cb, pattern=r"^nt:"),
+            ],
+            CREATE_AWAITING_SIZE_TEXT: [
+                MessageHandler(_text_not_cmd, received_size_text_cb),
+            ],
+            CREATE_AWAITING_EVENT_TEXT: [
+                MessageHandler(_text_not_cmd, received_event_text_cb),
+            ],
+            CREATE_AWAITING_DEADLINE_TEXT: [
+                MessageHandler(_text_not_cmd, received_deadline_text_cb),
+            ],
+            CREATE_AWAITING_EDIT_TITLE: [
+                MessageHandler(_text_not_cmd, received_edit_title_cb),
             ],
         },
         fallbacks=[
@@ -1866,6 +2800,15 @@ def build_handlers(cfg: HandlersConfig) -> Application:
         if update.message:
             await update.message.reply_text("Нечего отменять.")
 
+    async def cmd_replan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """/replan — пересобрать план дня с текущего момента."""
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        user_ctx = cfg.users.get(chat_id) if chat_id else None
+        if user_ctx is None:
+            logger.warning("cmd_replan: unauthorized chat_id={}", chat_id)
+            return
+        await _handle_replan(update, user_ctx, context)
+
     # ── Регистрация в строгом порядке ─────────────────────────────────────────
     #
     # ConversationHandler — первым, чтобы перехватывать card:* коллбэки.
@@ -1880,6 +2823,7 @@ def build_handlers(cfg: HandlersConfig) -> Application:
     app.add_handler(CallbackQueryHandler(page_nav_cb, pattern=r"^page:\d+$"))          # пагинация
     app.add_handler(CallbackQueryHandler(confirm_move_cb,   pattern=r"^confirm:move$"))   # risky ОК
     app.add_handler(CallbackQueryHandler(confirm_cancel_cb, pattern=r"^confirm:cancel$")) # risky отмена
+    app.add_handler(CallbackQueryHandler(oc_cb, pattern=r"^oc:"))                      # другие колонки
 
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("help",   cmd_help))
@@ -1888,6 +2832,8 @@ def build_handlers(cfg: HandlersConfig) -> Application:
     app.add_handler(CommandHandler("done",   cmd_done))
     app.add_handler(CommandHandler("move",   cmd_move))
     app.add_handler(CommandHandler("note",   cmd_note))
+    app.add_handler(CommandHandler("other",  cmd_other))
+    app.add_handler(CommandHandler("replan", cmd_replan))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 

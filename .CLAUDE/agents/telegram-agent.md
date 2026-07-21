@@ -5,6 +5,7 @@ model: claude-sonnet-4-6
 tools:
   - Read
   - Write
+  - Edit
 ---
 
 # Telegram Bot Agent
@@ -88,6 +89,16 @@ try:
 except Exception:
     await bot.send_message(chat_id, text)  # parse_mode не передаётся
 ```
+
+## send_message vs edit_message_text при обязательном вводе
+
+Любой промпт, ожидающий обязательный ответ пользователя (вопрос в состоянии ConversationHandler), должен отправляться **новым сообщением** — `send_message` или `query.message.reply_text`. Не через `query.edit_message_text`.
+
+Telegram не создаёт push-уведомление на редактирование существующего сообщения. Пользователь не видит вопрос бота и считает, что кнопка сломана.
+
+Правило:
+- `edit_message_text` — только для обновления статусных данных (результат действия, подтверждение завершения).
+- `send_message` / `reply_text` — для любого вопроса, ждущего ввода от пользователя.
 
 ## Routines (bot.py)
 

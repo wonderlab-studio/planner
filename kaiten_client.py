@@ -430,6 +430,18 @@ class KaitenClient:
             return None
         return {self._field_ids["importance"]: [opt_id]}
 
+    def weekday_property(self, name: str) -> dict | None:
+        """Возвращает {field_key: [option_id]} для записи поля дня недели.
+
+        name — 'ПН' | 'ВТ' | 'СР' | 'ЧТ' | 'ПТ' | 'СБ' | 'ВС'.
+        Возвращает None если имя не найдено в weekday_options (например, для аккаунта
+        без этого поля).
+        """
+        opt_id = self._weekday_options.get(name)
+        if opt_id is None:
+            return None
+        return {self._field_ids["weekday"]: [opt_id]}
+
     def configure_custom_fields(
         self,
         *,
@@ -699,6 +711,31 @@ class KaitenClient:
             logger.error("add_tag_by_name: не удалось добавить тег «{}» к карточке id={}", tag_name, card_id)
             return False
         logger.info("add_tag_by_name: тег «{}» добавлен к карточке id={}", tag_name, card_id)
+        return True
+
+    async def remove_tag_by_name(self, card_id: int, tag_name: str) -> bool:
+        """DELETE /cards/{card_id}/tags/{tag_id} — удаляет тег с карточки по имени.
+
+        Резолвит tag_id через self.tag_id(tag_name) (per-инстанс маппинг, мульти-аккаунт).
+        Если тег с таким именем не сконфигурирован для этого аккаунта — логирует warning, возвращает False.
+        ЭНДПОИНТ НЕ ПОДТВЕРЖДЁН ЭМПИРИЧЕСКИ (симметричен POST .../tags по конвенции Kaiten REST API,
+        но реального теста на проде не было) — при HTTP-ошибке (_request вернёт None) логировать error
+        и вернуть False, не бросать исключение. Если в проде эндпоинт окажется другим — это будет видно
+        по логам при первом использовании (баг всплывёт при реальном редактировании регулярности).
+        Возвращает True при успехе, False при ошибке/если тег не найден в конфигурации.
+        """
+        tid = self.tag_id(tag_name)
+        if tid is None:
+            logger.warning("remove_tag_by_name: тег «{}» не сконфигурирован для этого аккаунта", tag_name)
+            return False
+        data = await self._request("DELETE", f"/cards/{card_id}/tags/{tid}")
+        if data is None:
+            logger.error(
+                "remove_tag_by_name: не удалось удалить тег «{}» (id={}) с карточки id={}",
+                tag_name, tid, card_id,
+            )
+            return False
+        logger.info("remove_tag_by_name: тег «{}» удалён с карточки id={}", tag_name, card_id)
         return True
 
     async def block_card(self, card_id: int, reason: str) -> bool:

@@ -3,7 +3,7 @@ scheduler.py — APScheduler джобы системы планирования.
 
 Джобы:
     run_morning_job          — 06:30 ежедневно, план дня (итерирует по всем пользователям)
-    run_evening_job          — 21:00 ежедневно, [UPD 4] временно отключено
+    run_evening_job          — 22:00 ежедневно, вечерний итог (снэпшот+diff+Claude)
     run_reminder_job         — каждую минуту, напоминания о событиях
     run_archive_cleanup_job  — каждый пн в 06:00, удаление старых карточек из Архива
 
@@ -25,6 +25,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from loguru import logger
 
 import db
+from evening_logic import diff_day
 from kaiten_client import Card, KaitenClient, TAG_IDS
 from board_logic import BoardLogic
 from claude_client import ClaudeClient
@@ -85,12 +86,13 @@ def _card_to_dict(
 ) -> dict:
     """Конвертирует Card в dict для ClaudeClient.generate_morning_plan.
 
-    Поля: title, description, importance, size, due_date, event_time,
+    Поля: id, title, description, importance, size, due_date, event_time,
           section, comments, segments.
     segments — список пар ("HH:MM", "HH:MM"); одна пара если задача не прерывается.
     """
     et = card.event_time
     return {
+        "id":          card.id,
         "title":       card.title,
         "description": card.description,
         "importance":  card.importance,
@@ -217,10 +219,10 @@ class Scheduler:
             misfire_grace_time=3600,  # допуск 1 час если сервер был выключен
         )
 
-        # Вечер — 21:00 по МСК
+        # Вечер — 22:00 по МСК
         self._scheduler.add_job(
             self._safe_evening,
-            trigger=CronTrigger(hour=21, minute=0, timezone="Europe/Moscow"),
+            trigger=CronTrigger(hour=22, minute=0, timezone="Europe/Moscow"),
             id="evening_job",
             name="Вечерний итог",
             replace_existing=True,
@@ -251,7 +253,7 @@ class Scheduler:
 
         logger.info(
             "scheduler: джобы зарегистрированы "
-            "(morning=06:30, evening=21:00[off], reminder=1m, archive_cleanup=пн 06:00)"
+            "(morning=06:30, evening=22:00, reminder=1m, archive_cleanup=пн 06:00)"
         )
 
     # ── Публичные методы ──────────────────────────────────────────────────────
@@ -321,6 +323,7 @@ class Scheduler:
         """
         user_id = user_ctx.user_cfg.user_id
         now = _now_msk()
+        loop = asyncio.get_event_loop()
         logger.info("replan user={}: старт ({})", user_id, now.isoformat())
 
         try:
@@ -396,6 +399,17 @@ class Scheduler:
                 lines.append(f"— {marker}{item['title']} → {item['target']}")
             plan_text += "\n".join(lines)
 
+        # Логируем overflow-переносы в daily_events — только для пересборок (не для первого
+        # утреннего запуска), чтобы вечерний итог видел перемещения, произошедшие в течение дня.
+        for item in overflow:
+            try:
+                await loop.run_in_executor(
+                    None, db.append_daily_event,
+                    user_id, now.date(), "overflow", item["title"], item["target"],
+                )
+            except Exception as exc:
+                logger.error("replan user={}: ошибка append_daily_event — {}", user_id, exc)
+
         logger.info(
             "replan user={}: завершено, карточек={} overflow={}",
             user_id, len(task_cards), len(overflow),
@@ -459,6 +473,24 @@ class Scheduler:
             user_id, len(cards_dicts),
         )
 
+        # ── Сохраняем утренний снэпшот для вечернего итога ───────────────────
+        snapshot_cards = [
+            {
+                "id":         d["id"],
+                "title":      d["title"],
+                "size":       d["size"],
+                "importance": d["importance"],
+                "section":    d["section"],
+            }
+            for d in cards_dicts
+        ]
+        try:
+            await loop.run_in_executor(
+                None, db.save_morning_snapshot, user_id, today, snapshot_cards
+            )
+        except Exception as exc:
+            logger.error("morning_job user={}: ошибка save_morning_snapshot — {}", user_id, exc)
+
         # ── Генерируем план через Claude ──────────────────────────────────────
         date_str = _format_date_ru(today)
         try:
@@ -497,15 +529,76 @@ class Scheduler:
         await loop.run_in_executor(None, db.set_morning_done, today, user_id)
         logger.info("morning_job user={}: завершено, флаг установлен", user_id)
 
-    # ── Вечерняя джоба [UPD 4: временно отключена] ──────────────────────────
+    # ── Вечерняя джоба ───────────────────────────────────────────────────────
 
     async def run_evening_job(self) -> None:
-        """[UPD 4] Временно отключена — будет доработана в v5.
+        """Запускает вечерний итог для каждого пользователя.
 
-        Джоба в 21:00 остаётся зарегистрированной но ничего не делает.
-        Команда «вечер» в боте также возвращает заглушку.
+        Ошибка одного пользователя не прерывает остальных.
         """
-        logger.info("evening: временно отключено")
+        for user_ctx in self._users:
+            try:
+                await self._run_evening_for_user(user_ctx)
+            except Exception as exc:
+                logger.error(
+                    "evening_job user={}: {}",
+                    user_ctx.user_cfg.user_id, exc,
+                )
+
+    async def run_evening_for_user(self, user_ctx: UserSchedulerCtx) -> None:
+        """Публичный метод для ручного запуска вечерней логики (из handlers, команда «вечер»)."""
+        await self._run_evening_for_user(user_ctx)
+
+    async def _run_evening_for_user(self, user_ctx: UserSchedulerCtx) -> None:
+        """Вечерний итог для одного пользователя: снэпшот утра + лог событий + текущее
+        состояние сегодняшней колонки → diff_day → Claude → отправка → очистка данных дня.
+
+        Идемпотентность: guard через флаг evening_done в SQLite (как is_morning_done у утра) —
+        если пользователь уже получил вечерний отчёт сегодня (вручную командой «вечер» до
+        автозапуска в 22:00, или наоборот), повторный запуск пропускается. Данные дня (снэпшот
+        + лог событий) удаляются ТОЛЬКО после успешной отправки — если отправка не удалась,
+        данные остаются для следующей попытки.
+        """
+        today   = _now_msk().date()
+        user_id = user_ctx.user_cfg.user_id
+        loop    = asyncio.get_event_loop()
+        logger.info("evening_job user={}: старт ({})", user_id, today.isoformat())
+
+        already_done = await loop.run_in_executor(None, db.is_evening_done, today, user_id)
+        if already_done:
+            logger.info("evening_job user={}: уже выполнено сегодня, пропускаем", user_id)
+            return
+
+        snapshot = await loop.run_in_executor(None, db.load_morning_snapshot, user_id, today)
+        events   = await loop.run_in_executor(None, db.load_daily_events, user_id, today)
+
+        today_col_id = user_ctx.logic.get_today_column_id()
+        try:
+            cards = await user_ctx.kaiten.get_cards(today_col_id)
+        except Exception as exc:
+            logger.error("evening_job user={}: не удалось загрузить карточки — {}", user_id, exc)
+            return
+
+        current_cards = _extract_section_cards(cards)
+        diff = diff_day(snapshot, events, current_cards)
+
+        try:
+            summary = await self._claude.generate_evening_summary(
+                diff["done"], diff["undone"], diff["moved"], diff["added"],
+            )
+        except Exception as exc:
+            logger.error("evening_job user={}: ошибка generate_evening_summary — {}", user_id, exc)
+            summary = "Не удалось сформировать вечерний итог дня."
+
+        try:
+            await user_ctx.notifier.send(summary)
+        except Exception as exc:
+            logger.error("evening_job user={}: ошибка отправки — {}", user_id, exc)
+            return  # НЕ чистим данные дня — следующая попытка должна их увидеть
+
+        await loop.run_in_executor(None, db.clear_daily_data, user_id, today)
+        await loop.run_in_executor(None, db.set_evening_done, today, user_id)
+        logger.info("evening_job user={}: завершено, данные дня очищены", user_id)
 
     # ── Джоба очистки Архива ─────────────────────────────────────────────────
 

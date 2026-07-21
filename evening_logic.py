@@ -1,129 +1,138 @@
 """
-evening_logic.py — вечерняя логика подведения итогов дня.
+evening_logic.py — сравнение утреннего снэпшота с текущим состоянием дня.
 
-Класс EveningLogic реализует:
-  - загрузку карточек сегодняшней колонки (невыполненные)
-  - загрузку карточек Архива через /columns/{id}/cards (содержит column_changed_at)
-  - фильтрацию выполненных сегодня по полю column_changed_at
-  - генерацию итога через ClaudeClient
-
-Публичный метод:
-    async def run(self, today: date) -> str
-        Возвращает текст итога дня для отправки в Telegram.
-
-Логика определения «выполнено сегодня»:
-    Kaiten возвращает поле column_changed_at при запросе через
-    GET /columns/{column_id}/cards — дату и время попадания карточки
-    в текущую колонку. Карточки Архива с column_changed_at == сегодня
-    — это задачи, заархивированные сегодня (выполненные).
-    Fallback: если column_changed_at отсутствует — карточка в done не попадает.
+Чистая функция без I/O: принимает снэпшот утра, лог событий дня и текущие карточки
+сегодняшней колонки — возвращает 4 категории для вечернего итога (done/undone/moved/added).
+Хранение снэпшота/лога — в db.py (SQLite). Оркестрация (загрузка из БД, Kaiten, Claude,
+отправка в Telegram, очистка после отправки) — в scheduler.py.
 """
 
 from __future__ import annotations
 
-from datetime import date, timezone, timedelta
-
 from loguru import logger
 
-from kaiten_client import Card, KaitenClient, ARCHIVE_COLUMN_ID
-from board_logic import BoardLogic, COLUMN_IDS, WEEKDAY_COLUMNS
-from claude_client import ClaudeClient
 
-# UTC+3 для сравнения дат (карточки хранят время в МСК)
-_TZ_MSK = timezone(timedelta(hours=3))
+def diff_day(
+    snapshot: list[dict] | None,
+    events: list[dict],
+    current_cards: list[dict],
+) -> dict:
+    """Сравнивает утренний снэпшот с текущим состоянием карточек сегодняшней колонки.
 
+    snapshot       — из db.load_morning_snapshot: [{"id","title","size","importance","section"}, ...]
+                     или None (если утренняя логика сегодня не запускалась)
+    events         — из db.load_daily_events: [{"event_type","card_title","detail","created_at"}, ...]
+    current_cards  — текущие карточки сегодняшней колонки: [{"id","title","size","importance",
+                     "section",...}, ...] (лишние ключи в dict допустимы и игнорируются)
 
-class EveningLogic:
-    """Вечерняя логика: собирает статистику дня и генерирует итог через Claude."""
+    Алгоритм (сопоставление по id между snapshot и current_cards; по card_title между
+    snapshot и events):
+      - undone: карточки снэпшота, чей id ЕСТЬ среди current_cards (остались невыполненными)
+      - done:   карточки снэпшота, чьего id НЕТ среди current_cards, И для card_title которых
+                НЕТ события с event_type in ('moved', 'overflow') в events
+                (пропала из колонки без явного переноса → значит архивирована/выполнена)
+      - moved:  карточки снэпшота, чьего id НЕТ среди current_cards, И ЕСТЬ событие
+                event_type in ('moved', 'overflow') с совпадающим card_title —
+                detail берётся из ПОСЛЕДНЕГО (самого свежего) такого события для этой карточки
+      - added:  карточки current_cards, чьего id НЕТ среди id снэпшота (появились в течение дня)
 
-    def __init__(
-        self,
-        client: KaitenClient,
-        logic: BoardLogic,
-        claude: ClaudeClient,
-    ) -> None:
-        self._client = client
-        self._logic = logic
-        self._claude = claude
+    Если snapshot is None (утренняя логика сегодня не запускалась) — возвращает все
+    current_cards как undone, done/moved/added — пустые списки.
 
-    # ── Точка входа ───────────────────────────────────────────────────────────
-
-    async def run(self, today: date) -> str:
-        """Подводит итог дня.
-
-        1. Загружает карточки сегодняшней колонки → всё что осталось = невыполненные.
-        2. Загружает Архив через /columns/{id}/cards → фильтрует по column_changed_at.
-        3. Формирует списки dict для ClaudeClient.
-        4. Возвращает текст итога.
-
-        Не бросает исключения — при ошибках возвращает fallback-строку.
-        """
-        today_col_id = COLUMN_IDS[WEEKDAY_COLUMNS[today.weekday()]]
-        logger.info("evening: загружаем карточки col={} ({})", today_col_id, today.isoformat())
-
-        # ── 1. Невыполненные: карточки сегодняшней колонки ───────────────────
-        # Всё что осталось в колонке дня к вечеру — не сделано.
-        # Выполненные карточки уходят в Архив командой «готово»,
-        # в колонке дня их уже нет.
-        try:
-            today_cards = await self._client.get_cards(today_col_id)
-        except Exception as exc:
-            logger.error("evening: не удалось загрузить карточки сегодня — {}", exc)
-            return "⚠️ Не удалось загрузить задачи дня. Попробуй позже."
-
-        undone: list[Card] = [
-            c for c in today_cards
-            if not c.blocked and not c.archived
-        ]
-
-        # ── 2. Выполненные: Архив, updated_at == сегодня ─────────────────────
-        # Используем get_cards() — стандартный рабочий эндпоинт.
-        # Фильтруем по updated_at: карточки обновлённые сегодня
-        # скорее всего и были заархивированы сегодня.
-        done: list[Card] = []
-        try:
-            archive_cards = await self._client.get_cards(ARCHIVE_COLUMN_ID)
-            for card in archive_cards:
-                if card.blocked:
-                    continue
-                # Пробуем updated_at
-                ts = card.updated_at_parsed
-                if ts is None:
-                    # Fallback: column_changed_at если есть
-                    ts = card.column_changed_at_parsed
-                if ts is None:
-                    continue
-                ts_local = ts.astimezone(_TZ_MSK)
-                if ts_local.date() == today:
-                    done.append(card)
-            logger.info(
-                "evening: архив загружен, выполнено сегодня={} (всего в архиве={})",
-                len(done), len(archive_cards),
-            )
-        except Exception as exc:
-            logger.warning("evening: не удалось загрузить Архив — {}", exc)
-
-        logger.info(
-            "evening: выполнено={} не_выполнено={}", len(done), len(undone)
-        )
-
-        # ── 3. Форматируем в dict для ClaudeClient ────────────────────────────
-        def _to_dict(card: Card) -> dict:
-            return {
-                "title":      card.title,
-                "importance": card.importance,  # str | None
-                "size":       card.size,         # int | None
+    Возвращает:
+        {
+            "done":   [{"title": str, "importance": str|None, "size": int|None}, ...],
+            "undone": [{"title": str, "importance": str|None, "size": int|None,
+                        "section": str|None}, ...],
+            "moved":  [{"title": str, "detail": str}, ...],
+            "added":  [{"title": str, "importance": str|None, "size": int|None}, ...],
+        }
+    """
+    # ── Снэпшот отсутствует — утро не запускалось ─────────────────────────────
+    if snapshot is None:
+        logger.info("diff_day: снэпшот отсутствует — все current_cards → undone")
+        undone = [
+            {
+                "title":      c.get("title"),
+                "importance": c.get("importance"),
+                "size":       c.get("size"),
+                "section":    c.get("section"),
             }
+            for c in current_cards
+        ]
+        return {"done": [], "undone": undone, "moved": [], "added": []}
 
-        done_dicts   = [_to_dict(c) for c in done]
-        undone_dicts = [_to_dict(c) for c in undone]
+    # ── Множества id для эффективного поиска ──────────────────────────────────
+    current_ids: set[int] = set()
+    for c in current_cards:
+        cid = c.get("id")
+        if cid is not None:
+            current_ids.add(cid)
 
-        # ── 4. Генерация итога через Claude ───────────────────────────────────
-        try:
-            summary = await self._claude.generate_evening_summary(done_dicts, undone_dicts)
-        except Exception as exc:
-            logger.error("evening: ошибка generate_evening_summary — {}", exc)
-            return "⚠️ Не удалось сгенерировать итог дня. Попробуй позже."
+    snapshot_ids: set[int] = set()
+    for c in snapshot:
+        cid = c.get("id")
+        if cid is not None:
+            snapshot_ids.add(cid)
 
-        logger.info("evening: итог сгенерирован ({} символов)", len(summary))
-        return summary
+    # ── Индекс перемещений: title → detail последнего события moved/overflow ──
+    # Итерируем в порядке id (хронологически), каждый следующий перезаписывает —
+    # в результате остаётся только самый свежий detail для каждого названия.
+    moved_detail: dict[str, str] = {}
+    for event in events:
+        if event.get("event_type") in ("moved", "overflow"):
+            title = event.get("card_title", "")
+            if title:
+                moved_detail[title] = event.get("detail", "")
+
+    # ── Классификация карточек снэпшота ──────────────────────────────────────
+    done: list[dict] = []
+    undone: list[dict] = []
+    moved: list[dict] = []
+
+    for card in snapshot:
+        cid = card.get("id")
+        if cid is None:
+            logger.warning("diff_day: карточка в снэпшоте без поля id — пропускаем: {}", card)
+            continue
+
+        title = card.get("title")
+
+        if cid in current_ids:
+            # Карточка ещё в колонке дня → не выполнена
+            undone.append({
+                "title":      title,
+                "importance": card.get("importance"),
+                "size":       card.get("size"),
+                "section":    card.get("section"),
+            })
+        elif title in moved_detail:
+            # Ушла из колонки + есть событие переноса → moved
+            moved.append({
+                "title":  title,
+                "detail": moved_detail[title],
+            })
+        else:
+            # Ушла из колонки без явного переноса → выполнена/архивирована
+            done.append({
+                "title":      title,
+                "importance": card.get("importance"),
+                "size":       card.get("size"),
+            })
+
+    # ── Карточки, добавленные в течение дня ──────────────────────────────────
+    added: list[dict] = []
+    for card in current_cards:
+        cid = card.get("id")
+        if cid is not None and cid not in snapshot_ids:
+            added.append({
+                "title":      card.get("title"),
+                "importance": card.get("importance"),
+                "size":       card.get("size"),
+            })
+
+    logger.info(
+        "diff_day: done={} undone={} moved={} added={}",
+        len(done), len(undone), len(moved), len(added),
+    )
+    return {"done": done, "undone": undone, "moved": moved, "added": added}

@@ -87,7 +87,12 @@ class Notifier:
 
     # ── Внутренние хелперы ────────────────────────────────────────────────────
 
-    async def _post(self, text: str, parse_mode: str | None = "Markdown") -> int | None:
+    async def _post(
+        self,
+        text: str,
+        parse_mode: str | None = "Markdown",
+        disable_notification: bool = False,
+    ) -> int | None:
         """Отправляет одно сообщение. Возвращает message_id при успехе, None при ошибке.
 
         При ошибке парсинга Markdown автоматически повторяет без форматирования.
@@ -98,6 +103,8 @@ class Notifier:
         }
         if parse_mode:
             payload["parse_mode"] = parse_mode
+        if disable_notification:
+            payload["disable_notification"] = True
 
         try:
             async with httpx.AsyncClient(timeout=_SEND_MESSAGE_TIMEOUT) as client:
@@ -117,7 +124,11 @@ class Notifier:
                         "Notifier._post: Markdown-ошибка ({}), повтор без форматирования",
                         description,
                     )
-                    return await self._post(text, parse_mode=None)
+                    return await self._post(
+                        text,
+                        parse_mode=None,
+                        disable_notification=disable_notification,
+                    )
 
                 logger.error(
                     "Notifier._post: Telegram API error {} — {}",
@@ -186,11 +197,12 @@ class Notifier:
                     "Notifier.send: не удалось отправить часть {}/{}", i, len(parts)
                 )
 
-    async def send_and_pin(self, text: str) -> None:
+    async def send_and_pin(self, text: str, silent: bool = False) -> None:
         """Отправляет текст (с разбивкой если >4096 символов), затем откепляет все
         ранее закреплённые сообщения и закрепляет последнее отправленное.
 
         Ошибки pin/unpin не критичны — не бросает исключения.
+        silent=True — отправить без звука (для утреннего авто-плана).
         """
         if not text:
             logger.warning("Notifier.send_and_pin: передан пустой текст, пропускаем")
@@ -198,7 +210,7 @@ class Notifier:
         parts = _split_text(text)
         last_message_id: int | None = None
         for i, part in enumerate(parts, start=1):
-            message_id = await self._post(part)
+            message_id = await self._post(part, disable_notification=silent)
             if message_id is not None:
                 last_message_id = message_id
                 logger.info(
@@ -213,11 +225,13 @@ class Notifier:
             await self._unpin_all()
             await self._pin(last_message_id)
 
-    async def send_card_buttons(self, cards: list) -> None:
+    async def send_card_buttons(self, cards: list, silent: bool = False) -> None:
         """Отправляет сообщение с InlineKeyboard из карточек (первая страница, до 20 кнопок).
 
         Карточки сортируются: «На контроле» — всегда в конец, затем по event_time.
         cards — list[Card] из kaiten_client.
+        silent=True — отправить без звука (для утреннего авто-плана).
+        Кнопки с event_time на сегодня отображают префикс времени «ЧЧ:ММ».
         """
         # Сортируем ПОЛНЫЙ список по sort_order — нужно для определения секции «На контроле»
         full_sorted = sorted(cards, key=lambda c: c.sort_order)
@@ -234,9 +248,19 @@ class Notifier:
         max_buttons = 20
         btn_title_len = 40
         shown = task_cards[:max_buttons]
+        today_msk = datetime.now(TZ_MSK).date()
+
+        def _button_text(c: Card) -> str:
+            prefix = ""
+            if c.event_time and c.event_time.date() == today_msk:
+                prefix = f"{c.event_time:%H:%M} "
+            available = btn_title_len - len(prefix)
+            title = c.title[:available] + ("…" if len(c.title) > available else "")
+            return prefix + title
+
         keyboard = [
             [InlineKeyboardButton(
-                text=c.title[:btn_title_len] + ("…" if len(c.title) > btn_title_len else ""),
+                text=_button_text(c),
                 callback_data=f"card:{c.id}",
             )]
             for c in shown
@@ -253,6 +277,7 @@ class Notifier:
             "text": text,
             "parse_mode": "Markdown",
             "reply_markup": markup.to_dict(),
+            "disable_notification": silent,
         }
         try:
             async with httpx.AsyncClient(timeout=_SEND_MESSAGE_TIMEOUT) as client:

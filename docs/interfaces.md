@@ -35,6 +35,7 @@ ANTHROPIC_API_KEY=...
 | Добавить комментарий | POST | `/cards/{card_id}/comments` |
 | Получить комментарии | GET | `/cards/{card_id}/comments` |
 | Добавить тег | POST | `/cards/{card_id}/tags` — body: `{"name": "tagname"}` |
+| Удалить тег | DELETE | `/cards/{card_id}/tags/{tag_id}` — не подтверждён эмпирически (симметричен POST по конвенции REST) |
 | Заблокировать карточку | POST | `/cards/{card_id}/blockers` — body: `{"reason": "Утро"}` |
 | Создать кастомное поле | POST | `/company/custom-properties` — body: `{"name": str, "type": str, ["multi_select": bool]}` |
 | Добавить вариант select | POST | `/company/custom-properties/{property_id}/select-values` — body: `{"value": str}` |
@@ -290,6 +291,10 @@ class KaitenClient:
         """name — 'среднее'|'важное'|'критическое'.
         Возвращает {field_key: [option_id]} или None если имя не найдено."""
 
+    def weekday_property(self, name: str) -> dict | None:
+        """name — 'ПН'|'ВТ'|'СР'|'ЧТ'|'ПТ'|'СБ'|'ВС'.
+        Возвращает {field_key: [option_id]} или None если имя не найдено в self._weekday_options."""
+
     def configure_custom_fields(
         self,
         *,
@@ -376,6 +381,15 @@ class KaitenClient:
         """POST /cards/{card_id}/tags  body={"name": tag_name}
         Добавляет тег по имени (не по ID) — совместимо с мульти-пользовательским режимом.
         Возвращает True при успехе, False при ошибке."""
+
+    async def remove_tag_by_name(self, card_id: int, tag_name: str) -> bool:
+        """DELETE /cards/{card_id}/tags/{tag_id}
+        Удаляет тег с карточки по имени. Резолвит tag_id через self.tag_id(tag_name).
+        Если тег не сконфигурирован для аккаунта — warning + False.
+        ЭНДПОИНТ НЕ ПОДТВЕРЖДЁН ЭМПИРИЧЕСКИ — симметричен POST .../tags по конвенции REST,
+        реального теста на проде не было. При HTTP-ошибке (_request → None) логирует error,
+        возвращает False. Используется для смены регулярности (снять старый тег, поставить новый).
+        Возвращает True при успехе, False при ошибке или если тег не найден в конфигурации."""
 
     async def block_card(self, card_id: int, reason: str) -> bool:
         """POST /cards/{card_id}/blockers  body={"reason": reason}
@@ -620,6 +634,7 @@ class Card:
 | 6 | Блокировка карточки через API | Решено | POST /cards/{id}/blockers с {"reason": "..."} (PATCH игнорируется) |
 | 7 | Поле last_moved_at в ответе API | Открыт | Добавлено в Card и _parse_card, нужно проверить реально ли Kaiten возвращает это поле. Если нет — last_moved_at_parsed автоматически использует updated_at как fallback. |
 | 8 | GET /company/custom-properties | Открыт | Эндпоинт добавлен в get_custom_properties() по аналогии с /company/tags, но не проверен эмпирически. При 404 метод вернёт [] и защита от дублей отключится (безопасный fallback). |
+| 9 | DELETE /cards/{id}/tags/{tag_id} | Открыт | Реализован в remove_tag_by_name() по аналогии с POST (конвенция REST), но эмпирически не проверен. При ошибке в проде будет видно по логам remove_tag_by_name. |
 
 ---
 

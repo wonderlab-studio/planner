@@ -2,7 +2,8 @@
 db.py — модуль состояния на SQLite.
 
 Хранит флаги выполнения утренней/вечерней логики по датам и пользователям,
-а также автообнаруженную конфигурацию Kaiten (ID полей/тегов/вариантов select).
+а также автообнаруженную конфигурацию Kaiten (ID полей/тегов/вариантов select),
+снэпшот утренних карточек и лог событий дня для вечернего итога.
 Синхронный — вызывать из asyncio через loop.run_in_executor(None, func, args).
 
 Конфиг из .env:
@@ -78,6 +79,35 @@ def _init_db() -> None:
             logger.info("db: migrated daily_flags — added user_id column")
 
         _init_kaiten_config_table(conn)
+
+        # Снэпшот утренних карточек для вечернего итога
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS daily_snapshot (
+                date          TEXT NOT NULL,
+                user_id       TEXT NOT NULL,
+                snapshot_json TEXT NOT NULL,
+                created_at    TEXT NOT NULL,
+                PRIMARY KEY (date, user_id)
+            )
+        """)
+
+        # Лог событий дня (overflow, done, moved, created)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS daily_events (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                date       TEXT NOT NULL,
+                user_id    TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                card_title TEXT NOT NULL,
+                detail     TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_daily_events_lookup
+            ON daily_events(date, user_id)
+        """)
+        conn.commit()
 
     logger.debug("db: таблицы готовы (DB_PATH={})", DB_PATH)
 
@@ -229,3 +259,133 @@ def load_user_kaiten_config(user_id: str) -> dict | None:
     except (ValueError, TypeError) as exc:
         logger.error("load_user_kaiten_config({}): не удалось распарсить JSON — {}", user_id, exc)
         return None
+
+
+# ── Снэпшот утра и лог событий (для вечернего итога) ─────────────────────────
+
+def save_morning_snapshot(user_id: str, d: date | str, cards: list[dict]) -> None:
+    """Сохраняет JSON-снэпшот утренних карточек дня.
+
+    cards: [{"id": int, "title": str, "size": int|None, "importance": str|None,
+             "section": str|None}, ...]
+
+    INSERT OR REPLACE — перезаписывает существующую запись при повторном вызове
+    (вызывается один раз в день благодаря guard is_morning_done в scheduler.py,
+    но идемпотентность на всякий случай сохраняется).
+    """
+    key = _date_key(d)
+    snapshot_json = json.dumps(cards, ensure_ascii=False)
+    now = datetime.now(timezone.utc).isoformat()
+    with _get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO daily_snapshot (date, user_id, snapshot_json, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(date, user_id) DO UPDATE SET snapshot_json = excluded.snapshot_json,
+                                                     created_at = excluded.created_at
+            """,
+            (key, user_id, snapshot_json, now),
+        )
+        conn.commit()
+    logger.info(
+        "save_morning_snapshot({}, {}): сохранено {} карточек",
+        key, user_id, len(cards),
+    )
+
+
+def load_morning_snapshot(user_id: str, d: date | str) -> list[dict] | None:
+    """Возвращает ранее сохранённый снэпшот или None если для (date, user_id)
+    ничего не сохранено (например, утренняя логика в этот день не запускалась)."""
+    key = _date_key(d)
+    with _get_connection() as conn:
+        row = conn.execute(
+            "SELECT snapshot_json FROM daily_snapshot WHERE date = ? AND user_id = ?",
+            (key, user_id),
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        return json.loads(row["snapshot_json"])
+    except (ValueError, TypeError) as exc:
+        logger.error(
+            "load_morning_snapshot({}, {}): не удалось распарсить JSON — {}",
+            key, user_id, exc,
+        )
+        return None
+
+
+def append_daily_event(
+    user_id: str,
+    d: date | str,
+    event_type: str,
+    card_title: str,
+    detail: str = "",
+) -> None:
+    """Добавляет запись в лог событий дня.
+
+    event_type: 'created' | 'done' | 'moved' | 'overflow'
+    INSERT — добавляет новую запись, НЕ перезаписывает предыдущие
+    (история накапливается за день).
+    """
+    key = _date_key(d)
+    now = datetime.now(timezone.utc).isoformat()
+    with _get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO daily_events (date, user_id, event_type, card_title, detail, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (key, user_id, event_type, card_title, detail, now),
+        )
+        conn.commit()
+    logger.debug(
+        "append_daily_event({}, {}): type={} title={}",
+        key, user_id, event_type, card_title,
+    )
+
+
+def load_daily_events(user_id: str, d: date | str) -> list[dict]:
+    """Возвращает список событий дня в хронологическом порядке (ORDER BY id).
+
+    Каждый элемент: {"event_type": str, "card_title": str, "detail": str, "created_at": str}
+    """
+    key = _date_key(d)
+    with _get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT event_type, card_title, detail, created_at
+            FROM daily_events
+            WHERE date = ? AND user_id = ?
+            ORDER BY id
+            """,
+            (key, user_id),
+        ).fetchall()
+    return [
+        {
+            "event_type": row["event_type"],
+            "card_title": row["card_title"],
+            "detail":     row["detail"],
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ]
+
+
+def clear_daily_data(user_id: str, d: date | str) -> None:
+    """Удаляет снэпшот (daily_snapshot) и все события (daily_events) для (date, user_id).
+
+    Вызывать ТОЛЬКО после успешной отправки вечернего отчёта — иначе данные дня будут
+    потеряны при повторной попытке отправки.
+    """
+    key = _date_key(d)
+    with _get_connection() as conn:
+        conn.execute(
+            "DELETE FROM daily_snapshot WHERE date = ? AND user_id = ?",
+            (key, user_id),
+        )
+        conn.execute(
+            "DELETE FROM daily_events WHERE date = ? AND user_id = ?",
+            (key, user_id),
+        )
+        conn.commit()
+    logger.info("clear_daily_data({}, {}): снэпшот и события дня удалены", key, user_id)

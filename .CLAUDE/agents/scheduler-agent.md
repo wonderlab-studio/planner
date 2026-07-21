@@ -5,6 +5,7 @@ model: claude-sonnet-4-6
 tools:
   - Read
   - Write
+  - Edit
 ---
 
 # Scheduler Agent

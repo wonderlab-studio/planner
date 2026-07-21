@@ -24,6 +24,7 @@ import signal
 import sys
 
 from loguru import logger
+from telegram import BotCommand, MenuButtonCommands
 
 import db  # noqa: F401 — инициализирует SQLite при импорте
 from board_logic import BoardLogic
@@ -162,7 +163,7 @@ async def main() -> None:
             await scheduler.run_morning_for_user(_sc)
 
         async def evening_routine(_sc=sched_ctx) -> None:
-            pass  # evening отключён в v4
+            await scheduler.run_evening_for_user(_sc)
 
         async def replan_routine(_sc=sched_ctx) -> str:
             return await scheduler.run_replan_for_user(_sc)
@@ -200,6 +201,16 @@ async def main() -> None:
         logger.info("bot: APScheduler запущен")
 
         await app.initialize()
+
+        await app.bot.set_my_commands([
+            BotCommand("newtask", "Создать задачу"),
+            BotCommand("other",   "Задачи другой колонки"),
+            BotCommand("replan",  "Пересобрать план дня"),
+            BotCommand("help",    "Список команд"),
+        ])
+        await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+        logger.info("bot: команды и меню Telegram настроены")
+
         await app.start()
         await app.updater.start_polling(drop_pending_updates=True)
         logger.info(
