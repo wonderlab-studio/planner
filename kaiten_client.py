@@ -624,18 +624,65 @@ class KaitenClient:
     async def get_comments(self, card_id: int) -> list[str]:
         """GET /cards/{card_id}/comments → список текстов комментариев.
 
+        Комментарии возвращаются в хронологическом порядке (старые → новые).
+        Сортировка: сначала по полю даты создания (created / created_at / createdAt /
+        timestamp), fallback — по числовому id (монотонно возрастает), финальный
+        fallback — исходный порядок ответа API (sort стабилен).
         Возвращает пустой список при ошибке или если комментариев нет.
         """
         data = await self._request("GET", f"/cards/{card_id}/comments")
         if not isinstance(data, list):
             logger.debug("get_comments: нет комментариев для id={}", card_id)
             return []
+
+        dict_items = [item for item in data if isinstance(item, dict)]
+
+        # Определяем поле для сортировки по первому элементу — логируем один раз
+        date_field_used = "index"
+        if dict_items:
+            first = dict_items[0]
+            _found = False
+            for _candidate in ("created", "created_at", "createdAt", "timestamp"):
+                _val = first.get(_candidate)
+                if _val:
+                    try:
+                        datetime.fromisoformat(str(_val).replace("Z", "+00:00"))
+                        date_field_used = _candidate
+                        _found = True
+                        break
+                    except (ValueError, TypeError):
+                        pass
+            if not _found and isinstance(first.get("id"), (int, float)):
+                date_field_used = "id"
+        logger.debug(
+            "get_comments: id={} сортировка по полю='{}'", card_id, date_field_used
+        )
+
+        def _sort_key(indexed_item: tuple[int, dict]) -> tuple[int, float, int, int]:
+            idx, item = indexed_item
+            for candidate in ("created", "created_at", "createdAt", "timestamp"):
+                val = item.get(candidate)
+                if val:
+                    try:
+                        parsed = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+                        return (0, parsed.timestamp(), 0, idx)
+                    except (ValueError, TypeError):
+                        pass
+            id_val = item.get("id")
+            if isinstance(id_val, (int, float)):
+                return (1, 0.0, int(id_val), idx)
+            return (2, 0.0, 0, idx)
+
+        # enumerate по исходному data сохраняет оригинальный индекс для стабильности
+        indexed = [(i, item) for i, item in enumerate(data) if isinstance(item, dict)]
+        indexed.sort(key=_sort_key)
+
         texts: list[str] = []
-        for item in data:
-            if isinstance(item, dict):
-                text = item.get("text") or item.get("body") or ""
-                if text:
-                    texts.append(str(text))
+        for _, item in indexed:
+            text = item.get("text") or item.get("body") or ""
+            if text:
+                texts.append(str(text))
+
         logger.debug("get_comments: id={} комментариев={}", card_id, len(texts))
         return texts
 

@@ -25,7 +25,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from loguru import logger
 
 import db
-from evening_logic import diff_day
+from evening_logic import diff_day, CardLookupCtx
 from kaiten_client import Card, KaitenClient, TAG_IDS
 from board_logic import BoardLogic
 from claude_client import ClaudeClient
@@ -580,7 +580,74 @@ class Scheduler:
             return
 
         current_cards = _extract_section_cards(cards)
-        diff = diff_day(snapshot, events, current_cards)
+
+        # ── Предзагрузка реального состояния «неопознанных» карточек ─────────
+        # «Неопознанные» — карточки снэпшота, которые исчезли из сегодняшней
+        # колонки без явного события moved/overflow в daily_events. Без этой
+        # проверки они слепо засчитывались бы как done, хотя могли быть
+        # перенесены вручную в Kaiten UI (бот про перенос не знает).
+        card_ctx: CardLookupCtx | None = None
+        if snapshot:
+            _current_ids_eve: set[int] = {
+                c["id"] for c in current_cards if c.get("id") is not None
+            }
+            _moved_titles_eve: set[str] = {
+                e["card_title"]
+                for e in events
+                if e.get("event_type") in ("moved", "overflow")
+            }
+            _unrecognized_ids: list[int] = [
+                s["id"]
+                for s in snapshot
+                if s.get("id") is not None
+                and s["id"] not in _current_ids_eve
+                and s.get("title", "") not in _moved_titles_eve
+            ]
+
+            if _unrecognized_ids:
+                logger.info(
+                    "evening_job user={}: предзагрузка {} «неопознанных» карточек",
+                    user_id, len(_unrecognized_ids),
+                )
+                _gc_results = await asyncio.gather(
+                    *[user_ctx.kaiten.get_card(cid) for cid in _unrecognized_ids],
+                    return_exceptions=True,
+                )
+                _card_lookup: dict[int, Card | None] = {}
+                for _cid, _res in zip(_unrecognized_ids, _gc_results):
+                    if isinstance(_res, BaseException):
+                        logger.error(
+                            "evening_job user={}: ошибка get_card id={} — {}",
+                            user_id, _cid, _res,
+                        )
+                        _card_lookup[_cid] = None   # fallback: treat as done
+                    else:
+                        _card_lookup[_cid] = _res   # Card | None
+
+                _client = user_ctx.kaiten
+                _logic  = user_ctx.logic
+                _tag_weekly   = _client.tag_id("еженедельно")
+                _tag_weekdays = _client.tag_id("по будням")
+                _tag_weekends = _client.tag_id("по выходным")
+                _tag_daily    = _client.tag_id("ежедневно")
+                card_ctx = CardLookupCtx(
+                    lookup=_card_lookup,
+                    today_col_id=today_col_id,
+                    archive_col_id=_logic.column_ids["Архив"],
+                    snapshot_date=today,
+                    regular_tag_ids={
+                        t for t in [_tag_weekly, _tag_weekdays, _tag_weekends, _tag_daily]
+                        if t is not None
+                    },
+                    weekly_tag_id=_tag_weekly,
+                    weekdays_tag_id=_tag_weekdays,
+                    weekends_tag_id=_tag_weekends,
+                    col_id_by_name=_logic.column_ids,
+                )
+            else:
+                logger.debug("evening_job user={}: неопознанных карточек нет", user_id)
+
+        diff = diff_day(snapshot, events, current_cards, card_ctx)
 
         try:
             summary = await self._claude.generate_evening_summary(
