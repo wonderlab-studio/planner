@@ -823,6 +823,11 @@ class MorningLogic:
                 et.astimezone(_TZ_MSK) if (et and et.tzinfo)
                 else (et.replace(tzinfo=_TZ_MSK) if et else None)
             )
+            # Карточка, перенесённая из другой колонки/дня, может нести устаревшее
+            # event_time с прошлой датой — оно не относится к сегодняшнему плану.
+            # Обнуляем, чтобы карточка получила свежее время через _place_groups.
+            if et_local is not None and et_local.date() < today:
+                et_local = None
             tag_names = {t.name for t in card.tags}
             is_hard = "жёсткое событие" in tag_names
 

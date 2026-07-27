@@ -484,6 +484,7 @@ async def _handle_create(
     cfg: HandlersConfig,
     raw_text: str,
     user_ctx: UserHandlerCtx,
+    context: ContextTypes.DEFAULT_TYPE | None = None,
 ) -> None:
     """Парсит намерение и создаёт карточку в Kaiten."""
     assert update.message is not None
@@ -581,6 +582,12 @@ async def _handle_create(
                 InlineKeyboardButton("❌ Нет", callback_data="replan_offer:no"),
             ]]),
         )
+
+    if context is not None and update.effective_chat:
+        try:
+            await _resend_card_buttons(user_ctx, context, update.effective_chat.id)
+        except Exception as exc:
+            logger.warning("_handle_create: не удалось отправить кнопки — {}", exc)
 
 
 # ── Обработчик «готово» ───────────────────────────────────────────────────────
@@ -700,6 +707,10 @@ async def _handle_move(
         if column_name and column_name in user_ctx.logic.column_ids:
             target_column_id   = user_ctx.logic.column_ids[column_name]
             target_column_name = column_name
+        elif section == "На контроле":
+            today_wd           = datetime.now(TZ_MSK).date().weekday()
+            target_column_name = WEEKDAY_COLUMNS[today_wd]
+            target_column_id   = user_ctx.logic.get_today_column_id()
         else:
             tomorrow_wd        = (datetime.now(TZ_MSK).date() + timedelta(days=1)).weekday()
             target_column_name = WEEKDAY_COLUMNS[tomorrow_wd]
@@ -977,16 +988,30 @@ async def _finalize_new_task(
                 "ПН": "Понедельник", "ВТ": "Вторник", "СР": "Среда",
                 "ЧТ": "Четверг", "ПТ": "Пятница", "СБ": "Суббота", "ВС": "Воскресенье",
             }
+            _wd_to_idx: dict[str, int] = {
+                "ПН": 0, "ВТ": 1, "СР": 2, "ЧТ": 3, "ПТ": 4, "СБ": 5, "ВС": 6,
+            }
             full_name = _wd_to_col.get(wd_short) if wd_short else None
+            target_wd = _wd_to_idx.get(wd_short) if wd_short else None
             if full_name:
-                try:
-                    column_id = user_ctx.logic.get_column_id(full_name)
-                except ValueError:
-                    logger.warning(
-                        "_finalize_new_task: неизвестная колонка {!r}, fallback на сегодня",
-                        full_name,
-                    )
-                    column_id = user_ctx.logic.get_today_column_id()
+                if target_wd is not None and target_wd < today_wd:
+                    # Выбранный день уже прошёл на этой неделе → «Следующая неделя»
+                    try:
+                        column_id = user_ctx.logic.get_column_id("Следующая неделя")
+                    except ValueError:
+                        logger.warning(
+                            "_finalize_new_task: колонка «Следующая неделя» не найдена, fallback на сегодня"
+                        )
+                        column_id = user_ctx.logic.get_today_column_id()
+                else:
+                    try:
+                        column_id = user_ctx.logic.get_column_id(full_name)
+                    except ValueError:
+                        logger.warning(
+                            "_finalize_new_task: неизвестная колонка {!r}, fallback на сегодня",
+                            full_name,
+                        )
+                        column_id = user_ctx.logic.get_today_column_id()
             else:
                 column_id = user_ctx.logic.get_today_column_id()
         elif regularity == "по выходным" and today_wd <= 4:
@@ -1106,6 +1131,10 @@ async def _finalize_new_task(
         )
 
     context.user_data.pop("new_task", None)
+    try:
+        await _resend_card_buttons(user_ctx, context, query.message.chat_id)
+    except Exception as exc:
+        logger.warning("_finalize_new_task: не удалось отправить кнопки — {}", exc)
     return ConversationHandler.END
 
 
@@ -1203,6 +1232,10 @@ async def _finalize_edit_task(
         f"✅ Изменения сохранены: *{title}*{moved_note}", parse_mode=ParseMode.MARKDOWN
     )
     context.user_data.pop("new_task", None)
+    try:
+        await _resend_card_buttons(user_ctx, context, query.message.chat_id)
+    except Exception as exc:
+        logger.warning("_finalize_edit_task: не удалось отправить кнопки — {}", exc)
     return ConversationHandler.END
 
 
@@ -1402,7 +1435,7 @@ async def _resend_card_buttons(
             cards = await user_ctx.kaiten.get_cards(today_col_id)
             task_cards = [c for c in cards if not c.blocked and not c.archived]
             if task_cards:
-                await send_card_buttons(task_cards, context.bot, chat_id, page=page, context=context)
+                await send_card_buttons(cards, context.bot, chat_id, page=page, context=context)
             else:
                 # Удаляем старое сообщение с кнопками перед отправкой статуса «все обработаны»
                 old_msg_id = context.user_data.get("last_buttons_msg_id")
@@ -1977,6 +2010,10 @@ def build_handlers(cfg: HandlersConfig) -> Application:
             if column_name and column_name in user_ctx.logic.column_ids:
                 target_col_id   = user_ctx.logic.column_ids[column_name]
                 target_col_name = column_name
+            elif section == "На контроле":
+                today_wd        = datetime.now(TZ_MSK).date().weekday()
+                target_col_name = WEEKDAY_COLUMNS[today_wd]
+                target_col_id   = user_ctx.logic.get_today_column_id()
             else:
                 tomorrow        = datetime.now(TZ_MSK).date() + timedelta(days=1)
                 target_col_name = WEEKDAY_COLUMNS[tomorrow.weekday()]
@@ -3160,7 +3197,7 @@ def build_handlers(cfg: HandlersConfig) -> Application:
             return
 
         if re.match(r"^(создать|создай)\b", lower):
-            await _handle_create(update, cfg, _strip_command_prefix(text, "создать", "создай"), user_ctx)
+            await _handle_create(update, cfg, _strip_command_prefix(text, "создать", "создай"), user_ctx, context)
             return
 
         if re.match(r"^(готово|выполнено|сделал|сделано)\b", lower):
@@ -3200,7 +3237,7 @@ def build_handlers(cfg: HandlersConfig) -> Application:
         if user_ctx is None:
             logger.warning("cmd_add: unauthorized chat_id={}", chat_id)
             return
-        await _handle_create(update, cfg, " ".join(context.args or []), user_ctx)
+        await _handle_create(update, cfg, " ".join(context.args or []), user_ctx, context)
 
     async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """/done <описание> — архивировать карточку."""
