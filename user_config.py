@@ -3,6 +3,8 @@ import json
 import os
 from dataclasses import dataclass, field
 
+from loguru import logger
+
 REQUIRED_COLUMN_NAMES = [
     "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье",
     "Следующая неделя", "Далекие времена", "Долгий ящик", "Архив",
@@ -27,17 +29,23 @@ class UserConfig:
 
 
 def load_users() -> list[UserConfig]:
-    """Загружает список пользователей из users.json, USERS_JSON env или одиночного env (обратная совместимость)."""
+    """Загружает список пользователей из users.json, USERS_JSON env или одиночного env (обратная совместимость).
+
+    После загрузки из статических источников дополняет список онбординг-пользователями
+    из SQLite (дедуп по user_id — записи из json/env имеют приоритет).
+    """
     path = os.getenv("USERS_CONFIG_PATH", "users.json")
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-        return [_parse_user(item) for item in data]
-    users_json_env = os.getenv("USERS_JSON")
-    if users_json_env:
-        data = json.loads(users_json_env)
-        return [_parse_user(item) for item in data]
-    return _load_from_env()
+        users = [_parse_user(item) for item in data]
+    elif os.getenv("USERS_JSON"):
+        data = json.loads(os.getenv("USERS_JSON"))  # type: ignore[arg-type]
+        users = [_parse_user(item) for item in data]
+    else:
+        users = _load_from_env()
+    users = _merge_db_users(users)
+    return users
 
 
 def _parse_user(item: dict) -> UserConfig:
@@ -95,3 +103,43 @@ def _load_from_env() -> list[UserConfig]:
         kaiten_token=None,
         kaiten_base_url=None,
     )]
+
+
+def _merge_db_users(users: list[UserConfig]) -> list[UserConfig]:
+    """Догружает онбординг-пользователей из БД (db.load_user_records()).
+
+    Токен резолвится из os.getenv(record['kaiten_token_env']); если переменной нет —
+    пользователь пропускается с warning (владелец ещё не добавил ключ в Railway env).
+    Дедуп по user_id: записи из json/env имеют приоритет.
+    """
+    import db  # локальный импорт чтобы не тянуть db на уровень модуля
+    seen = {u.user_id for u in users}
+    try:
+        records = db.load_user_records()
+    except Exception as exc:
+        logger.error("load_users: не удалось загрузить пользователей из БД — {}", exc)
+        return users
+    for rec in records:
+        if rec["user_id"] in seen:
+            continue
+        token = os.getenv(rec["kaiten_token_env"], "")
+        if not token:
+            logger.warning(
+                "load_users: пользователь user={} пропущен — env-переменная {} не задана",
+                rec["user_id"], rec["kaiten_token_env"],
+            )
+            continue
+        users.append(UserConfig(
+            user_id=rec["user_id"],
+            telegram_chat_id=int(rec["telegram_chat_id"]),
+            kaiten_board_id=int(rec["kaiten_board_id"]),
+            kaiten_lane_id=int(rec.get("kaiten_lane_id", 0)),
+            kaiten_space_id=int(rec["kaiten_space_id"]),
+            timezone=rec.get("timezone", "Europe/Moscow"),
+            column_ids={k: int(v) for k, v in (rec.get("column_ids") or {}).items()},
+            kaiten_token=token,
+            kaiten_base_url=rec.get("kaiten_base_url"),
+        ))
+        seen.add(rec["user_id"])
+        logger.info("load_users: подключён онбординг-пользователь user={}", rec["user_id"])
+    return users

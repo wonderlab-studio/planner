@@ -107,6 +107,22 @@ def _init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_daily_events_lookup
             ON daily_events(date, user_id)
         """)
+
+        # Онбординг-пользователи (создаются в рантайме через self-service)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id           TEXT PRIMARY KEY,
+                telegram_chat_id  INTEGER NOT NULL UNIQUE,
+                kaiten_board_id   INTEGER NOT NULL,
+                kaiten_lane_id    INTEGER NOT NULL DEFAULT 0,
+                kaiten_space_id   INTEGER NOT NULL,
+                kaiten_token_env  TEXT    NOT NULL,
+                kaiten_base_url   TEXT    NOT NULL,
+                column_ids_json   TEXT    NOT NULL DEFAULT '{}',
+                timezone          TEXT    NOT NULL DEFAULT 'Europe/Moscow',
+                created_at        TEXT    NOT NULL
+            )
+        """)
         conn.commit()
 
     logger.debug("db: таблицы готовы (DB_PATH={})", DB_PATH)
@@ -389,3 +405,138 @@ def clear_daily_data(user_id: str, d: date | str) -> None:
         )
         conn.commit()
     logger.info("clear_daily_data({}, {}): снэпшот и события дня удалены", key, user_id)
+
+
+# ── Онбординг-пользователи ────────────────────────────────────────────────────
+
+def save_user_record(
+    user_id: str,
+    telegram_chat_id: int,
+    kaiten_board_id: int,
+    kaiten_lane_id: int,
+    kaiten_space_id: int,
+    kaiten_token_env: str,
+    kaiten_base_url: str,
+    column_ids: dict[str, int],
+    timezone_name: str = "Europe/Moscow",
+) -> None:
+    """Сохраняет/обновляет запись онбординг-пользователя (UPSERT по user_id).
+
+    Токен НЕ хранится — только имя env-переменной kaiten_token_env.
+    """
+    column_ids_json = json.dumps(column_ids, ensure_ascii=False)
+    created_at = datetime.now(timezone.utc).isoformat()
+    with _get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO users (
+                user_id, telegram_chat_id, kaiten_board_id, kaiten_lane_id,
+                kaiten_space_id, kaiten_token_env, kaiten_base_url,
+                column_ids_json, timezone, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                telegram_chat_id = excluded.telegram_chat_id,
+                kaiten_board_id  = excluded.kaiten_board_id,
+                kaiten_lane_id   = excluded.kaiten_lane_id,
+                kaiten_space_id  = excluded.kaiten_space_id,
+                kaiten_token_env = excluded.kaiten_token_env,
+                kaiten_base_url  = excluded.kaiten_base_url,
+                column_ids_json  = excluded.column_ids_json,
+                timezone         = excluded.timezone,
+                created_at       = excluded.created_at
+            """,
+            (
+                user_id, telegram_chat_id, kaiten_board_id, kaiten_lane_id,
+                kaiten_space_id, kaiten_token_env, kaiten_base_url,
+                column_ids_json, timezone_name, created_at,
+            ),
+        )
+        conn.commit()
+    logger.info(
+        "save_user_record({}): сохранено, telegram_chat_id={}",
+        user_id, telegram_chat_id,
+    )
+
+
+def load_user_records() -> list[dict]:
+    """Возвращает все записи из таблицы users.
+
+    column_ids десериализуется из JSON в dict под ключом 'column_ids'.
+    Ключи каждого dict: user_id, telegram_chat_id, kaiten_board_id, kaiten_lane_id,
+    kaiten_space_id, kaiten_token_env, kaiten_base_url, column_ids (dict),
+    timezone, created_at.
+    """
+    with _get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT user_id, telegram_chat_id, kaiten_board_id, kaiten_lane_id,
+                   kaiten_space_id, kaiten_token_env, kaiten_base_url,
+                   column_ids_json, timezone, created_at
+            FROM users
+            """
+        ).fetchall()
+    result: list[dict] = []
+    for row in rows:
+        try:
+            raw = json.loads(row["column_ids_json"])
+            column_ids = {k: int(v) for k, v in raw.items()}
+        except (ValueError, TypeError, KeyError) as exc:
+            logger.error(
+                "load_user_records: не удалось распарсить column_ids для user={} — {}",
+                row["user_id"], exc,
+            )
+            column_ids = {}
+        result.append({
+            "user_id":          row["user_id"],
+            "telegram_chat_id": row["telegram_chat_id"],
+            "kaiten_board_id":  row["kaiten_board_id"],
+            "kaiten_lane_id":   row["kaiten_lane_id"],
+            "kaiten_space_id":  row["kaiten_space_id"],
+            "kaiten_token_env": row["kaiten_token_env"],
+            "kaiten_base_url":  row["kaiten_base_url"],
+            "column_ids":       column_ids,
+            "timezone":         row["timezone"],
+            "created_at":       row["created_at"],
+        })
+    return result
+
+
+def get_user_record_by_chat_id(chat_id: int) -> dict | None:
+    """Возвращает запись пользователя по telegram_chat_id или None.
+
+    Формат dict идентичен элементам из load_user_records().
+    """
+    with _get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT user_id, telegram_chat_id, kaiten_board_id, kaiten_lane_id,
+                   kaiten_space_id, kaiten_token_env, kaiten_base_url,
+                   column_ids_json, timezone, created_at
+            FROM users
+            WHERE telegram_chat_id = ?
+            """,
+            (chat_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        raw = json.loads(row["column_ids_json"])
+        column_ids = {k: int(v) for k, v in raw.items()}
+    except (ValueError, TypeError, KeyError) as exc:
+        logger.error(
+            "get_user_record_by_chat_id: не удалось распарсить column_ids для chat_id={} — {}",
+            chat_id, exc,
+        )
+        column_ids = {}
+    return {
+        "user_id":          row["user_id"],
+        "telegram_chat_id": row["telegram_chat_id"],
+        "kaiten_board_id":  row["kaiten_board_id"],
+        "kaiten_lane_id":   row["kaiten_lane_id"],
+        "kaiten_space_id":  row["kaiten_space_id"],
+        "kaiten_token_env": row["kaiten_token_env"],
+        "kaiten_base_url":  row["kaiten_base_url"],
+        "column_ids":       column_ids,
+        "timezone":         row["timezone"],
+        "created_at":       row["created_at"],
+    }

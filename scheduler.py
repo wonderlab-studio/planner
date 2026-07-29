@@ -268,6 +268,18 @@ class Scheduler:
         self._scheduler.shutdown(wait=False)
         logger.info("scheduler: остановлен")
 
+    def add_user(self, sched_ctx: UserSchedulerCtx) -> None:
+        """Горячее добавление пользователя в работающий планировщик.
+
+        Джобы (morning/evening/reminder/archive) читают self._users при КАЖДОМ запуске,
+        поэтому новый пользователь подхватывается без перезапуска сервиса.
+        Также заводит для него пустой set отправленных напоминаний.
+        """
+        self._users.append(sched_ctx)
+        uid = sched_ctx.user_cfg.user_id
+        self._sent_reminders.setdefault(uid, set())
+        logger.info("scheduler: горячо добавлен пользователь user={}", uid)
+
     # ── Безопасные обёртки (не бросают исключения) ────────────────────────────
 
     async def _safe_morning(self) -> None:

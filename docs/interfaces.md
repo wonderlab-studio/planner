@@ -428,6 +428,20 @@ class KaitenClient:
         При ошибке (в т.ч. 404 если эндпоинт не поддерживается) возвращает [] — защита
         от дублей в board_setup отключается, не ломая логику создания полей.
         Эндпоинт не подтверждён эмпирически — по аналогии с GET /company/tags."""
+
+    # ── Методы онбординга (создание доски нового пользователя) ────────────────
+
+    async def get_current_user(self) -> dict | None:
+        """GET /users/current — данные пользователя по текущему токену.
+        Используется для валидации токена при онбординге. None при невалидном токене."""
+
+    async def get_spaces(self) -> list[dict]:
+        """GET /spaces — список пространств, доступных пользователю. [] при ошибке."""
+
+    async def create_board(self, title: str, space_id: int | None = None) -> dict | None:
+        """POST /spaces/{space_id}/boards — создаёт новую (пустую) доску в пространстве.
+        space_id по умолчанию self._space_id. Возвращает dict с "id" или None.
+        ⚠ эндпоинт/форма ответа не подтверждены эмпирически — проверить на живом аккаунте."""
 ```
 
 ---
@@ -644,6 +658,42 @@ class Card:
 > Wave 1.5 (автосоздание полей/тегов через board_setup) — реализована, июль 2026.
 > Wave 1.6 (needs_custom_fields + защита от дублей) — реализована, июль 2026.
 > Wave 2 (проводка из users.json в bot.py + переход handlers/scheduler на builder-методы) — отдельная задача, ещё не выполнена.
+
+### Self-service онбординг через Telegram (`onboarding.py`) — реализован, июль 2026
+
+Новый пользователь открывает бота по ссылке и проходит диалог; система сама создаёт и
+настраивает доску Kaiten и **горячо подключает** пользователя без перезапуска сервиса.
+
+**Поток** (`OnboardingService` + `ConversationHandler` из `build_onboarding_handler`):
+1. Неизвестный `telegram_chat_id` пишет `/start`/любой текст → срабатывает онбординг
+   (entry_points фильтруются `_UnknownUser`: известные юзеры проваливаются к обычным хендлерам).
+2. `OB_AWAIT_URL` — пользователь присылает ссылку из браузера Kaiten →
+   `parse_kaiten_url(url) -> (base_url, space_id|None)`.
+3. `OB_AWAIT_TOKEN` — присылает API-ключ → `validate_token` (`get_current_user`).
+   Если `space_id` неизвестен — `get_spaces`: один → авто, несколько → `OB_AWAIT_SPACE` (кнопки).
+4. `provision_user`: `create_board` → `setup_board(needs_custom_fields=True)` →
+   `db.save_user_kaiten_config` + `db.save_user_record` (без токена) →
+   инъектированный `register_user(user_cfg, client)` (горячее подключение:
+   `Scheduler.add_user` + запись в `cfg.users`) → `_notify_owner`.
+
+**Хранение токена (без открытого текста):** в таблицу `users` пишется только ИМЯ
+env-переменной `kaiten_token_env = KAITEN_TOKEN_<USER_ID>`. Сам ключ бот пересылает
+владельцу (`TELEGRAM_CHAT_ID`) в личку строкой `KAITEN_TOKEN_<USER_ID>=<token>` для внесения
+в Railway env. На время текущей сессии токен живёт в памяти (горячее подключение работает
+сразу); после рестарта `user_config.load_users()` резолвит его из env по имени переменной
+(если переменной нет — пользователь пропускается с warning).
+
+**Публичный интерфейс `onboarding.py`:**
+- `parse_kaiten_url(url) -> tuple[str|None, int|None]`
+- `class OnboardingService(register_user, owner_chat_id, loop)` — методы `validate_token`,
+  `list_spaces`, `provision_user`
+- `build_onboarding_handler(cfg, service) -> ConversationHandler`
+- состояния: `OB_AWAIT_URL=100`, `OB_AWAIT_TOKEN=101`, `OB_AWAIT_SPACE=102`
+
+**Таблица `users` (SQLite, db.py):** `user_id` PK, `telegram_chat_id` UNIQUE,
+`kaiten_board_id`, `kaiten_lane_id`, `kaiten_space_id`, `kaiten_token_env`, `kaiten_base_url`,
+`column_ids_json`, `timezone`, `created_at`. CRUD: `save_user_record`, `load_user_records`,
+`get_user_record_by_chat_id`.
 
 ### Автоматическое создание полей и тегов (новая доска)
 

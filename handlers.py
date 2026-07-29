@@ -33,6 +33,7 @@ from board_logic import BoardLogic, WEEKDAY_COLUMNS
 from claude_client import ClaudeClient
 from kaiten_client import Card, KaitenClient, TAG_IDS, TZ_MSK
 from notifier import Notifier
+from onboarding import OnboardingService, build_onboarding_handler
 
 # ── Тип для routine-коллбэков ─────────────────────────────────────────────────
 
@@ -146,6 +147,7 @@ class HandlersConfig:
 
     users: dict[int, UserHandlerCtx]   # telegram_chat_id → контекст пользователя
     claude: ClaudeClient               # Claude — общий для всех пользователей
+    onboarding: OnboardingService | None = None  # None — онбординг отключён
 
 
 # ── Вспомогательные функции ───────────────────────────────────────────────────
@@ -3382,6 +3384,9 @@ def build_handlers(cfg: HandlersConfig) -> Application:
     # Когда пользователь НЕ в диалоге, conv_handler не трогает текстовые
     # сообщения (его entry_points реагируют только на card:* коллбэки),
     # и update проваливается к text_handler ниже.
+
+    if cfg.onboarding is not None:
+        app.add_handler(build_onboarding_handler(cfg, cfg.onboarding))                # онбординг — первым
 
     app.add_handler(conv_handler)                                                      # ConvHandler
     app.add_handler(CallbackQueryHandler(page_nav_cb, pattern=r"^page:\d+$"))          # пагинация

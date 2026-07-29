@@ -894,3 +894,35 @@ class KaitenClient:
         """
         data = await self._request("GET", "/company/custom-properties")
         return data if isinstance(data, list) else []
+
+    async def get_current_user(self) -> dict | None:
+        """GET /users/current — данные пользователя по текущему токену.
+        Используется для валидации токена при онбординге.
+        Возвращает dict или None при ошибке (например, невалидный токен)."""
+        data = await self._request("GET", "/users/current")
+        if not isinstance(data, dict) or not data:
+            logger.error("get_current_user: неожиданный ответ или пустой: {}", data)
+            return None
+        return data
+
+    async def get_spaces(self) -> list[dict]:
+        """GET /spaces — список пространств, доступных текущему пользователю.
+        Возвращает список сырых dict (поля id, title, ...) или [] при ошибке."""
+        data = await self._request("GET", "/spaces")
+        if not isinstance(data, list):
+            logger.warning("get_spaces: неожиданный ответ: {}", data)
+            return []
+        logger.debug("get_spaces: получено {} пространств", len(data))
+        return data
+
+    async def create_board(self, title: str, space_id: int | None = None) -> dict | None:
+        """POST /spaces/{space_id}/boards — создаёт новую доску в пространстве.
+        space_id по умолчанию берётся из self._space_id.
+        Возвращает сырой dict созданной доски (с полем id) или None при ошибке."""
+        sid = space_id or self._space_id
+        data = await self._request("POST", f"/spaces/{sid}/boards", json={"title": title})
+        if not data or not isinstance(data, dict):
+            logger.error("create_board: не удалось создать доску «{}» в space={}", title, sid)
+            return None
+        logger.info("create_board: создана доска «{}» id={} space={}", title, data.get("id"), sid)
+        return data

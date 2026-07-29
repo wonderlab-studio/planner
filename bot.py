@@ -20,6 +20,7 @@ bot.py — точка входа системы личного планиров�
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
 import sys
 
@@ -31,6 +32,7 @@ from board_logic import BoardLogic
 from board_setup import setup_board
 from claude_client import ClaudeClient
 from handlers import HandlersConfig, UserHandlerCtx, build_handlers
+from onboarding import OnboardingService
 from kaiten_client import KaitenClient
 from morning_logic import MorningLogic
 from notifier import Notifier
@@ -178,8 +180,51 @@ async def main() -> None:
             replan_routine=replan_routine,
         )
 
+    # ── Фабрика горячего подключения пользователя (используется онбордингом) ──
+    async def register_user(user_cfg, client) -> None:
+        logic = BoardLogic(client, user_cfg.column_ids)
+        morning = MorningLogic(client, logic)
+        notifier = Notifier(chat_id=user_cfg.telegram_chat_id)
+        kaiten_clients.append(client)  # чтобы закрыть в finally при остановке
+
+        sched_ctx = UserSchedulerCtx(
+            user_cfg=user_cfg,
+            morning=morning,
+            notifier=notifier,
+            kaiten=client,
+            logic=logic,
+        )
+        scheduler.add_user(sched_ctx)
+
+        async def morning_routine(_sc=sched_ctx) -> None:
+            await scheduler.run_morning_for_user(_sc)
+
+        async def evening_routine(_sc=sched_ctx) -> None:
+            await scheduler.run_evening_for_user(_sc)
+
+        async def replan_routine(_sc=sched_ctx) -> str:
+            return await scheduler.run_replan_for_user(_sc)
+
+        users_handler[user_cfg.telegram_chat_id] = UserHandlerCtx(
+            user_id=user_cfg.user_id,
+            kaiten=client,
+            logic=logic,
+            notifier=notifier,
+            morning_routine=morning_routine,
+            evening_routine=evening_routine,
+            replan_routine=replan_routine,
+        )
+        logger.info("bot: горячо зарегистрирован пользователь user={}", user_cfg.user_id)
+
+    owner_chat_id = int(os.getenv("TELEGRAM_CHAT_ID", "0")) or None
+    onboarding = OnboardingService(
+        register_user=register_user,
+        owner_chat_id=owner_chat_id,
+        loop=loop,
+    )
+
     # 9. Telegram Application
-    cfg = HandlersConfig(users=users_handler, claude=claude)
+    cfg = HandlersConfig(users=users_handler, claude=claude, onboarding=onboarding)
     app = build_handlers(cfg)
 
     # 10. Запуск
