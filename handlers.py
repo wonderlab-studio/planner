@@ -574,11 +574,17 @@ async def _handle_create(
         parts.append(f"⏱ Размер: {size} ч")
     await _reply(update, "\n".join(parts))
 
-    # Предлагаем пересобрать план, если дедлайн — сегодня
+    # Предлагаем пересобрать план, если дедлайн — сегодня или задача попала в сегодняшнюю колонку
     today_iso = datetime.now(TZ_MSK).date().isoformat()
-    if deadline == today_iso:
+    is_today_column = column_id == user_ctx.logic.get_today_column_id()
+    if deadline == today_iso or is_today_column:
+        replan_text = (
+            "📅 Задача с дедлайном на сегодня. Пересобрать план?"
+            if deadline == today_iso
+            else "📅 Задача добавлена в сегодняшнюю колонку. Пересобрать план?"
+        )
         await update.message.reply_text(
-            "📅 Задача с дедлайном на сегодня. Пересобрать план?",
+            replan_text,
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("✅ Да, пересобрать", callback_data="replan_offer:yes"),
                 InlineKeyboardButton("❌ Нет", callback_data="replan_offer:no"),
@@ -1115,14 +1121,16 @@ async def _finalize_new_task(
         parts.append("🔔 Напоминалка включена")
     await query.edit_message_text("\n".join(parts), parse_mode=ParseMode.MARKDOWN)
 
-    # Предлагаем пересобрать план, если задача на сегодня (событие с временем или дедлайн)
-    needs_replan_offer = is_hard_event_today or data.get("deadline") == today_iso
+    # Предлагаем пересобрать план, если задача на сегодня (событие с временем, дедлайн или сегодняшняя колонка)
+    is_today_column = column_id == user_ctx.logic.get_today_column_id()
+    needs_replan_offer = is_hard_event_today or data.get("deadline") == today_iso or is_today_column
     if needs_replan_offer:
-        warning = (
-            "⚠️ Задача на сегодня с конкретным временем. Пересобрать план, чтобы её учесть?"
-            if is_hard_event_today
-            else "📅 Задача с дедлайном на сегодня. Пересобрать план?"
-        )
+        if is_hard_event_today:
+            warning = "⚠️ Задача на сегодня с конкретным временем. Пересобрать план, чтобы её учесть?"
+        elif data.get("deadline") == today_iso:
+            warning = "📅 Задача с дедлайном на сегодня. Пересобрать план?"
+        else:
+            warning = "📅 Задача добавлена в сегодняшнюю колонку. Пересобрать план?"
         await context.bot.send_message(
             chat_id=query.message.chat_id,
             text=warning,

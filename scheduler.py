@@ -533,7 +533,7 @@ class Scheduler:
             logger.error("morning_job user={}: ошибка send_and_pin — {}", user_id, exc)
 
         try:
-            await user_ctx.notifier.send_card_buttons(task_cards)
+            await user_ctx.notifier.send_card_buttons(cards)
         except Exception as exc:
             logger.error("morning_job user={}: ошибка send_card_buttons — {}", user_id, exc)
 
