@@ -432,6 +432,8 @@ class MorningLogic:
             for step_idx, (step_cards, step_sched, _) in enumerate(processing_order):
                 if step_sched is not target_sched:
                     continue
+                if step_idx < from_step:
+                    continue
                 start_ci = from_card_idx + 1 if step_idx == from_step else 0
                 count += len(step_cards) - start_ci
             return count
@@ -1023,9 +1025,13 @@ class MorningLogic:
             section = _get_card_section(yest_sorted, card)
 
             if tag_weekly in tags:
-                # Еженедельно → следующая неделя (без time-scheduling)
-                sec = BoardLogic.section_by_event_time(card)
-                await self._move(card, next_week_col, sec, preloaded)
+                if card.weekday is None:
+                    # Еженедельная без дня недели — на общих основаниях, как обычная задача
+                    candidates.append(card)
+                else:
+                    # Еженедельно с указанным днём → следующая неделя (без time-scheduling)
+                    sec = BoardLogic.section_by_event_time(card)
+                    await self._move(card, next_week_col, sec, preloaded)
 
             elif section == "На контроле":
                 # На контроле → та же секция сегодня (без time-scheduling)
@@ -1162,11 +1168,15 @@ class MorningLogic:
             tags = set(card.tag_ids)
 
             if tag_weekly in tags:
-                # Еженедельно → колонка по weekday-полю
-                wd     = card.weekday
-                col_id = wd_to_col.get(wd, monday_col) if wd else monday_col
-                sec    = BoardLogic.section_by_event_time(card)
-                await self._move(card, col_id, sec, preloaded)
+                wd = card.weekday
+                if wd is None:
+                    # Еженедельная без дня недели — на общих основаниях, как обычная задача
+                    monday_candidates.append(card)
+                else:
+                    # Еженедельно с указанным днём → колонка по weekday-полю
+                    col_id = wd_to_col.get(wd, monday_col)
+                    sec    = BoardLogic.section_by_event_time(card)
+                    await self._move(card, col_id, sec, preloaded)
 
             elif tag_weekend in tags:
                 # По выходным → суббота

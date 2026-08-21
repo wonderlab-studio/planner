@@ -244,6 +244,17 @@ def _is_control_section(sorted_cards: list[Card], target: Card) -> bool:
     return False
 
 
+def _resolve_weekday_to_date(column_name: str | None) -> str | None:
+    """Если column_name — название дня недели, возвращает ISO-дату ближайшего
+    такого дня (сегодня, если сегодня этот день; иначе — в пределах недели вперёд)."""
+    if column_name not in WEEKDAY_COLUMNS:
+        return None
+    today = datetime.now(TZ_MSK).date()
+    target_idx = WEEKDAY_COLUMNS.index(column_name)
+    delta = (target_idx - today.weekday()) % 7
+    return (today + timedelta(days=delta)).isoformat()
+
+
 async def _load_active_cards(user_ctx: UserHandlerCtx) -> list[dict]:
     """Загружает карточки из всех активных колонок (дни недели + спец-колонки).
 
@@ -921,8 +932,11 @@ def _render_task_constructor(data: dict) -> tuple[str, InlineKeyboardMarkup]:
     deadline_label = data.get("deadline") or "не указан"
 
     reg = data.get("regularity")
-    if reg == "еженедельно" and data.get("weekday"):
-        reg_label = f"еженедельно ({data['weekday']})"
+    if reg == "еженедельно":
+        if data.get("weekday"):
+            reg_label = f"еженедельно ({data['weekday']})"
+        else:
+            reg_label = "еженедельно (без дня)"
     else:
         reg_label = reg or "разовая"
 
@@ -2212,7 +2226,8 @@ def build_handlers(cfg: HandlersConfig) -> Application:
             chat_id=update.effective_chat.id,
             text=(
                 "🤖 Какой вопрос по этой задаче?\n"
-                "_Например: «с чего начать», «какие риски», «что учесть»_"
+                "_Например: «с чего начать», «какие риски», «что учесть»_\n"
+                "_Добавь «+поиск» в вопрос, если нужен свежий ответ с поиском в интернете_"
             ),
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -2231,6 +2246,10 @@ def build_handlers(cfg: HandlersConfig) -> Application:
             return ConversationHandler.END
 
         question = update.message.text.strip()
+        use_search = False
+        if "+поиск" in question.lower():
+            use_search = True
+            question = re.sub(r"\+поиск", "", question, flags=re.IGNORECASE).strip()
         card_id  = context.user_data.get("selected_card_id")
         title    = context.user_data.get("selected_card_title", f"#{card_id}")
 
@@ -2254,6 +2273,7 @@ def build_handlers(cfg: HandlersConfig) -> Application:
                 card_title=title,
                 description=description,
                 comments=comments,
+                use_search=use_search,
             )
         except Exception as exc:
             logger.exception("received_question_cb: generate_card_advice error — {}", exc)
@@ -2325,6 +2345,8 @@ def build_handlers(cfg: HandlersConfig) -> Application:
             return AWAITING_REMINDER_TIME
 
         event_date: str | None = intent.get("deadline")  # "YYYY-MM-DD"
+        if not event_date:
+            event_date = _resolve_weekday_to_date(intent.get("column"))
 
         if not event_date:
             await update.message.reply_text(
@@ -2834,6 +2856,7 @@ def build_handlers(cfg: HandlersConfig) -> Application:
                     [InlineKeyboardButton(wd, callback_data=f"nt:wd:{wd}")]
                     for wd in ["ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС"]
                 ]
+                kb.append([InlineKeyboardButton("Без дня недели", callback_data="nt:wd:none")])
                 kb.append([InlineKeyboardButton("← Назад", callback_data="nt:back")])
                 await query.edit_message_text("Какой день недели?", reply_markup=InlineKeyboardMarkup(kb))
                 return CREATE_MENU
@@ -2844,7 +2867,7 @@ def build_handlers(cfg: HandlersConfig) -> Application:
                 return CREATE_MENU
         if action == "wd" and sub is not None:
             data["regularity"] = "еженедельно"
-            data["weekday"] = sub
+            data["weekday"] = None if sub == "none" else sub
             await _redraw()
             return CREATE_MENU
 
@@ -2945,6 +2968,8 @@ def build_handlers(cfg: HandlersConfig) -> Application:
                 return CREATE_AWAITING_EVENT_TEXT
             event_date = intent.get("deadline")
             if not event_date:
+                event_date = _resolve_weekday_to_date(intent.get("column"))
+            if not event_date:
                 await update.message.reply_text("❓ Не удалось определить дату. Попробуй точнее:")
                 return CREATE_AWAITING_EVENT_TEXT
             m = re.search(r"\b(\d{1,2}):(\d{2})\b", text)
@@ -2972,6 +2997,8 @@ def build_handlers(cfg: HandlersConfig) -> Application:
             await update.message.reply_text("⚠️ Не удалось разобрать дату. Попробуй ещё раз:")
             return CREATE_AWAITING_DEADLINE_TEXT
         deadline = intent.get("deadline")
+        if not deadline:
+            deadline = _resolve_weekday_to_date(intent.get("column"))
         if not deadline:
             await update.message.reply_text("❓ Не удалось определить дату. Попробуй точнее:")
             return CREATE_AWAITING_DEADLINE_TEXT

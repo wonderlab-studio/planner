@@ -28,7 +28,7 @@ import anthropic
 from dotenv import load_dotenv
 from loguru import logger
 
-from prompts import MORNING_SYSTEM, EVENING_SYSTEM, PARSE_INTENT_SYSTEM, SEARCH_SYSTEM, ADVICE_SYSTEM
+from prompts import MORNING_SYSTEM, EVENING_SYSTEM, PARSE_INTENT_SYSTEM, SEARCH_SYSTEM, ADVICE_SYSTEM, ADVICE_SEARCH_SUFFIX
 
 load_dotenv()
 
@@ -38,7 +38,8 @@ MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 2500
 MAX_TOKENS_INTENT = 256   # JSON-ответ короткий — экономим
 MAX_TOKENS_SEARCH = 64    # {"id": 123} — минимум токенов
-MAX_TOKENS_ADVICE = 600   # совет по карточке
+MAX_TOKENS_ADVICE = 600        # совет по карточке
+MAX_TOKENS_ADVICE_SEARCH = 1200  # совет с веб-поиском — результаты поиска увеличивают объём
 
 _ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
@@ -475,15 +476,17 @@ class ClaudeClient:
         card_title: str,
         description: str | None,
         comments: list[str],
+        use_search: bool = False,
     ) -> str:
         """Генерирует совет Claude по конкретной задаче из планировщика.
 
         Параметры:
-            question   — вопрос пользователя по задаче
-            card_title — название карточки
+            question    — вопрос пользователя по задаче
+            card_title  — название карточки
             description — описание карточки (может быть None)
-            comments   — список текстов комментариев к карточке
-                         (включая предыдущие вопросы/ответы если уже были)
+            comments    — список текстов комментариев к карточке
+                          (включая предыдущие вопросы/ответы если уже были)
+            use_search  — включить веб-поиск через server-side tool (по умолчанию False)
 
         Возвращает:
             Текст совета в Markdown для отправки в Telegram.
@@ -513,29 +516,40 @@ class ClaudeClient:
         user_message = f"Вопрос: {question}\n\n{card_context}"
 
         logger.debug(
-            "generate_card_advice: card={!r} comments={} question={!r}",
-            card_title, len(comments), question,
+            "generate_card_advice: card={!r} comments={} question={!r} search={}",
+            card_title, len(comments), question, use_search,
         )
 
+        system_text = ADVICE_SYSTEM + ADVICE_SEARCH_SUFFIX if use_search else ADVICE_SYSTEM
+        max_tokens = MAX_TOKENS_ADVICE_SEARCH if use_search else MAX_TOKENS_ADVICE
+
+        create_kwargs: dict[str, Any] = dict(
+            model=MODEL,
+            max_tokens=max_tokens,
+            system=[
+                {
+                    "type": "text",
+                    "text": system_text,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            messages=[{"role": "user", "content": user_message}],
+        )
+        if use_search:
+            create_kwargs["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
+
         try:
-            response = await self._client.messages.create(
-                model=MODEL,
-                max_tokens=MAX_TOKENS_ADVICE,
-                system=[
-                    {
-                        "type": "text",
-                        "text": ADVICE_SYSTEM,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
-                messages=[{"role": "user", "content": user_message}],
-            )
-            result = response.content[0].text
+            response = await self._client.messages.create(**create_kwargs)
+            # Собираем все текстовые блоки — при веб-поиске первым может прийти
+            # server_tool_use/web_search_tool_result, а не text
+            answer_parts = [block.text for block in response.content if block.type == "text"]
+            result = "\n".join(answer_parts).strip()
             logger.info(
-                "generate_card_advice: input={} cached_read={} output={}",
+                "generate_card_advice: input={} cached_read={} output={} search={}",
                 response.usage.input_tokens,
                 getattr(response.usage, "cache_read_input_tokens", 0),
                 response.usage.output_tokens,
+                use_search,
             )
             return result
         except anthropic.APIError as e:
