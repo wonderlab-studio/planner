@@ -280,6 +280,15 @@ class Scheduler:
         self._sent_reminders.setdefault(uid, set())
         logger.info("scheduler: горячо добавлен пользователь user={}", uid)
 
+    def remove_user(self, user_id: str) -> None:
+        """Убирает пользователя из списка активных — используется при горячей деактивации
+        администратором, без перезапуска сервиса. Ошибка не выбрасывается, если
+        пользователь уже отсутствует."""
+        before = len(self._users)
+        self._users = [u for u in self._users if u.user_cfg.user_id != user_id]
+        if len(self._users) < before:
+            logger.info("scheduler: пользователь {} удалён из активных (деактивация)", user_id)
+
     # ── Безопасные обёртки (не бросают исключения) ────────────────────────────
 
     async def _safe_morning(self) -> None:

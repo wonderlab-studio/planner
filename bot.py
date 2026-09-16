@@ -216,6 +216,57 @@ async def main() -> None:
         )
         logger.info("bot: горячо зарегистрирован пользователь user={}", user_cfg.user_id)
 
+    # ── Администраторские коллбэки (деактивация/реактивация пользователей) ───
+
+    async def _deactivate_user(user_id: str) -> bool:
+        """Деактивирует пользователя: помечает в БД + убирает из активных без рестарта."""
+        ok = db.set_user_active(user_id, False)
+        if not ok:
+            return False
+        chat_id_to_remove = next(
+            (cid for cid, ctx in users_handler.items() if ctx.user_id == user_id), None
+        )
+        if chat_id_to_remove is not None:
+            users_handler.pop(chat_id_to_remove, None)
+        scheduler.remove_user(user_id)
+        logger.info("bot: пользователь {} деактивирован", user_id)
+        return True
+
+    async def _reactivate_user(user_id: str) -> bool:
+        """Реактивирует пользователя: помечает в БД + пересобирает контекст без рестарта."""
+        ok = db.set_user_active(user_id, True)
+        if not ok:
+            return False
+        # Загружаем обновлённый список (теперь включает реактивированного пользователя)
+        all_users = load_users()
+        user_cfg = next((u for u in all_users if u.user_id == user_id), None)
+        if user_cfg is None:
+            logger.warning("_reactivate_user: пользователь {} не найден в load_users()", user_id)
+            return False
+        # Строим KaitenClient так же, как стартовый цикл
+        saved_config = await loop.run_in_executor(None, db.load_user_kaiten_config, user_id)
+        saved_config = saved_config or {}
+
+        def _merged_r(explicit, key):
+            return explicit if explicit is not None else saved_config.get(key)
+
+        merged_field_ids_r = _merged_r(user_cfg.field_ids, "field_ids")
+        client_r = KaitenClient(
+            board_id=user_cfg.kaiten_board_id,
+            lane_id=user_cfg.kaiten_lane_id,
+            token=user_cfg.kaiten_token,
+            base_url=user_cfg.kaiten_base_url,
+            tag_ids=_merged_r(user_cfg.tag_ids, "tag_ids"),
+            importance_options=_merged_r(user_cfg.importance_options, "importance_options"),
+            weekday_options=_merged_r(user_cfg.weekday_options, "weekday_options"),
+            field_ids=merged_field_ids_r,
+            time_of_day_options=saved_config.get("time_of_day_options"),
+            space_id=user_cfg.kaiten_space_id,
+        )
+        await register_user(user_cfg, client_r)
+        logger.info("bot: пользователь {} реактивирован", user_id)
+        return True
+
     owner_chat_id = int(os.getenv("TELEGRAM_CHAT_ID", "0")) or None
     onboarding = OnboardingService(
         register_user=register_user,
@@ -224,7 +275,15 @@ async def main() -> None:
     )
 
     # 9. Telegram Application
-    cfg = HandlersConfig(users=users_handler, claude=claude, onboarding=onboarding)
+    cfg = HandlersConfig(
+        users=users_handler,
+        claude=claude,
+        onboarding=onboarding,
+        owner_chat_id=owner_chat_id,
+        deactivate_user=_deactivate_user,
+        reactivate_user=_reactivate_user,
+        list_users=db.load_user_records,
+    )
     app = build_handlers(cfg)
 
     # 10. Запуск

@@ -10,6 +10,7 @@ board_logic.py — бизнес-логика работы с канбан-дос
 
 from __future__ import annotations
 
+import calendar
 from datetime import date, datetime, timezone, timedelta
 
 from loguru import logger
@@ -59,6 +60,21 @@ REGULAR_TAG_IDS: set[int] = {
 
 # Небольшой epsilon для вставки в пустую секцию
 _EPSILON = 0.001
+
+
+# ── Вспомогательные функции модульного уровня ─────────────────────────────────
+
+def next_month_same_day(base: date) -> date:
+    """Возвращает дату с тем же числом в следующем месяце.
+
+    Если в следующем месяце нет такого числа (например, сегодня 31 января,
+    а в феврале только 28/29 дней) — возвращает последний день следующего месяца.
+    """
+    year = base.year + (1 if base.month == 12 else 0)
+    month = 1 if base.month == 12 else base.month + 1
+    last_day = calendar.monthrange(year, month)[1]
+    day = min(base.day, last_day)
+    return date(year, month, day)
 
 
 # ── BoardLogic ────────────────────────────────────────────────────────────────
@@ -359,6 +375,16 @@ class BoardLogic:
         из tag_id() клиента, чтобы корректно работать с per-user маппингами тегов.
         """
         return bool(set(card.tag_ids) & self._regular_tag_ids)
+
+    def has_tag_by_name(self, card: Card, tag_name: str) -> bool:
+        """True если у карточки есть тег с указанным именем.
+
+        Сравнение идёт по card.tags (список объектов Tag с полем name), а не по
+        числовым tag_ids — это позволяет проверять теги, для которых у данного
+        Kaiten-аккаунта ещё не сконфигурирован numeric ID (например, только что
+        появившийся тег «ежемесячно», которого нет в TAG_IDS/self._tag_ids).
+        """
+        return any(t.name == tag_name for t in card.tags)
 
     def should_include_today(self, card: Card, today: date) -> bool:
         """Проверяет, должна ли регулярная задача попасть в текущий день.

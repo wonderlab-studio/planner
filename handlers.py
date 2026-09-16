@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time as dt_time, timedelta
 from typing import Callable, Awaitable
 
 import db
@@ -29,7 +29,7 @@ from telegram.ext import (
     filters,
 )
 
-from board_logic import BoardLogic, WEEKDAY_COLUMNS
+from board_logic import BoardLogic, WEEKDAY_COLUMNS, next_month_same_day
 from claude_client import ClaudeClient
 from kaiten_client import Card, KaitenClient, TAG_IDS, TZ_MSK
 from notifier import Notifier
@@ -54,6 +54,7 @@ CREATE_AWAITING_EVENT_TEXT    = 9   # ждём дату/время событи�
 CREATE_AWAITING_DEADLINE_TEXT = 10  # ждём дату дедлайна текстом (реализация в след. задаче)
 CREATE_AWAITING_EDIT_TITLE    = 11  # ждём новое название при редактировании карточки
 CREATE_AWAITING_DESCRIPTION   = 12  # ждём текст описания задачи
+AWAITING_WORKED_ON            = 13  # ждём ответ «Да/Нет» на вопрос «Удалось позаниматься?»
 # CONFIRM_RISKY_MOVE — не используется как состояние диалога;
 # confirm_move_cb/confirm_cancel_cb зарегистрированы как top-level хендлеры
 
@@ -148,6 +149,10 @@ class HandlersConfig:
     users: dict[int, UserHandlerCtx]   # telegram_chat_id → контекст пользователя
     claude: ClaudeClient               # Claude — общий для всех пользователей
     onboarding: OnboardingService | None = None  # None — онбординг отключён
+    owner_chat_id: int | None = None   # chat_id владельца (для admin-команд)
+    deactivate_user: Callable[[str], Awaitable[bool]] | None = None
+    reactivate_user: Callable[[str], Awaitable[bool]] | None = None
+    list_users: Callable[[], list[dict]] | None = None
 
 
 # ── Вспомогательные функции ───────────────────────────────────────────────────
@@ -528,17 +533,13 @@ async def _handle_create(
     size         = intent.get("size")
 
     if column_name and column_name in user_ctx.logic.column_ids:
-        column_id = user_ctx.logic.column_ids[column_name]
-    elif deadline:
-        # Колонка не задана явно, но дедлайн есть — вычисляем колонку из даты
-        try:
-            target_date = date.fromisoformat(deadline)
-            column_id = user_ctx.logic.resolve_column_for_date(target_date)
-            column_name = user_ctx.logic.column_name_by_id.get(column_id, str(column_id))
-        except Exception as exc:
-            logger.warning("handle_create: resolve_column_for_date({}) — {}, используем сегодня", deadline, exc)
-            column_id = user_ctx.logic.get_today_column_id()
-            column_name = next((k for k, v in user_ctx.logic.column_ids.items() if v == column_id), "сегодня")
+        if column_name in WEEKDAY_COLUMNS:
+            resolved = _resolve_weekday_to_date(column_name)
+            wd_date = date.fromisoformat(resolved)
+            column_id = user_ctx.logic.resolve_column_for_date(wd_date)
+            column_name = user_ctx.logic.column_name_by_id.get(column_id, column_name)
+        else:
+            column_id = user_ctx.logic.column_ids[column_name]
     else:
         column_id = user_ctx.logic.get_today_column_id()
         column_name = next((k for k, v in user_ctx.logic.column_ids.items() if v == column_id), "сегодня")
@@ -647,7 +648,30 @@ async def _handle_done(
     # B.4: для регулярной задачи override event_type="done", для архива — log после archive_card
     try:
         card = await user_ctx.kaiten.get_card(matched["id"])
-        if card and user_ctx.logic.is_regular_task(card):
+        if card and user_ctx.logic.has_tag_by_name(card, "ежемесячно"):
+            # Ежемесячная задача: не архивируем — переносим в «Далекие времена»
+            # с датой события на то же число следующего месяца
+            next_date = next_month_same_day(datetime.now(TZ_MSK).date())
+            far_future_col = user_ctx.logic.column_ids["Далекие времена"]
+            event_dt = datetime.combine(next_date, dt_time(9, 0), tzinfo=TZ_MSK)
+            try:
+                await user_ctx.kaiten.update_card(
+                    matched["id"], properties=user_ctx.kaiten.event_time_property(event_dt)
+                )
+                await user_ctx.kaiten.move_card(matched["id"], far_future_col, 1.0)
+                await _log_event(
+                    user_ctx, "done", matched["title"],
+                    detail=f"ежемесячная → {next_date.isoformat()}",
+                )
+                await _reply(
+                    update,
+                    f"✅ Готово! «{matched['title']}» — ежемесячная задача, "
+                    f"следующий раз {next_date.strftime('%d.%m.%Y')} (Далекие времена).",
+                )
+            except Exception as exc:
+                logger.exception("_handle_done: ежемесячная задача, ошибка переноса — {}", exc)
+                await _reply(update, "⚠️ Не удалось перенести ежемесячную задачу.")
+        elif card and user_ctx.logic.is_regular_task(card):
             # Регулярная задача: переносим на следующий цикл — это ЗАВЕРШЕНИЕ, не перенос
             ok, msg = await _postpone_card(user_ctx, card, hours=None, event_type="done")
             await _reply(update, msg)
@@ -724,8 +748,14 @@ async def _handle_move(
 
     if target_column_id is None:
         if column_name and column_name in user_ctx.logic.column_ids:
-            target_column_id   = user_ctx.logic.column_ids[column_name]
-            target_column_name = column_name
+            if column_name in WEEKDAY_COLUMNS:
+                resolved = _resolve_weekday_to_date(column_name)
+                wd_date = date.fromisoformat(resolved)
+                target_column_id = user_ctx.logic.resolve_column_for_date(wd_date)
+                target_column_name = user_ctx.logic.column_name_by_id.get(target_column_id, column_name)
+            else:
+                target_column_id   = user_ctx.logic.column_ids[column_name]
+                target_column_name = column_name
         elif section == "На контроле":
             today_wd           = datetime.now(TZ_MSK).date().weekday()
             target_column_name = WEEKDAY_COLUMNS[today_wd]
@@ -907,6 +937,7 @@ def _action_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔔 Напоминалка",              callback_data="action:reminder")],
         [InlineKeyboardButton("✏️ Редактировать",            callback_data="action:edit")],
         [InlineKeyboardButton("📄 Описание и комментарии",   callback_data="action:description")],
+        [InlineKeyboardButton("🗑 Удалить",                   callback_data="action:delete")],
         [InlineKeyboardButton("← Назад",                     callback_data="action:back")],
     ])
 
@@ -995,10 +1026,6 @@ async def _finalize_new_task(
         column_id = user_ctx.logic.resolve_column_for_date(target_date)
         hour = int(data["event_time"][:2]) if data.get("event_time") else 9
         section = "Утро" if hour < 12 else ("День" if hour < 19 else "Вечер")
-    elif data.get("deadline"):
-        target_date = date.fromisoformat(data["deadline"])
-        column_id = user_ctx.logic.resolve_column_for_date(target_date)
-        section = "Утро"
     else:
         regularity = data.get("regularity")
         today_msk = datetime.now(TZ_MSK).date()
@@ -1694,20 +1721,43 @@ def build_handlers(cfg: HandlersConfig) -> Application:
     async def action_today_cb(
         update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> int:
-        """⏭ Продолжить в другой день → для коротких задач сразу переносим, иначе спрашиваем часы."""
+        """⏭ Продолжить в другой день → сначала спрашиваем, удалось ли позаниматься."""
+        query = update.callback_query
+        assert query is not None
+        await query.answer()
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        card_id = context.user_data.get("selected_card_id")
+        context.user_data["postpone_card_id"] = card_id
+        # Убираем клавиатуру у старого сообщения
+        await query.edit_message_text("⏭ Продолжить в другой день", reply_markup=None)
+        # Новое сообщение — пользователь получит push-уведомление
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="❓ Удалось позаниматься с задачей?",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Да", callback_data="worked:yes"),
+                InlineKeyboardButton("Нет", callback_data="worked:no"),
+            ]]),
+        )
+        return AWAITING_WORKED_ON
+
+    async def worked_on_cb(
+        update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        """Ответ «Да/Нет» на вопрос «Удалось позаниматься?» → основная логика переноса."""
         query = update.callback_query
         assert query is not None
         await query.answer()
         chat_id = update.effective_chat.id if update.effective_chat else None
         user_ctx = cfg.users.get(chat_id) if chat_id else None
-        card_id = context.user_data.get("selected_card_id")
+        worked = query.data.split(":")[1] == "yes"
+        context.user_data["postpone_worked"] = worked
+        card_id = context.user_data.get("postpone_card_id")
         card = await user_ctx.kaiten.get_card(card_id) if (user_ctx and card_id) else None
 
         # FIX 1: size=None трактуется как 15 мин (DEFAULT_HOURS=0.25) → тоже короткая задача
         if card and card.size != 999 and (card.size is None or card.size <= 0.25):
-            # Мягкое сопротивление: критическая задача с дедлайном сегодня/завтра —
-            # тот же risky-чек, что в received_hours_cb, иначе короткие задачи без
-            # размера проскакивали перенос без подтверждения (баг).
+            # Мягкое сопротивление: критическая задача с дедлайном сегодня/завтра
             today_t = datetime.now(TZ_MSK).date()
             tomorrow_t = today_t + timedelta(days=1)
             due_dt_t = card.due_date_parsed
@@ -1720,6 +1770,7 @@ def build_handlers(cfg: HandlersConfig) -> Application:
                     "kind": "postpone",
                     "card_id": card_id,
                     "hours": None,
+                    "event_type": "done" if worked else "moved",
                 }
                 await query.edit_message_text(
                     f"⚠️ «{title_t}» — критическая задача с дедлайном {due_date_t}.\n"
@@ -1731,17 +1782,19 @@ def build_handlers(cfg: HandlersConfig) -> Application:
                 )
                 return ConversationHandler.END
 
-            ok, msg = await _postpone_card(user_ctx, card, hours=None)
+            ok, msg = await _postpone_card(
+                user_ctx, card, hours=None,
+                event_type="done" if worked else "moved",
+            )
             await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN)
             if update.effective_chat:
                 await _resend_card_buttons(user_ctx, context, update.effective_chat.id)
             return ConversationHandler.END
 
-        # Убираем клавиатуру у старого сообщения
-        await query.edit_message_text("⏭ Продолжить в другой день", reply_markup=None)
-        # Новое сообщение — пользователь получит push-уведомление
+        # Не короткая задача — спрашиваем часы
+        await query.edit_message_text("⏱ Продолжить в другой день…", reply_markup=None)
         await context.bot.send_message(
-            chat_id=update.effective_chat.id,
+            chat_id=chat_id,
             text="⏱ Сколько часов реально нужно ещё? Перенесу на следующий подходящий день. _(введи целое число)_",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -1839,7 +1892,32 @@ def build_handlers(cfg: HandlersConfig) -> Application:
         if action == "done":
             try:
                 card = await user_ctx.kaiten.get_card(card_id)
-                if card and user_ctx.logic.is_regular_task(card):
+                if card and user_ctx.logic.has_tag_by_name(card, "ежемесячно"):
+                    # Ежемесячная задача: переносим в «Далекие времена» на то же число следующего месяца
+                    next_date = next_month_same_day(datetime.now(TZ_MSK).date())
+                    far_future_col = user_ctx.logic.column_ids["Далекие времена"]
+                    event_dt = datetime.combine(next_date, dt_time(9, 0), tzinfo=TZ_MSK)
+                    try:
+                        if comment_text:
+                            await user_ctx.kaiten.add_comment(card_id, comment_text)
+                        await user_ctx.kaiten.update_card(
+                            card_id, properties=user_ctx.kaiten.event_time_property(event_dt)
+                        )
+                        await user_ctx.kaiten.move_card(card_id, far_future_col, 1.0)
+                        await _log_event(
+                            user_ctx, "done", title,
+                            detail=f"ежемесячная → {next_date.isoformat()}",
+                        )
+                        await update.message.reply_text(
+                            f"✅ «{title}» выполнено — ежемесячная задача, следующий раз "
+                            f"{next_date.strftime('%d.%m.%Y')} (Далекие времена).",
+                        )
+                    except Exception as exc:
+                        logger.exception(
+                            "received_comment_cb: ежемесячная задача, ошибка переноса — {}", exc
+                        )
+                        await update.message.reply_text("⚠️ Не удалось перенести ежемесячную задачу.")
+                elif card and user_ctx.logic.is_regular_task(card):
                     start_col_id = _next_col_for_regular(
                         card, datetime.now(TZ_MSK).date(), user_ctx.logic.column_ids
                     )
@@ -1960,6 +2038,7 @@ def build_handlers(cfg: HandlersConfig) -> Application:
                     "kind": "postpone",
                     "card_id": card_id,
                     "hours": hours,
+                    "event_type": "done" if context.user_data.get("postpone_worked") else "moved",
                 }
                 await update.message.reply_text(
                     f"⚠️ «{title_h}» — критическая задача с дедлайном {due_date_h}.\n"
@@ -1972,7 +2051,10 @@ def build_handlers(cfg: HandlersConfig) -> Application:
                 # Диалог завершается; confirm_move_cb/confirm_cancel_cb — top-level хендлеры
                 return ConversationHandler.END
 
-            ok, msg = await _postpone_card(user_ctx, card_obj, hours)
+            ok, msg = await _postpone_card(
+                user_ctx, card_obj, hours,
+                event_type="done" if context.user_data.get("postpone_worked") else "moved",
+            )
             await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
         except Exception as exc:
             logger.exception("received_hours_cb: error — {}", exc)
@@ -2032,8 +2114,14 @@ def build_handlers(cfg: HandlersConfig) -> Application:
 
         if target_col_id is None:
             if column_name and column_name in user_ctx.logic.column_ids:
-                target_col_id   = user_ctx.logic.column_ids[column_name]
-                target_col_name = column_name
+                if column_name in WEEKDAY_COLUMNS:
+                    resolved = _resolve_weekday_to_date(column_name)
+                    wd_date = date.fromisoformat(resolved)
+                    target_col_id = user_ctx.logic.resolve_column_for_date(wd_date)
+                    target_col_name = user_ctx.logic.column_name_by_id.get(target_col_id, column_name)
+                else:
+                    target_col_id   = user_ctx.logic.column_ids[column_name]
+                    target_col_name = column_name
             elif section == "На контроле":
                 today_wd        = datetime.now(TZ_MSK).date().weekday()
                 target_col_name = WEEKDAY_COLUMNS[today_wd]
@@ -2178,13 +2266,15 @@ def build_handlers(cfg: HandlersConfig) -> Application:
                 await query.edit_message_text("⚠️ Ошибка при перемещении карточки.")
 
         elif pending["kind"] == "postpone":
-            # Ветку postpone НЕ трогаем — _postpone_card уже логирует "moved" через B.3
             try:
                 card = await user_ctx.kaiten.get_card(pending["card_id"])
                 if card is None:
                     await query.edit_message_text("⚠️ Карточка не найдена.")
                 else:
-                    ok, msg = await _postpone_card(user_ctx, card, pending["hours"])
+                    ok, msg = await _postpone_card(
+                        user_ctx, card, pending["hours"],
+                        event_type=pending.get("event_type", "moved"),
+                    )
                     await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN)
             except Exception as exc:
                 logger.exception("confirm_move_cb: postpone error — {}", exc)
@@ -2530,6 +2620,78 @@ def build_handlers(cfg: HandlersConfig) -> Application:
         logger.info("action_description_cb: card_id={} комментариев={}", card_id, len(comments))
         return CARD_ACTION
 
+    async def action_delete_cb(
+        update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        """🗑 Удалить → запрашиваем подтверждение (необратимое действие)."""
+        query = update.callback_query
+        assert query is not None
+        await query.answer()
+
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        user_ctx = cfg.users.get(chat_id) if chat_id else None
+        if user_ctx is None:
+            return CARD_ACTION
+
+        card_id = context.user_data.get("selected_card_id")
+        try:
+            card = await user_ctx.kaiten.get_card(card_id)
+        except Exception as exc:
+            logger.exception("action_delete_cb: get_card error — {}", exc)
+            card = None
+
+        title = card.title if card else f"#{card_id}"
+        await query.edit_message_text(
+            f"🗑 Удалить карточку «{title}» безвозвратно?\n\nЭто действие нельзя отменить.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Да, удалить", callback_data="delete:confirm"),
+                InlineKeyboardButton("Отмена", callback_data="delete:cancel"),
+            ]]),
+        )
+        return CARD_ACTION
+
+    async def delete_confirm_cb(
+        update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        """Пользователь подтвердил удаление карточки."""
+        query = update.callback_query
+        assert query is not None
+        await query.answer()
+
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        user_ctx = cfg.users.get(chat_id) if chat_id else None
+        if user_ctx is None:
+            await query.edit_message_text("⚠️ Не удалось определить пользователя.")
+            return ConversationHandler.END
+
+        card_id = context.user_data.get("selected_card_id")
+        try:
+            card = await user_ctx.kaiten.get_card(card_id)
+        except Exception:
+            card = None
+        title = card.title if card else f"#{card_id}"
+
+        try:
+            ok = await user_ctx.kaiten.delete_card(card_id)
+        except Exception as exc:
+            logger.exception("delete_confirm_cb: delete_card error — {}", exc)
+            ok = False
+
+        if ok:
+            await query.edit_message_text(f"🗑 Карточка «{title}» удалена.")
+        else:
+            await query.edit_message_text("⚠️ Не удалось удалить карточку.")
+
+        if update.effective_chat and user_ctx:
+            await _resend_card_buttons(user_ctx, context, update.effective_chat.id)
+        return ConversationHandler.END
+
+    async def delete_cancel_cb(
+        update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        """Пользователь отменил удаление → возвращаемся к списку карточек."""
+        return await action_back_cb(update, context)
+
     async def received_edit_title_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Получено новое название карточки в режиме редактирования."""
         assert update.message is not None
@@ -2842,6 +3004,7 @@ def build_handlers(cfg: HandlersConfig) -> Application:
                  InlineKeyboardButton("По выходным", callback_data="nt:reg:weekends")],
                 [InlineKeyboardButton("Ежедневно", callback_data="nt:reg:daily"),
                  InlineKeyboardButton("Еженедельно", callback_data="nt:reg:weekly")],
+                [InlineKeyboardButton("Ежемесячно", callback_data="nt:reg:monthly")],
                 [InlineKeyboardButton("← Назад", callback_data="nt:back")],
             ]
             await query.edit_message_text("Регулярность:", reply_markup=InlineKeyboardMarkup(kb))
@@ -2849,7 +3012,7 @@ def build_handlers(cfg: HandlersConfig) -> Application:
         if action == "reg" and sub is not None:
             reg_mapping = {
                 "none": None, "weekdays": "по будням", "weekends": "по выходным",
-                "daily": "ежедневно",
+                "daily": "ежедневно", "monthly": "ежемесячно",
             }
             if sub == "weekly":
                 kb = [
@@ -3052,7 +3215,13 @@ def build_handlers(cfg: HandlersConfig) -> Application:
                 CallbackQueryHandler(action_reminder_cb,    pattern=r"^action:reminder$"),
                 CallbackQueryHandler(action_edit_cb,        pattern=r"^action:edit$"),
                 CallbackQueryHandler(action_description_cb, pattern=r"^action:description$"),
+                CallbackQueryHandler(action_delete_cb,      pattern=r"^action:delete$"),
+                CallbackQueryHandler(delete_confirm_cb,     pattern=r"^delete:confirm$"),
+                CallbackQueryHandler(delete_cancel_cb,      pattern=r"^delete:cancel$"),
                 CallbackQueryHandler(action_back_cb,        pattern=r"^action:back$"),
+            ],
+            AWAITING_WORKED_ON: [
+                CallbackQueryHandler(worked_on_cb, pattern=r"^worked:(yes|no)$"),
             ],
             AWAITING_COMMENT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, received_comment_cb),
@@ -3171,6 +3340,8 @@ def build_handlers(cfg: HandlersConfig) -> Application:
 
             deadline = intent.get("deadline")
             if not deadline:
+                deadline = _resolve_weekday_to_date(intent.get("column"))
+            if not deadline:
                 await update.message.reply_text(
                     "❓ Не удалось определить дату. Дедлайн не изменён."
                 )
@@ -3213,6 +3384,49 @@ def build_handlers(cfg: HandlersConfig) -> Application:
             chat_id,
             text[:80],
         )
+
+        # ── Администраторские команды (только для владельца) ─────────────────────
+        if lower == "пользователи":
+            if cfg.owner_chat_id is None or chat_id != cfg.owner_chat_id:
+                return  # тихо игнорируем — не владелец
+            if cfg.list_users is None:
+                await _reply(update, "⚠️ Админ-функции недоступны.")
+                return
+            records = cfg.list_users()
+            lines = ["Пользователи:"]
+            for r in records:
+                status = "✅" if r.get("is_active", True) else "⛔"
+                lines.append(f"{status} {r['user_id']} (chat_id {r['telegram_chat_id']})")
+            await _reply(update, "\n".join(lines))
+            return
+
+        if re.match(r"^отключить\s+\S+", lower):
+            if cfg.owner_chat_id is None or chat_id != cfg.owner_chat_id:
+                return
+            if cfg.deactivate_user is None:
+                await _reply(update, "⚠️ Админ-функции недоступны.")
+                return
+            target_id = text.split(maxsplit=1)[1].strip()
+            ok_admin = await cfg.deactivate_user(target_id)
+            if ok_admin:
+                await _reply(update, f"✅ Пользователь {target_id} отключён.")
+            else:
+                await _reply(update, f"⚠️ Пользователь {target_id} не найден.")
+            return
+
+        if re.match(r"^включить\s+\S+", lower):
+            if cfg.owner_chat_id is None or chat_id != cfg.owner_chat_id:
+                return
+            if cfg.reactivate_user is None:
+                await _reply(update, "⚠️ Админ-функции недоступны.")
+                return
+            target_id = text.split(maxsplit=1)[1].strip()
+            ok_admin = await cfg.reactivate_user(target_id)
+            if ok_admin:
+                await _reply(update, f"✅ Пользователь {target_id} включён.")
+            else:
+                await _reply(update, f"⚠️ Пользователь {target_id} не найден.")
+            return
 
         # Ожидание ответа на вопрос о дедлайне после переноса в «На контроле».
         # Проверяем ДО роутинга команд — любой текст пользователя в этот момент

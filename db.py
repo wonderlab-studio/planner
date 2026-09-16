@@ -120,10 +120,19 @@ def _init_db() -> None:
                 kaiten_base_url   TEXT    NOT NULL,
                 column_ids_json   TEXT    NOT NULL DEFAULT '{}',
                 timezone          TEXT    NOT NULL DEFAULT 'Europe/Moscow',
-                created_at        TEXT    NOT NULL
+                created_at        TEXT    NOT NULL,
+                is_active         INTEGER NOT NULL DEFAULT 1
             )
         """)
         conn.commit()
+
+        # Миграция: добавить is_active если колонки нет (существующие БД)
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
+            conn.commit()
+            logger.info("db: migrated users — added is_active column")
+        except sqlite3.OperationalError:
+            pass  # колонка уже существует
 
     logger.debug("db: таблицы готовы (DB_PATH={})", DB_PATH)
 
@@ -459,19 +468,19 @@ def save_user_record(
 
 
 def load_user_records() -> list[dict]:
-    """Возвращает все записи из таблицы users.
+    """Возвращает все записи из таблицы users (включая неактивных).
 
     column_ids десериализуется из JSON в dict под ключом 'column_ids'.
     Ключи каждого dict: user_id, telegram_chat_id, kaiten_board_id, kaiten_lane_id,
     kaiten_space_id, kaiten_token_env, kaiten_base_url, column_ids (dict),
-    timezone, created_at.
+    timezone, created_at, is_active (bool).
     """
     with _get_connection() as conn:
         rows = conn.execute(
             """
             SELECT user_id, telegram_chat_id, kaiten_board_id, kaiten_lane_id,
                    kaiten_space_id, kaiten_token_env, kaiten_base_url,
-                   column_ids_json, timezone, created_at
+                   column_ids_json, timezone, created_at, is_active
             FROM users
             """
         ).fetchall()
@@ -497,8 +506,20 @@ def load_user_records() -> list[dict]:
             "column_ids":       column_ids,
             "timezone":         row["timezone"],
             "created_at":       row["created_at"],
+            "is_active":        bool(row["is_active"]),
         })
     return result
+
+
+def set_user_active(user_id: str, is_active: bool) -> bool:
+    """Включает/отключает пользователя. Возвращает True, если строка с таким user_id найдена и обновлена."""
+    with _get_connection() as conn:
+        cursor = conn.execute(
+            "UPDATE users SET is_active = ? WHERE user_id = ?",
+            (1 if is_active else 0, user_id),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
 
 
 def get_user_record_by_chat_id(chat_id: int) -> dict | None:

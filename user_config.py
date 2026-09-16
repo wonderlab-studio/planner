@@ -26,6 +26,7 @@ class UserConfig:
     importance_options: dict[str, int] | None = None
     weekday_options: dict[str, int] | None = None
     field_ids: dict[str, str] | None = None   # keys: "event", "importance", "weekday"
+    is_active: bool = True
 
 
 def load_users() -> list[UserConfig]:
@@ -45,7 +46,7 @@ def load_users() -> list[UserConfig]:
     else:
         users = _load_from_env()
     users = _merge_db_users(users)
-    return users
+    return [u for u in users if u.is_active]
 
 
 def _parse_user(item: dict) -> UserConfig:
@@ -81,6 +82,7 @@ def _parse_user(item: dict) -> UserConfig:
         importance_options=importance_options,
         weekday_options=weekday_options,
         field_ids=field_ids,
+        is_active=bool(item.get("is_active", True)),
     )
 
 
@@ -139,6 +141,7 @@ def _merge_db_users(users: list[UserConfig]) -> list[UserConfig]:
             column_ids={k: int(v) for k, v in (rec.get("column_ids") or {}).items()},
             kaiten_token=token,
             kaiten_base_url=rec.get("kaiten_base_url"),
+            is_active=bool(rec.get("is_active", True)),
         ))
         seen.add(rec["user_id"])
         logger.info("load_users: подключён онбординг-пользователь user={}", rec["user_id"])
