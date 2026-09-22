@@ -6,13 +6,22 @@ evening_logic.py — сравнение утреннего снэпшота с �
 Хранение снэпшота/лога — в db.py (SQLite). Оркестрация (загрузка из БД, Kaiten, Claude,
 отправка в Telegram, очистка после отправки) — в scheduler.py.
 
-Уточнённая классификация: карточки, пропавшие без явного события moved/overflow,
+Уточнённая классификация: карточки, пропавшие без явного события moved/overflow/done,
 НЕ засчитываются сразу done. scheduler.py параллельно запрашивает get_card для каждой
 и передаёт результат в CardLookupCtx. diff_day использует его для точной классификации:
   - Card is None (удалена) → done
   - column_id == archive → done
   - регулярная задача в ожидаемой следующей колонке → done
   - иначе → moved (перенесена вручную, без явной команды бота)
+
+Особые случаи:
+  - event_type="done" в daily_events (ответ «Да» на «Удалось поработать?» при переносе)
+    явно засчитывается как done независимо от реального положения карточки.
+  - Карточки, оставшиеся в сегодняшней колонке в секции «На контроле» (актуальное
+    состояние), переносятся из undone в done с сохранением section="На контроле" —
+    передача задачи на контроль не личный провал, а успешная передача на проверку.
+  - Все done-элементы имеют единую структуру: title/importance/size/section
+    (section=None для обычных выполненных задач, "На контроле" для контрольных).
 """
 
 from __future__ import annotations
@@ -166,6 +175,8 @@ def diff_day(
     snapshot       — из db.load_morning_snapshot: [{"id","title","size","importance","section"}, ...]
                      или None (если утренняя логика сегодня не запускалась)
     events         — из db.load_daily_events: [{"event_type","card_title","detail","created_at"}, ...]
+                     Обрабатываемые event_type: "moved", "overflow", "done".
+                     Для каждого card_title используется последнее (наибольший id) событие.
     current_cards  — текущие карточки сегодняшней колонки: [{"id","title","size","importance",
                      "section",...}, ...] (лишние ключи в dict допустимы и игнорируются)
     card_ctx       — контекст предзагруженных карточек для уточнённой классификации.
@@ -177,10 +188,16 @@ def diff_day(
       - undone: карточки снэпшота, чей id ЕСТЬ среди current_cards (остались невыполненными).
                 Поле section берётся из АКТУАЛЬНОГО состояния (current_cards), не из снэпшота —
                 чтобы учесть пересборки («пересобрать»), изменившие секцию в течение дня.
-      - done:   карточки снэпшота, чьего id НЕТ среди current_cards, И для card_title которых
-                НЕТ события с event_type in ('moved', 'overflow') в events.
-                При наличии card_ctx: сначала проверяется реальное состояние через get_card
-                (archive, регулярная в ожидаемой колонке, удалена → done; иначе → moved).
+                Исключение: карточки с section=="На контроле" (актуальное) переносятся в done
+                с сохранением section — передача на контроль это не провал.
+      - done:   (1) карточки снэпшота, чьего id НЕТ среди current_cards, И в events есть
+                событие event_type=="done" с совпадающим card_title (ответ «Да» при переносе
+                «Продолжить в другой день» — позанимались, засчитываем как выполненную);
+                (2) карточки снэпшота, чьего id НЕТ среди current_cards, И НЕТ события
+                'moved'/'overflow'/'done' в events — при наличии card_ctx сначала проверяется
+                реальное состояние через get_card (archive, регулярная в ожидаемой колонке,
+                удалена → done; иначе → moved);
+                (3) карточки, переведённые в «На контроле» (из undone, см. выше).
       - moved:  карточки снэпшота, чьего id НЕТ среди current_cards, И ЕСТЬ событие
                 event_type in ('moved', 'overflow') с совпадающим card_title —
                 detail берётся из ПОСЛЕДНЕГО такого события; либо карточки, обнаруженные
@@ -192,7 +209,9 @@ def diff_day(
 
     Возвращает:
         {
-            "done":   [{"title": str, "importance": str|None, "size": int|None}, ...],
+            "done":   [{"title": str, "importance": str|None, "size": int|None,
+                        "section": str|None}, ...],
+                        # section=None для обычных выполненных; "На контроле" — для контрольных
             "undone": [{"title": str, "importance": str|None, "size": int|None,
                         "section": str|None}, ...],
             "moved":  [{"title": str, "detail": str}, ...],
@@ -228,15 +247,19 @@ def diff_day(
         if cid is not None:
             snapshot_ids.add(cid)
 
-    # ── Индекс перемещений: title → detail последнего события moved/overflow ──
-    # Итерируем в порядке id (хронологически), каждый следующий перезаписывает —
-    # в результате остаётся только самый свежий detail для каждого названия.
-    moved_detail: dict[str, str] = {}
+    # ── Индекс событий: title → (event_type, detail) последнего moved/overflow/done ──
+    # Итерируем в порядке id (хронологически, db.load_daily_events → ORDER BY id),
+    # каждый следующий перезаписывает — остаётся только самый свежий статус для title.
+    # "done" включён: ответ «Да» на «Удалось поработать?» пишет event_type="done"
+    # из handlers._postpone_card; без учёта этого типа такая карточка ошибочно
+    # попадала в moved через card_ctx/_classify_disappeared вместо done.
+    event_status_by_title: dict[str, tuple[str, str]] = {}
     for event in events:
-        if event.get("event_type") in ("moved", "overflow"):
-            title = event.get("card_title", "")
-            if title:
-                moved_detail[title] = event.get("detail", "")
+        ev_type = event.get("event_type")
+        if ev_type in ("moved", "overflow", "done"):
+            ev_title = event.get("card_title", "")
+            if ev_title:
+                event_status_by_title[ev_title] = (ev_type, event.get("detail", "") or "")
 
     # ── Классификация карточек снэпшота ──────────────────────────────────────
     done: list[dict] = []
@@ -263,12 +286,23 @@ def diff_day(
                 "section":    current.get("section") if current else card.get("section"),
             })
 
-        elif title in moved_detail:
-            # Явное событие переноса/overflow → moved (detail из events)
-            moved.append({
-                "title":  title,
-                "detail": moved_detail[title],
-            })
+        elif title in event_status_by_title:
+            # Явное событие из daily_events → классификация по типу
+            ev_type, ev_detail = event_status_by_title[title]
+            if ev_type == "done":
+                # Ответ «Да» на «Удалось поработать?» — задачей занимались, считаем выполненной
+                done.append({
+                    "title":      title,
+                    "importance": card.get("importance"),
+                    "size":       card.get("size"),
+                    "section":    None,
+                })
+            else:
+                # moved / overflow → карточка перенесена, не выполнена
+                moved.append({
+                    "title":  title,
+                    "detail": ev_detail,
+                })
 
         elif card_ctx is not None and cid in card_ctx.lookup:
             # Уточнённая классификация через предзагруженное реальное состояние карточки
@@ -278,6 +312,7 @@ def diff_day(
                     "title":      title,
                     "importance": card.get("importance"),
                     "size":       card.get("size"),
+                    "section":    None,
                 })
             elif status == "moved":
                 moved.append({
@@ -299,7 +334,17 @@ def diff_day(
                 "title":      title,
                 "importance": card.get("importance"),
                 "size":       card.get("size"),
+                "section":    None,
             })
+
+    # ── «На контроле» → переносим из undone в done ───────────────────────────
+    # Задача передана другим людям на проверку — это не личный провал.
+    # section="На контроле" сохраняем: claude_client.py использует его для отдельного
+    # форматирования этих карточек в итоговом отчёте.
+    control_cards = [c for c in undone if c.get("section") == "На контроле"]
+    if control_cards:
+        undone = [c for c in undone if c.get("section") != "На контроле"]
+        done.extend(control_cards)
 
     # ── Карточки, добавленные в течение дня ──────────────────────────────────
     added: list[dict] = []

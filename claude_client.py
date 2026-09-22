@@ -116,10 +116,20 @@ def _format_cards_by_section(cards: list[dict]) -> str:
 
 
 def _format_card_simple(card: dict) -> str:
-    """Упрощённый формат для вечернего итога (done / added)."""
+    """Упрощённый формат для вечернего итога (done / added).
+
+    Добавляет пометку [На контроле], если карточка была передана на
+    проверку/контроль, а не выполнена лично пользователем.
+    """
     title = card.get("title", "(без названия)")
     imp = card.get("importance", "")
-    suffix = f" [{imp}]" if imp else ""
+    section = card.get("section", "")
+    suffix_parts = []
+    if imp:
+        suffix_parts.append(imp)
+    if section == "На контроле":
+        suffix_parts.append("На контроле")
+    suffix = f" [{', '.join(suffix_parts)}]" if suffix_parts else ""
     return f"• {title}{suffix}"
 
 
@@ -231,7 +241,9 @@ class ClaudeClient:
         """Генерирует вечерний итог дня для Telegram.
 
         Параметры:
-            done   — выполненные карточки: [{title, importance, size}, ...]
+            done   — выполненные карточки: [{title, importance, size, section}, ...];
+                      section может быть "На контроле" для задач, переданных на
+                      проверку/контроль (не выполненных лично), иначе None
             undone — карточки, оставшиеся открытыми: [{title, importance, size,
                       section}, ...]; section может быть "На контроле"
             moved  — перенесённые карточки: [{title, detail}, ...],
@@ -242,12 +254,13 @@ class ClaudeClient:
             Текст итога в Markdown для отправки в Telegram.
 
         Пример промпта (user):
-            "Сделано (2):
+            "Сделано (3):
             • Позвонить заказчику [критическое]
             • Написать отчёт [важное]
+            • Согласовать смету [среднее, На контроле]
 
             Не сделано (1):
-            • Разобрать почту [среднее, На контроле]
+            • Разобрать почту [среднее]
 
             Перенесено (1):
             — Спортзал → на завтра утром
